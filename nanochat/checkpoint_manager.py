@@ -39,6 +39,16 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
+
+def _strip_mlp_keys_for_ctm(model_data):
+    """Remove MLP-specific keys from checkpoint so CTM keys stay freshly initialized.
+    Keeps all attention, embedding, and scalar parameters intact."""
+    mlp_keys = [k for k in model_data if '.mlp.' in k]
+    if mlp_keys:
+        log0(f"Stripping {len(mlp_keys)} MLP keys for CTM warm-start: {mlp_keys[:3]}...")
+        for k in mlp_keys:
+            del model_data[k]
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -97,12 +107,19 @@ def build_model(checkpoint_dir, step, device, phase):
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)
+    # If the checkpoint is MLP but the config wants CTM, strip MLP keys
+    # so that CTM blocks keep their fresh init from init_weights()
+    has_mlp_checkpoint = any('.mlp.c_fc.' in k for k in model_data)
+    if model_config.use_ctm and has_mlp_checkpoint:
+        log0("Converting MLP checkpoint -> CTM model (warm-starting attention + embeddings)")
+        _strip_mlp_keys_for_ctm(model_data)
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
-    model.load_state_dict(model_data, strict=True, assign=True)
+    strict = not (model_config.use_ctm and has_mlp_checkpoint)
+    model.load_state_dict(model_data, strict=strict, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()

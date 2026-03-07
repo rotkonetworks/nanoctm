@@ -15,6 +15,9 @@ Notable features:
 from functools import partial
 from dataclasses import dataclass
 
+import math
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,6 +40,13 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # CTM block settings (replaces MLP when enabled)
+    # Paper: https://arxiv.org/abs/2505.05522
+    use_ctm: bool = False
+    ctm_iterations: int = 4       # K thinking steps per token
+    ctm_memory_length: int = 8    # rolling trace history length
+    ctm_n_synch: int = 384        # neuron pairs for synchronisation readout
+    ctm_memory_hidden: int = 32   # NLM hidden dimension
 
 
 def norm(x):
@@ -137,14 +147,147 @@ class MLP(nn.Module):
         return x
 
 
+# --- Continuous Thought Machine block (replaces MLP) ---
+# Adapted from https://github.com/sakana-ai/continuous-thought-machines
+# Each token gets K iterations of synapse -> trace update -> NLM processing.
+# Output is read via synchronisation (pairwise temporal correlation between neurons).
+
+class SuperLinear(nn.Module):
+    """N independent linear transforms in parallel — one per neuron.
+    Master weights stay fp32 for optimizer precision, cast to input dtype for compute."""
+    def __init__(self, in_dims, out_dims, N):
+        super().__init__()
+        s = 1.0 / math.sqrt(in_dims + out_dims)
+        self.w1 = nn.Parameter(torch.empty(in_dims, out_dims, N).uniform_(-s, s))
+        self.b1 = nn.Parameter(torch.zeros(1, N, out_dims))
+
+    def forward(self, x):
+        # x: (B, N, in_dims) -> (B, N, out_dims)
+        return torch.einsum('BNM,MON->BNO', x, self.w1.to(x.dtype)) + self.b1.to(x.dtype)
+
+
+class CTMBlock(nn.Module):
+    """Continuous Thought Machine block — drop-in replacement for MLP.
+    Input/output: (B, T, D). Each token position is processed independently.
+    NOTE: like the rest of the model, __init__ runs in meta device context.
+    All actual data initialization happens in GPT.init_weights()."""
+    def __init__(self, config):
+        super().__init__()
+        D = config.n_embd
+        K = config.ctm_iterations
+        M = config.ctm_memory_length
+        n_synch = config.ctm_n_synch
+        hidden = config.ctm_memory_hidden
+
+        self.D = D
+        self.K = K           # max iterations (from config)
+        self.active_K = K    # current iterations (can be reduced by sleep-cycle scheduler)
+        self.M = M
+        self.n_synch = n_synch
+
+        # Synapses: concat(input, state) -> new pre-activations
+        self.synapse_fc = Linear(2 * D, 2 * D, bias=False)
+        self.synapse_ln = nn.LayerNorm(D)
+
+        # NLMs: per-neuron trace processing (deep variant with GLU)
+        self.nlm1 = SuperLinear(M, 2 * hidden, D)
+        self.nlm2 = SuperLinear(hidden, 2, D)
+
+        # Learnable initial states (fake init, real init in GPT.init_weights)
+        self.start_state = nn.Parameter(torch.empty(D))
+        self.start_trace = nn.Parameter(torch.empty(D, M))
+
+        # Synchronisation: buffers for neuron pairings (filled in init_weights) + learnable decay
+        self.register_buffer('synch_left', torch.zeros(n_synch, dtype=torch.long))
+        self.register_buffer('synch_right', torch.zeros(n_synch, dtype=torch.long))
+        self.decay = nn.Parameter(torch.zeros(n_synch))
+
+        # Output projection: synchronisation -> residual stream
+        self.c_proj = Linear(n_synch, D, bias=False)
+
+    def forward(self, x, dream=False, intervene=None):
+        """
+        Args:
+            x: input tensor (B, T, D)
+            dream: if True, collect per-iteration state deltas for convergence diagnostics
+            intervene: optional callback fn(k, state, trace) -> state
+                       Called after each iteration k. Can modify state for neuroplasticity.
+                       Return modified state or None to keep unchanged.
+        """
+        B, T, D = x.shape
+        BT = B * T
+        x_flat = x.reshape(BT, D)
+        K = self.active_K  # may be reduced by sleep-cycle scheduler
+
+        # Initialize recurrent state
+        state = self.start_state.unsqueeze(0).expand(BT, -1)
+        trace = self.start_trace.unsqueeze(0).expand(BT, -1, -1).clone()  # (BT, D, M)
+
+        # Synchronisation accumulators
+        r = torch.exp(-self.decay.clamp(0, 15)).unsqueeze(0)  # (1, n_synch)
+        decay_alpha = None
+        decay_beta = None
+
+        # Dream mode: collect per-iteration state deltas to measure convergence
+        deltas = [] if dream else None
+
+        for k in range(K):
+            prev_state = state if dream else None
+
+            # Synapses: mix external input with current state
+            pre = torch.cat([x_flat, state], dim=-1)
+            new_state = F.glu(self.synapse_fc(pre), dim=-1)
+            new_state = self.synapse_ln(new_state)
+
+            # Update trace (rolling window: drop oldest, append newest)
+            trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
+
+            # NLMs: per-neuron processing of trace history
+            h = F.glu(self.nlm1(trace), dim=-1)       # (BT, D, hidden)
+            state = F.glu(self.nlm2(h), dim=-1).squeeze(-1)  # (BT, D)
+
+            if dream:
+                # Measure how much state changed this iteration (convergence signal)
+                delta = (state - prev_state).norm(dim=-1).mean().item()
+                deltas.append(delta)
+
+            # Neuroplasticity hook: external intervention on internal state
+            if intervene is not None:
+                modified = intervene(k, state, trace)
+                if modified is not None:
+                    state = modified
+
+            # Update synchronisation (exponential moving correlation)
+            left = state[:, self.synch_left]
+            right = state[:, self.synch_right]
+            pp = left * right
+            if decay_alpha is None:
+                decay_alpha = pp
+                decay_beta = torch.ones_like(pp)
+            else:
+                decay_alpha = r * decay_alpha + pp
+                decay_beta = r * decay_beta + 1
+
+        # Readout: synchronisation -> output projection
+        synch = decay_alpha / torch.sqrt(decay_beta)
+        out = self.c_proj(synch).reshape(B, T, D)
+        if dream:
+            return out, deltas
+        return out
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = CTMBlock(config) if config.use_ctm else MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, dream=False):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        if dream and isinstance(self.mlp, CTMBlock):
+            mlp_out, deltas = self.mlp(norm(x), dream=True)
+            x = x + mlp_out
+            return x, deltas
         x = x + self.mlp(norm(x))
         return x
 
@@ -203,8 +346,8 @@ class GPT(nn.Module):
             attn.c_k:        uniform, std=1/sqrt(n_embd)
             attn.c_v:        uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
-            mlp.c_fc:        uniform, std=1/sqrt(n_embd)
-            mlp.c_proj:      zeros
+            mlp (MLP):       c_fc uniform, c_proj zeros
+            mlp (CTMBlock):  synapse uniform, c_proj zeros, NLMs Xavier, start states uniform
         """
 
         # Embedding and unembedding
@@ -219,8 +362,32 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if isinstance(block.mlp, CTMBlock):
+                ctm = block.mlp
+                # Synapse: uniform like c_fc
+                torch.nn.init.uniform_(ctm.synapse_fc.weight, -s, s)
+                # Output projection: zero for clean residual at init
+                torch.nn.init.zeros_(ctm.c_proj.weight)
+                # NLMs: Xavier-like per neuron
+                for nlm in (ctm.nlm1, ctm.nlm2):
+                    s_nlm = 1.0 / math.sqrt(nlm.w1.shape[0] + nlm.w1.shape[1])
+                    nlm.w1.uniform_(-s_nlm, s_nlm)
+                    nlm.b1.zero_()
+                # Start states
+                s_d = 1.0 / math.sqrt(ctm.D)
+                ctm.start_state.uniform_(-s_d, s_d)
+                s_dm = 1.0 / math.sqrt(ctm.D + ctm.M)
+                ctm.start_trace.uniform_(-s_dm, s_dm)
+                # Synapse LayerNorm
+                ctm.synapse_ln.weight.fill_(1.0)
+                ctm.synapse_ln.bias.zero_()
+                # Synchronisation: random neuron pairings
+                ctm.synch_left.copy_(torch.from_numpy(np.random.choice(ctm.D, size=ctm.n_synch, replace=True)))
+                ctm.synch_right.copy_(torch.from_numpy(np.random.choice(ctm.D, size=ctm.n_synch, replace=True)))
+                ctm.decay.zero_()
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -358,13 +525,16 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Muon only works on 2D matrices; route everything else to AdamW
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_h_params if p.ndim == 2]
+        ctm_other_params = [p for p in all_h_params if p.ndim != 2]  # SuperLinear 3D, decay 1D, start states, LayerNorm
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(ctm_other_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -379,6 +549,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        # CTM non-matrix params (SuperLinear 3D weights, decay params, start states, LayerNorm)
+        if ctm_other_params:
+            param_groups.append(dict(kind='adamw', params=ctm_other_params, lr=matrix_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -430,6 +603,112 @@ class GPT(nn.Module):
         else:
             # inference: just return the logits directly
             return logits
+
+    @torch.inference_mode()
+    def dream(self, idx):
+        """REM sleep: run forward pass collecting per-layer CTM convergence diagnostics.
+        Returns dict with per-layer state deltas at each iteration k.
+        Useful for adaptive K: layers that converge fast can use fewer iterations."""
+        B, T = idx.size()
+        T0 = 0
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
+        x = norm(x)
+        x0 = x
+        layer_diagnostics = {}
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            result = block(x, ve, cos_sin, self.window_sizes[i], None, dream=True)
+            if isinstance(result, tuple):
+                x, deltas = result
+                layer_diagnostics[i] = deltas  # list of K floats: state delta per iteration
+            else:
+                x = result
+        return layer_diagnostics
+
+    @torch.inference_mode()
+    def probe(self, idx, layers=None):
+        """Neuroimaging: capture full state snapshots at each K iteration per layer.
+        Like an fMRI of the model's thinking process.
+
+        Args:
+            idx: token indices (B, T)
+            layers: list of layer indices to probe (None = all CTM layers)
+
+        Returns: dict[layer_idx] -> list of K state tensors, each (B*T, D)
+        """
+        B, T = idx.size()
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
+        x = norm(x)
+        x0 = x
+        layer_snapshots = {}
+
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            probe_this = isinstance(block.mlp, CTMBlock) and (layers is None or i in layers)
+            if probe_this:
+                states = []
+                def capture(k, state, trace, _states=states):
+                    _states.append(state.detach().clone())
+                    return None  # don't modify
+                # Run attention, then CTM with capture hook
+                x_attn = x + block.attn(norm(x), ve, cos_sin, self.window_sizes[i], None)
+                mlp_out = block.mlp(norm(x_attn), intervene=capture)
+                x = x_attn + mlp_out
+                layer_snapshots[i] = states
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i], None)
+        return layer_snapshots
+
+    def sleep_cycle(self, idx, convergence_threshold=0.3, min_k=2):
+        """Full sleep cycle: dream (REM) then compact (adjust active_K per layer).
+
+        1. REM: run dream() to measure per-layer convergence
+        2. Compact: layers where state delta drops >threshold get reduced K
+
+        Args:
+            idx: token batch for dreaming
+            convergence_threshold: if final delta < initial * threshold, layer has converged
+            min_k: minimum K to allow (must be >= 2 for synch to work)
+
+        Returns: dict with per-layer diagnostics and new K values
+        """
+        if not self.config.use_ctm:
+            return {}
+
+        self.eval()
+        diagnostics = self.dream(idx)
+        self.train()
+
+        results = {}
+        for i, deltas in diagnostics.items():
+            block = self.transformer.h[i]
+            if not isinstance(block.mlp, CTMBlock):
+                continue
+
+            old_k = block.mlp.active_K
+            max_k = block.mlp.K
+
+            # Find the earliest iteration where delta drops below threshold
+            initial_delta = deltas[0] if deltas[0] > 0 else 1e-6
+            new_k = max_k
+            for k_idx, delta in enumerate(deltas):
+                if delta < initial_delta * convergence_threshold:
+                    new_k = max(min_k, k_idx + 1)  # +1 because we need at least this many
+                    break
+
+            block.mlp.active_K = new_k
+            results[i] = {
+                'deltas': deltas,
+                'old_k': old_k,
+                'new_k': new_k,
+                'converged': new_k < max_k,
+            }
+
+        return results
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

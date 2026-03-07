@@ -70,6 +70,13 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# CTM
+parser.add_argument("--use-ctm", action="store_true", help="use CTM blocks instead of MLP")
+parser.add_argument("--ctm-iterations", type=int, default=4, help="CTM thinking steps per token")
+parser.add_argument("--ctm-memory-length", type=int, default=8, help="CTM trace history length")
+parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisation neurons (-1 = n_embd//2)")
+parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension")
+parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -135,10 +142,14 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    ctm_n_synch = args.ctm_n_synch if args.ctm_n_synch > 0 else model_dim // 2
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        use_ctm=args.use_ctm, ctm_iterations=args.ctm_iterations,
+        ctm_memory_length=args.ctm_memory_length, ctm_n_synch=ctm_n_synch,
+        ctm_memory_hidden=args.ctm_memory_hidden,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -151,6 +162,18 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+
+# Warm-start from a pretrained MLP checkpoint (loads attention+embeddings, keeps CTM fresh)
+if args.warm_start_from:
+    from nanochat.checkpoint_manager import load_checkpoint, find_last_step, _strip_mlp_keys_for_ctm
+    warm_step = find_last_step(args.warm_start_from)
+    warm_data, _, _ = load_checkpoint(args.warm_start_from, warm_step, device, load_optimizer=False)
+    # Strip torch.compile prefix if present
+    warm_data = {k.removeprefix("_orig_mod."): v for k, v in warm_data.items()}
+    _strip_mlp_keys_for_ctm(warm_data)
+    missing, unexpected = model.load_state_dict(warm_data, strict=False, assign=True)
+    print0(f"Warm-start from {args.warm_start_from} step {warm_step}")
+    print0(f"  Loaded {len(warm_data)} keys, {len(missing)} missing (CTM blocks), {len(unexpected)} unexpected")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -244,7 +267,10 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if os.environ.get("NANOCHAT_NO_COMPILE"):
+    print0("torch.compile disabled via NANOCHAT_NO_COMPILE")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -407,6 +433,14 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# Hippocampal replay buffer: stores high-loss sequences for CTM sleep cycle dreaming.
+# During training, we track which batches had the highest loss (= most surprising/novel).
+# During sleep cycle, we replay these hard examples instead of generic text, so the
+# convergence diagnostics reflect actual difficulty, not easy-to-process filler.
+import heapq
+replay_buffer_size = 16  # keep top-N hardest sequences
+replay_buffer = []  # min-heap of (loss, x_clone) — lowest loss gets evicted first
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -468,6 +502,41 @@ while True:
             print0(tokenizer.decode(sample[0]))
         model.train()
 
+    # once in a while: run CTM sleep cycle (dream + compaction) to adapt per-layer K
+    # Uses hippocampal replay: dreams on the hardest sequences from training, not generic text.
+    # This ensures convergence diagnostics reflect actual model difficulty.
+    if args.use_ctm and args.eval_every > 0 and (step > 0 and step % args.eval_every == 0) and master_process:
+        print0(f"Step {step:05d} | Running CTM sleep cycle (dream + compaction)...")
+        if replay_buffer:
+            # Dream on the hardest sequence (highest loss = most surprising)
+            hardest_loss, hardest_x = max(replay_buffer, key=lambda t: t[0])
+            sleep_idx = hardest_x[:1]  # take first sample from batch
+            print0(f"  Replaying hardest sequence (loss={hardest_loss:.4f}) for dream diagnostics")
+        else:
+            # Fallback if no replay data yet
+            sleep_text = "The quick brown fox jumps over the lazy dog"
+            sleep_tokens = tokenizer(sleep_text, prepend="<|bos|>")
+            sleep_idx = torch.tensor([sleep_tokens], device=device)
+            print0(f"  No replay data yet, using fallback text")
+        sleep_results = orig_model.sleep_cycle(sleep_idx, convergence_threshold=0.3, min_k=2)
+        for layer_i, info in sorted(sleep_results.items()):
+            delta_str = " -> ".join(f"{d:.4f}" for d in info['deltas'])
+            status = "CONVERGED" if info['converged'] else "active"
+            print0(f"  Layer {layer_i:2d}: K {info['old_k']}->{info['new_k']} [{delta_str}] {status}")
+        converged = sum(1 for r in sleep_results.values() if r['converged'])
+        total_k = sum(orig_model.transformer.h[i].mlp.active_K for i in sleep_results)
+        max_k = sum(orig_model.transformer.h[i].mlp.K for i in sleep_results)
+        print0(f"  Converged: {converged}/{len(sleep_results)} layers | Total active K: {total_k}/{max_k}")
+        avg_replay_loss = sum(l for l, _ in replay_buffer) / len(replay_buffer) if replay_buffer else 0
+        wandb_run.log({
+            "step": step,
+            "ctm/converged_layers": converged,
+            "ctm/total_active_k": total_k,
+            "ctm/max_k": max_k,
+            "ctm/replay_hardest_loss": hardest_loss if replay_buffer else 0,
+            "ctm/replay_avg_loss": avg_replay_loss,
+        })
+
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
@@ -510,6 +579,13 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        # Hippocampal replay: remember hard sequences (high loss = high prediction error)
+        if args.use_ctm and micro_step == 0:  # only track first micro-step to save memory
+            loss_val = train_loss.item()
+            if len(replay_buffer) < replay_buffer_size:
+                heapq.heappush(replay_buffer, (loss_val, x.detach().clone()))
+            elif loss_val > replay_buffer[0][0]:
+                heapq.heapreplace(replay_buffer, (loss_val, x.detach().clone()))
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
