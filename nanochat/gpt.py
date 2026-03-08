@@ -365,7 +365,7 @@ class CTMBlock(nn.Module):
         obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
         obs = obs.reshape(BT, D)
 
-        new_state = self.synapses(torch.cat([obs, state], dim=-1))
+        new_state = state + self.synapses(torch.cat([obs, state], dim=-1))
         trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
 
         h = F.glu(self.nlm1(trace), dim=-1)
@@ -452,8 +452,8 @@ class CTMBlock(nn.Module):
                 obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
                 obs = obs.reshape(BT, D)
 
-                # U-NET synapses: mix observation with current state
-                new_state = self.synapses(torch.cat([obs, state], dim=-1))  # (BT, D)
+                # U-NET synapses: mix observation with current state (residual for gradient flow)
+                new_state = state + self.synapses(torch.cat([obs, state], dim=-1))  # (BT, D)
 
                 # Update trace (rolling window: drop oldest, append newest)
                 trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
