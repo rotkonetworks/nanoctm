@@ -1,3 +1,33 @@
+# nanochat + CTM: Solving the Clive Wearing Problem
+
+## The Problem
+
+Every current LLM is Clive Wearing — the musician who lost his ability to form new memories after a brain infection. He could still play piano brilliantly, but every few seconds he believed he had just woken up for the first time. He had no continuity of experience.
+
+LLMs are the same. Each conversation starts from scratch. Each token is processed without any memory of what came before beyond the context window. The model cannot learn from its experiences, cannot remember that it talked to you yesterday, cannot build on previous conversations. It is stateless in the deepest sense — a brilliant amnesiac.
+
+## Our Approach
+
+This fork replaces the MLP layers in the standard transformer with Continuous Thought Machine (CTM) blocks from [Continuous Thought Machines (Jesson et al., 2025)](https://arxiv.org/abs/2505.05522) ([interactive demo](https://pub.sakana.ai/ctm/)). CTM gives the model something transformers lack: an internal recurrent state that persists across tokens, iterative thinking with measurable certainty, and the substrate for real memory.
+
+Three memory systems, mirroring the brain:
+
+- **Working memory** (seconds) — CTMCache: recurrent state, trace history, and synchronisation accumulators that carry forward from token to token during generation. The model maintains a stream of consciousness rather than starting fresh at each position.
+
+- **Episodic memory** (hours/days) — Planned: persist CTMCache snapshots across sessions, indexed by context. Before a new conversation, retrieve the most similar past session's mental state and warm-start from it. "I remember thinking about this topic before."
+
+- **Semantic memory** (permanent) — compact_memory: after an inference session, the accumulated synchronisation patterns (which neuron pairs fired together) are written into the synapse weights permanently. The model literally changes its brain based on what it experienced. Gated by a dopamine signal — surprising moments get remembered harder, boring ones fade.
+
+The sleep cycle consolidates learning: dream (measure convergence), compact (adjust thinking depth per layer), consolidate (certainty-weighted replay on the hardest training examples, updating only the synaptic weights).
+
+This is not a finished system. It is an experiment in building a language model that can experience continuity, form memories, and change itself through experience — a model that is not Clive Wearing.
+
+---
+
+*This is a fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). Original README follows.*
+
+---
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
