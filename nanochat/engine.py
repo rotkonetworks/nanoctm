@@ -354,14 +354,21 @@ class Session:
     """Persistent conversation session with continuous memory.
 
     Unlike Engine.generate() which creates fresh caches per call, a Session
-    maintains KVCache + CTMCache across multiple turns. You send one message,
-    get a reply, send another — the model remembers everything through:
+    maintains KVCache across multiple turns. You send one message, get a reply,
+    send another — the model remembers everything through attention's KV cache.
 
-    - KVCache: all previous token representations (attention can recall any past token)
-    - CTMCache: the thinking state (recurrent state, trace, sync accumulators)
+    CTMCache (persistent thinking state across tokens) is disabled by default.
+    The CTM blocks still run their K thinking iterations per token — that's the
+    "deep thinking" part — but each token starts from fresh start_state. This is
+    because the model is trained without cross-token CTM state (training processes
+    all tokens in parallel with fresh state). Carrying state across tokens at
+    inference time feeds the model inputs it never saw during training, which
+    degrades output quality.
 
-    This is what solves the Clive Wearing problem at inference time. The model
-    has continuity of experience across the entire conversation.
+    To enable CTMCache, the model would need a second training phase with chunked
+    sequences where CTMCache is carried between chunks, teaching the model what
+    persistent thinking state means. This is future work — the infrastructure
+    (CTMCache, cache persistence, episodic memory) is ready and tested.
 
     Usage:
         session = Session(model, tokenizer, max_seq_len=4096)
@@ -387,7 +394,10 @@ class Session:
 
         # Persistent caches — survive across turns
         self.kv_cache = KVCache(batch_size=1, seq_len=seq_len, device=self.device, dtype=self.dtype, **kv_kwargs)
-        self.ctm_cache = CTMCache(m.n_layer) if m.use_ctm else None
+        # CTMCache disabled by default — the model is trained without persistent CTM state,
+        # so enabling it degrades output quality. Enable only after training with chunked
+        # CTMCache continuity (future work).
+        self.ctm_cache = None
         self.surprise_ema = None
 
         # Track all tokens in the conversation

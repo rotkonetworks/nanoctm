@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
+
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
@@ -294,7 +296,9 @@ class SynapseUNET(nn.Module):
         for i, (layer, ln) in enumerate(zip(self.up_layers, self.up_norms)):
             if i > 0 and skips:
                 h = torch.cat([h, skips.pop()], dim=-1)
-            h = ln(F.silu(layer(h)))
+            h = F.silu(layer(h))
+            # LayerNorm keeps float32 weights for optimizer precision; cast to match activations
+            h = F.layer_norm(h, ln.normalized_shape, ln.weight.to(h.dtype), ln.bias.to(h.dtype), ln.eps)
         return h
 
 
@@ -350,6 +354,24 @@ class CTMBlock(nn.Module):
         # Output projection: S_out synchronisation -> residual stream
         self.c_proj = Linear(n_synch, D, bias=False)
 
+    def _tick_core(self, alpha_act, beta_act, x, attn_k, attn_v, state, trace):
+        """One iteration of CTM thinking — factored out for gradient checkpointing."""
+        B, T, D = x.shape
+        BT = B * T
+        H, HD = self.n_attn_heads, self.attn_head_dim
+
+        synch_act = (alpha_act / torch.sqrt(beta_act)).to(x.dtype)
+        attn_q = norm(self.attn_q_proj(synch_act).view(B, T, H, HD))
+        obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
+        obs = obs.reshape(BT, D)
+
+        new_state = self.synapses(torch.cat([obs, state], dim=-1))
+        trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
+
+        h = F.glu(self.nlm1(trace), dim=-1)
+        state = F.glu(self.nlm2(h), dim=-1).squeeze(-1)
+        return state, trace
+
     def forward(self, x, dream=False, intervene=None, multi_tick=False, adaptive=False, ctm_cache=None, layer_idx=None):
         """
         Args:
@@ -366,6 +388,7 @@ class CTMBlock(nn.Module):
         K = self.active_K
         H = self.n_attn_heads
         HD = self.attn_head_dim
+        dtype = x.dtype  # match input dtype (bfloat16 on cuda)
 
         # Precompute keys and values from input (constant across ticks)
         attn_k = norm(self.attn_k_proj(x).view(B, T, H, HD))  # QK norm on keys
@@ -374,18 +397,24 @@ class CTMBlock(nn.Module):
         # Initialize recurrent state: from cache (continuing thought) or learned params (new thought)
         cached = ctm_cache.layers[layer_idx] if ctm_cache is not None and ctm_cache.layers[layer_idx] is not None else None
         if cached is not None:
-            state = cached['state']
-            trace = cached['trace']
-            alpha_out, beta_out = cached['alpha_out'], cached['beta_out']
-            alpha_act, beta_act = cached['alpha_act'], cached['beta_act']
+            # Cached state is (B_cached, *) — expand to all T positions per batch element
+            # B_cached=1 for inference prefill, B_cached=B for chunked BPTT or multi-sample decode
+            B_cached = cached['state'].shape[0]
+            T_per = BT // B_cached
+            state = cached['state'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).to(dtype)
+            trace = cached['trace'].unsqueeze(1).expand(B_cached, T_per, -1, -1).reshape(BT, self.D, self.M).clone().to(dtype)
+            alpha_out = cached['alpha_out'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
+            beta_out = cached['beta_out'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
+            alpha_act = cached['alpha_act'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
+            beta_act = cached['beta_act'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
         else:
-            state = self.start_state.unsqueeze(0).expand(BT, -1)
-            trace = self.start_trace.unsqueeze(0).expand(BT, -1, -1).clone()  # (BT, D, M)
+            state = self.start_state.to(dtype).unsqueeze(0).expand(BT, -1)
+            trace = self.start_trace.to(dtype).unsqueeze(0).expand(BT, -1, -1).clone()  # (BT, D, M)
             alpha_out = alpha_act = beta_out = beta_act = None
 
         # Dual synchronisation accumulators
-        r_out = torch.exp(-self.decay_out.clamp(0, 15)).unsqueeze(0)
-        r_act = torch.exp(-self.decay_act.clamp(0, 15)).unsqueeze(0)
+        r_out = torch.exp(-self.decay_out.clamp(0, 15).to(dtype)).unsqueeze(0)
+        r_act = torch.exp(-self.decay_act.clamp(0, 15).to(dtype)).unsqueeze(0)
 
         # Dopamine gating: scales how strongly this token's sync gets accumulated
         # dopamine > 1 = surprising token, remember harder. dopamine < 1 = boring, dampen.
@@ -397,27 +426,41 @@ class CTMBlock(nn.Module):
         deltas = [] if track_deltas else None
         tick_outputs = [] if multi_tick else None
 
+        # Whether to use gradient checkpointing (saves memory for large K, ~30% slower)
+        use_checkpoint = self.training and K > 4
+
         for k in range(K):
             prev_state = state
 
-            # Cross-attention: use S_action to generate query, re-observe input
-            if alpha_act is not None:
-                synch_act = (alpha_act / torch.sqrt(beta_act)).to(x.dtype)
+            # --- Core tick computation (optionally checkpointed) ---
+            if use_checkpoint:
+                # Pack optional alpha_act/beta_act as zeros when None so checkpoint gets tensors
+                has_act = alpha_act is not None
+                _alpha_act = alpha_act if has_act else torch.zeros(BT, self.n_synch, device=x.device, dtype=x.dtype)
+                _beta_act = beta_act if has_act else torch.ones(BT, self.n_synch, device=x.device, dtype=x.dtype)
+                state, trace = grad_checkpoint(
+                    self._tick_core, _alpha_act, _beta_act, x, attn_k, attn_v, state, trace,
+                    use_reentrant=False,
+                )
             else:
-                synch_act = torch.zeros(BT, self.n_synch, device=x.device, dtype=x.dtype)
-            attn_q = norm(self.attn_q_proj(synch_act).view(B, T, H, HD))  # QK norm
-            obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
-            obs = obs.reshape(BT, D)
+                # Cross-attention: use S_action to generate query, re-observe input
+                if alpha_act is not None:
+                    synch_act = (alpha_act / torch.sqrt(beta_act)).to(x.dtype)
+                else:
+                    synch_act = torch.zeros(BT, self.n_synch, device=x.device, dtype=x.dtype)
+                attn_q = norm(self.attn_q_proj(synch_act).view(B, T, H, HD))  # QK norm
+                obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
+                obs = obs.reshape(BT, D)
 
-            # U-NET synapses: mix observation with current state
-            new_state = self.synapses(torch.cat([obs, state], dim=-1))  # (BT, D)
+                # U-NET synapses: mix observation with current state
+                new_state = self.synapses(torch.cat([obs, state], dim=-1))  # (BT, D)
 
-            # Update trace (rolling window: drop oldest, append newest)
-            trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
+                # Update trace (rolling window: drop oldest, append newest)
+                trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
 
-            # NLMs: per-neuron processing of trace history
-            h = F.glu(self.nlm1(trace), dim=-1)       # (BT, D, hidden)
-            state = F.glu(self.nlm2(h), dim=-1).squeeze(-1)  # (BT, D)
+                # NLMs: per-neuron processing of trace history
+                h = F.glu(self.nlm1(trace), dim=-1)       # (BT, D, hidden)
+                state = F.glu(self.nlm2(h), dim=-1).squeeze(-1)  # (BT, D)
 
             # Track state delta (convergence / confidence signal)
             if track_deltas:
@@ -468,10 +511,14 @@ class CTMBlock(nn.Module):
         # Only keep the last token's state — during prefill BT = B*T but we
         # only need the final position to seed the next decode step.
         if ctm_cache is not None:
+            # Save last token's state per batch element: (BT, *) -> (B, T, *) -> (B, *)
             ctm_cache.layers[layer_idx] = {
-                'state': state[-1:], 'trace': trace[-1:],
-                'alpha_out': alpha_out[-1:], 'beta_out': beta_out[-1:],
-                'alpha_act': alpha_act[-1:], 'beta_act': beta_act[-1:],
+                'state': state.view(B, T, -1)[:, -1, :],
+                'trace': trace.view(B, T, self.D, self.M)[:, -1, :, :],
+                'alpha_out': alpha_out.view(B, T, -1)[:, -1, :],
+                'beta_out': beta_out.view(B, T, -1)[:, -1, :],
+                'alpha_act': alpha_act.view(B, T, -1)[:, -1, :],
+                'beta_act': beta_act.view(B, T, -1)[:, -1, :],
             }
 
         if dream:
@@ -743,15 +790,17 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         # Muon only works on 2D matrices; route everything else to AdamW
-        all_h_params = list(self.transformer.h.parameters())
+        # Filter out frozen params (requires_grad=False) for Phase 2 freeze
+        all_h_params = [p for p in self.transformer.h.parameters() if p.requires_grad]
         matrix_params = [p for p in all_h_params if p.ndim == 2]
         ctm_other_params = [p for p in all_h_params if p.ndim != 2]  # SuperLinear 3D, decay 1D, start states, LayerNorm
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(ctm_other_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        value_embeds_params = [p for p in self.value_embeds.parameters() if p.requires_grad]
+        embedding_params = [p for p in self.transformer.wte.parameters() if p.requires_grad]
+        lm_head_params = [p for p in self.lm_head.parameters() if p.requires_grad]
+        resid_params = [self.resid_lambdas] if self.resid_lambdas.requires_grad else []
+        x0_params = [self.x0_lambdas] if self.x0_lambdas.requires_grad else []
+        all_trainable = [p for p in self.parameters() if p.requires_grad]
+        assert len(all_trainable) == len(matrix_params) + len(ctm_other_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -792,7 +841,7 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
         return logits
 
-    def forward(self, idx, targets=None, kv_cache=None, ctm_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, ctm_cache=None, loss_reduction='mean', pos_offset=0):
         """
         CTMCache is inference-only: during training, all T positions in a sequence process
         independently from start_state (like an MLP). This is intentional — training batches
@@ -813,7 +862,7 @@ class GPT(nn.Module):
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        T0 = pos_offset if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
@@ -891,6 +940,49 @@ class GPT(nn.Module):
         else:
             # inference: just return the logits directly
             return logits
+
+    def forward_chunked_bptt(self, idx, targets, n_chunks=8):
+        """Phase 3: chunked backpropagation through time for CTM state continuity.
+
+        Splits the sequence into n_chunks, processes sequentially with CTM state
+        carried between chunks. Gradients are detached at chunk boundaries
+        (truncated BPTT) to bound memory. Teaches the model to use persistent
+        CTM state — the prerequisite for episodic and semantic memory.
+
+        Attention context is local to each chunk (no KV cache carry). Cross-chunk
+        information flows only through CTM state — which is exactly what we're training.
+
+        Args:
+            idx: token indices (B, T)
+            targets: target token indices (B, T)
+            n_chunks: number of chunks to split the sequence into
+        """
+        B, T = idx.size()
+        assert T % n_chunks == 0, f"seq_len {T} not divisible by n_chunks {n_chunks}"
+        C = T // n_chunks
+
+        ctm_cache = CTMCache(self.config.n_layer)
+        total_loss = 0.0
+
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * C
+            end = start + C
+            chunk_loss = self.forward(
+                idx[:, start:end],
+                targets[:, start:end],
+                ctm_cache=ctm_cache,
+                pos_offset=start,
+            )
+            total_loss = total_loss + chunk_loss
+
+            # Truncated BPTT: detach state at chunk boundaries to cut gradient flow
+            if chunk_idx < n_chunks - 1:
+                for layer_state in ctm_cache.layers:
+                    if layer_state is not None:
+                        for key in layer_state:
+                            layer_state[key] = layer_state[key].detach()
+
+        return total_loss / n_chunks
 
     @torch.inference_mode()
     def dream(self, idx):
@@ -988,7 +1080,10 @@ class GPT(nn.Module):
                     new_k = max(min_k, k_idx + 1)  # +1 because we need at least this many
                     break
 
-            block.mlp.active_K = new_k
+            # NOTE: we no longer reduce active_K. The model was trained with full K
+            # and reducing it at inference/sleep degrades quality. We still track
+            # convergence for diagnostics, but don't act on it.
+            # block.mlp.active_K = new_k
             results[i] = {
                 'deltas': deltas,
                 'old_k': old_k,

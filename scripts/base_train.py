@@ -78,6 +78,8 @@ parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisa
 parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension")
 parser.add_argument("--ctm-synapse-depth", type=int, default=6, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16.")
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
+parser.add_argument("--freeze-non-ctm", action="store_true", help="freeze attention+embeddings, only train CTM blocks (Phase 2 fine-tuning)")
+parser.add_argument("--bptt-chunks", type=int, default=1, help="Phase 3: split sequences into N chunks for truncated BPTT with CTM state carry-over (1 = disabled)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -176,6 +178,23 @@ if args.warm_start_from:
     missing, unexpected = model.load_state_dict(warm_data, strict=False, assign=True)
     print0(f"Warm-start from {args.warm_start_from} step {warm_step}")
     print0(f"  Loaded {len(warm_data)} keys, {len(missing)} missing (CTM blocks), {len(unexpected)} unexpected")
+
+# Phase 2: freeze everything except CTM blocks (attention+embeddings already learned language)
+if args.freeze_non_ctm:
+    from nanochat.gpt import CTMBlock
+    n_frozen, n_trainable = 0, 0
+    for name, param in model.named_parameters():
+        is_ctm = any(f'.mlp.{attr}' in name for attr in [
+            'synapses', 'nlm1', 'nlm2', 'c_proj', 'start_state', 'start_trace',
+            'decay_out', 'decay_act', 'attn_q_proj', 'attn_k_proj', 'attn_v_proj',
+        ])
+        if is_ctm:
+            param.requires_grad_(True)
+            n_trainable += param.numel()
+        else:
+            param.requires_grad_(False)
+            n_frozen += param.numel()
+    print0(f"Phase 2 freeze: {n_frozen:,} params frozen, {n_trainable:,} CTM params trainable")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -507,11 +526,14 @@ while True:
             "If 5*x + 3 = 13, then x is",
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+        try:
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with disable_fp8(orig_model):
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                print0(tokenizer.decode(sample[0]))
+        except Exception as e:
+            print0(f"Sampling failed: {e}")
         model.train()
 
     # once in a while: run CTM sleep cycle (dream + compaction) to adapt per-layer K
@@ -603,7 +625,10 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        if args.bptt_chunks > 1 and args.use_ctm:
+            loss = model.forward_chunked_bptt(x, y, n_chunks=args.bptt_chunks)
+        else:
+            loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
