@@ -271,6 +271,16 @@ def disable_fp8(model):
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 if os.environ.get("NANOCHAT_NO_COMPILE"):
     print0("torch.compile disabled via NANOCHAT_NO_COMPILE")
+elif model.config.use_ctm:
+    # CTMBlock has a K-iteration loop + mixed-rank params that torch.compile can't handle
+    # (compiler OOMs trying to unroll the loop). Instead, compile just the attention modules.
+    from nanochat.gpt import CausalSelfAttention, Block
+    n_compiled = 0
+    for block in model.transformer.h:
+        if isinstance(block, Block):
+            block.attn = torch.compile(block.attn, dynamic=False)
+            n_compiled += 1
+    print0(f"Partial torch.compile: compiled {n_compiled} attention modules (CTMBlock left interpreted)")
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
