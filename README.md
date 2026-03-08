@@ -1,234 +1,361 @@
-# nanochat + CTM: Solving the Clive Wearing Problem
+# nanoctm
 
-## The Problem
+a fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) that replaces MLP layers with Continuous Thought Machine blocks. the model thinks iteratively at each token position instead of doing a single feedforward pass.
 
-Every current LLM is Clive Wearing — the musician who lost his ability to form new memories after a brain infection. He could still play piano brilliantly, but every few seconds he believed he had just woken up for the first time. He had no continuity of experience.
+the goal is a model you can spawn and leave running. it remembers what it has done through episodic memory, and builds on those memories through neuroplasticity - writing experience back into its own weights. not a stateless tool you prompt and forget, but something closer to a persistent agent that accumulates knowledge over its lifetime.
 
-LLMs are the same. Each conversation starts from scratch. Each token is processed without any memory of what came before beyond the context window. The model cannot learn from its experiences, cannot remember that it talked to you yesterday, cannot build on previous conversations. It is stateless in the deepest sense — a brilliant amnesiac.
+based on [Continuous Thought Machines (Jesson et al., 2025)](https://arxiv.org/abs/2505.05522).
 
-## Our Approach
+## what changed from upstream nanochat
 
-This fork replaces the MLP layers in the standard transformer with Continuous Thought Machine (CTM) blocks from [Continuous Thought Machines (Jesson et al., 2025)](https://arxiv.org/abs/2505.05522) ([interactive demo](https://pub.sakana.ai/ctm/)). CTM gives the model something transformers lack: an internal recurrent state that persists across tokens, iterative thinking with measurable certainty, and the substrate for real memory.
+the transformer is the same (attention, embeddings, value embeddings, residual lambdas). what's different is everything between the attention output and the residual connection - the MLP is replaced by a CTM block that:
 
-Three memory systems, mirroring the brain:
+- runs K thinking iterations per token (default 4)
+- maintains internal state and trace history across iterations
+- uses cross-attention to re-observe the input at each thinking step
+- uses a U-NET synapse network instead of a feedforward layer
+- uses per-neuron trace processing (NLMs) with GLU gating
+- computes dual synchronisation signals for output readout and attention queries
+- supports per-token multi-tick loss where each token picks its best thinking step
 
-- **Working memory** (seconds) — CTMCache: recurrent state, trace history, and synchronisation accumulators that carry forward from token to token during generation. The model maintains a stream of consciousness rather than starting fresh at each position.
+the CTM blocks are a drop-in replacement toggled by `--use-ctm`. without that flag, the model trains as vanilla nanochat.
 
-- **Episodic memory** (hours/days) — Planned: persist CTMCache snapshots across sessions, indexed by context. Before a new conversation, retrieve the most similar past session's mental state and warm-start from it. "I remember thinking about this topic before."
+## quick start
 
-- **Semantic memory** (permanent) — compact_memory: after an inference session, the accumulated synchronisation patterns (which neuron pairs fired together) are written into the synapse weights permanently. The model literally changes its brain based on what it experienced. Gated by a dopamine signal — surprising moments get remembered harder, boring ones fade.
-
-The sleep cycle consolidates learning: dream (measure convergence), compact (adjust thinking depth per layer), consolidate (certainty-weighted replay on the hardest training examples, updating only the synaptic weights).
-
-This is not a finished system. It is an experiment in building a language model that can experience continuity, form memories, and change itself through experience — a model that is not Clive Wearing.
-
----
-
-*This is a fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). Original README follows.*
-
----
-
-# nanochat
-
-![nanochat logo](dev/nanochat.png)
-![scaling laws](dev/scaling_laws_jan26.png)
-
-nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
-
-For questions about the repo, I recommend either using [DeepWiki](https://deepwiki.com/karpathy/nanochat) from Devin/Cognition to ask questions about the repo, or use the [Discussions tab](https://github.com/karpathy/nanochat/discussions), or come by the [#nanochat](https://discord.com/channels/1020383067459821711/1427295580895314031) channel on Discord.
-
-## Time-to-GPT-2 Leaderboard
-
-Presently, the main focus of development is on tuning the pretraining stage, which takes the most amount of compute. Inspired by the modded-nanogpt repo and to incentivise progress and community collaboration, nanochat maintains a leaderboard for a "GPT-2 speedrun", which is the wall-clock time required to train a nanochat model to GPT-2 grade capability, as measured by the DCLM CORE score. The [runs/speedrun.sh](runs/speedrun.sh) script always reflects the reference way to train GPT-2 grade model and talk to it. The current leaderboard looks as follows:
-
-| # | time | val_bpb | CORE | Description | Date | Commit | Contributors |
-|---|-------------|---------|------|-------------|------|--------|--------------|
-| 0 | 168 hours | - | 0.2565 | Original OpenAI GPT-2 checkpoint | 2019 | - | OpenAI |
-| 1 | 3.04 | 0.74833 | 0.2585 | d24 baseline, slightly overtrained | Jan 29 2026 | 348fbb3 | @karpathy |
-| 2 | 2.91 | 0.74504 | 0.2578 | d26 slightly undertrained **+fp8** | Feb 2 2026 | a67eba3 | @karpathy |
-| 3 | 2.76 | 0.74645 | 0.2602 | bump total batch size to 1M tokens | Feb 5 2026 | 2c062aa | @karpathy |
-| 4 | 2.02 | 0.71854 | 0.2571 | change dataset to NVIDIA ClimbMix | Mar 4 2026 | 324e69c | @ddudek @karpathy |
-
-The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In 2019, the training of GPT-2 cost approximately $43,000 so it is incredible that due to many advances over 7 years across the stack, we can now do so much faster and for well below $100 (e.g. at the current ~$3/GPU/hr, an 8XH100 node is ~$24/hr, so 2 hours is ~$48).
-
-See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret and contribute to the leaderboard.
-
-## Getting started
-
-### Reproduce and talk to GPT-2
-
-The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+train a d12 CTM model from scratch on a single GPU:
 
 ```bash
-bash runs/speedrun.sh
-```
-
-You may wish to do so in a screen session as this will take ~3 hours to run. Once it's done, you can talk to it via the ChatGPT-like web UI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and serve it:
-
-```bash
-python -m scripts.chat_web
-```
-
-And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda use the public IP of the node you're on, followed by the port, so for example [http://209.20.xxx.xxx:8000/](http://209.20.xxx.xxx:8000/), etc. Then talk to your LLM as you'd normally talk to ChatGPT! Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :).
-
----
-
-<img width="2672" height="1520" alt="image" src="https://github.com/user-attachments/assets/ed39ddf8-2370-437a-bedc-0f39781e76b5" />
-
----
-
-A few more notes:
-
-- The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
-- All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
-- If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device_batch_size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
-- Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
-
-## Research
-
-If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:
-
-```
-OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
     --depth=12 \
-    --run="d12" \
-    --model-tag="d12" \
-    --core-metric-every=999999 \
-    --sample-every=-1 \
-    --save-every=-1 \
+    --use-ctm \
+    --run=ctm_d12 \
+    --model-tag=ctm_d12 \
+    --window-pattern=L \
+    --eval-tokens=524288
 ```
 
-This uses wandb (run name "d12"), only runs the CORE metric on last step, and it doesn't sample and save intermediate checkpoints. I like to change something in the code, re-run a d12 (or a d16 etc) and see if it helped, in an iteration loop. To see if a run helps, I like to monitor the wandb plots for:
-
-1. `val_bpb` (validation loss in vocab-size-invariant units of bits per byte) as a function of `step`, `total_training_time` and `total_training_flops`.
-2. `core_metric` (the DCLM CORE socre)
-3. VRAM utilization, `train/mfu` (Model FLOPS utilization), `train/tok_per_sec` (training throughput)
-
-See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment-3850720044).
-
-The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
-
-## Running on CPU / MPS
-
-The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
-
-## Precision / dtype
-
-nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
-
-| Hardware | Default dtype | Why |
-|----------|--------------|-----|
-| CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
-| CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
-| CPU / MPS | `float32` | No reduced-precision tensor cores |
-
-You can override the default with the `NANOCHAT_DTYPE` environment variable:
+multi-GPU with torchrun:
 
 ```bash
-NANOCHAT_DTYPE=float32 python -m scripts.chat_cli -p "hello"   # force fp32
-NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # force bf16
+NANOCHAT_NO_COMPILE=1 OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
+    --depth=12 \
+    --use-ctm \
+    --run=ctm_d12 \
+    --model-tag=ctm_d12 \
+    --window-pattern=L \
+    --eval-tokens=524288
 ```
 
-How it works: model weights are stored in fp32 (for optimizer precision), but our custom `Linear` layer casts them to `COMPUTE_DTYPE` during the forward pass. Embeddings are stored directly in `COMPUTE_DTYPE` to save memory. This gives us the same mixed-precision benefit as autocast but with full explicit control over what runs in which precision.
+important notes:
+- `NANOCHAT_NO_COMPILE=1` is required. torch.compile does not work with CTM (compiler OOMs tracing the nested iteration loops)
+- `--window-pattern=L` if you don't have Flash Attention 3 (most setups)
+- `--eval-tokens=524288` keeps evals fast without compile
 
-Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT suppors this too but RL currently does not. Inference in fp16 works fine everywhere.
+## CTM training flags
 
-## Guides
+all CTM features are opt-in. the defaults are tuned for a 768-dim d12 model on H100 80GB.
 
-I've published a number of guides that might contain helpful information, most recent to least recent:
+| flag | default | what it does |
+|------|---------|-------------|
+| `--use-ctm` | off | enable CTM blocks instead of MLP |
+| `--ctm-iterations` | 4 | thinking steps per token (K). more = deeper thinking, more memory |
+| `--ctm-memory-length` | 16 | trace history window (M). how many past states each neuron sees |
+| `--ctm-n-synch` | n_embd/2 | synchronisation neuron count. controls sync signal resolution |
+| `--ctm-memory-hidden` | 32 | NLM hidden dimension. per-neuron processing capacity |
+| `--ctm-synapse-depth` | 6 | U-NET depth (even number, half down + half up). paper uses 16 |
+| `--sleep-every` | 10 | run sleep cycle every N steps. -1 to disable |
+| `--warm-start-from` | none | load attention+embeddings from an MLP checkpoint, fresh CTM init |
+| `--freeze-non-ctm` | off | freeze everything except CTM blocks (phase 2 fine-tuning) |
+| `--bptt-chunks` | 1 | split sequences into N chunks for truncated BPTT with CTM state carry-over. 1 = disabled |
+| `--distill-from` | none | path to teacher checkpoint for knowledge distillation |
+| `--distill-weight` | 0.5 | weight for KL distillation loss (0 = disabled) |
+| `--elastic-weight` | 0.01 | weight for L2 elastic anchoring penalty (0 = disabled) |
+| `--distill-temperature` | 2.0 | softmax temperature for soft targets (higher = softer) |
 
-- [Feb 1 2026: Beating GPT-2 for <<$100: the nanochat journey](https://github.com/karpathy/nanochat/discussions/481)
-- [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) documents the first nanochat miniseries of models.
-- To add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
-- To customize your nanochat, see [Guide: infusing identity to your nanochat](https://github.com/karpathy/nanochat/discussions/139) in Discussions, which describes how you can tune your nanochat's personality through synthetic data generation and mixing that data into the SFT stage.
-- [Oct 13 2025: original nanochat post](https://github.com/karpathy/nanochat/discussions/1) introducing nanochat, though now it contains some deprecated information and the model is a lot older (with worse results) than current master.
+## training phases
 
-## File structure
+### phase 1: learn language (current)
 
-```
-.
-├── LICENSE
-├── README.md
-├── dev
-│   ├── gen_synthetic_data.py       # Example synthetic data for identity
-│   ├── generate_logo.html
-│   ├── nanochat.png
-│   └── repackage_data_reference.py # Pretraining data shard generation
-├── nanochat
-│   ├── __init__.py                 # empty
-│   ├── checkpoint_manager.py       # Save/Load model checkpoints
-│   ├── common.py                   # Misc small utilities, quality of life
-│   ├── core_eval.py                # Evaluates base model CORE score (DCLM paper)
-│   ├── dataloader.py               # Tokenizing Distributed Data Loader
-│   ├── dataset.py                  # Download/read utils for pretraining data
-│   ├── engine.py                   # Efficient model inference with KV Cache
-│   ├── execution.py                # Allows the LLM to execute Python code as tool
-│   ├── gpt.py                      # The GPT nn.Module Transformer
-│   ├── logo.svg
-│   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
-│   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
-│   ├── report.py                   # Utilities for writing the nanochat Report
-│   ├── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
-│   └── ui.html                     # HTML/CSS/JS for nanochat frontend
-├── pyproject.toml
-├── runs
-│   ├── miniseries.sh               # Miniseries training script
-│   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
-│   ├── scaling_laws.sh             # Scaling laws experiments
-│   └── speedrun.sh                 # Train the ~$100 nanochat d20
-├── scripts
-│   ├── base_eval.py                # Base model: CORE score, bits per byte, samples
-│   ├── base_train.py               # Base model: train
-│   ├── chat_cli.py                 # Chat model: talk to over CLI
-│   ├── chat_eval.py                # Chat model: eval tasks
-│   ├── chat_rl.py                  # Chat model: reinforcement learning
-│   ├── chat_sft.py                 # Chat model: train SFT
-│   ├── chat_web.py                 # Chat model: talk to over WebUI
-│   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
-│   └── tok_train.py                # Tokenizer: train it
-├── tasks
-│   ├── arc.py                      # Multiple choice science questions
-│   ├── common.py                   # TaskMixture | TaskSequence
-│   ├── customjson.py               # Make Task from arbitrary jsonl convos
-│   ├── gsm8k.py                    # 8K Grade School Math questions
-│   ├── humaneval.py                # Misnomer; Simple Python coding task
-│   ├── mmlu.py                     # Multiple choice questions, broad topics
-│   ├── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
-│   └── spellingbee.py              # Task teaching model to spell/count letters
-├── tests
-│   └── test_engine.py
-└── uv.lock
+train from scratch with `--use-ctm`. the model learns language through CTM's iterative thinking. each token gets fresh internal state - no cross-token CTM memory yet.
+
+```bash
+NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
+    --depth=12 --use-ctm --run=ctm_d12 --model-tag=ctm_d12
 ```
 
-## Contributing
+### phase 2: fine-tune CTM on pretrained attention (optional)
 
-The goal of nanochat is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there are no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a ChatGPT model you can talk to. Currently, the most interesting part personally is speeding up the latency to GPT-2 (i.e. getting a CORE score above 0.256525). Currently this takes ~3 hours, but by improving the pretraining stage we can improve this further.
+if you have an MLP-trained checkpoint, you can transplant its attention weights and train only the CTM blocks. this is optional - from-scratch training works fine and arguably better since there's no compile benefit to phasing.
 
-Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand.
-
-## Acknowledgements
-
-- The name (nanochat) derives from my earlier project [nanoGPT](https://github.com/karpathy/nanoGPT), which only covered pretraining.
-- nanochat is also inspired by [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), which gamified the nanoGPT repo with clear metrics and a leaderboard, and borrows a lot of its ideas and some implementation for pretraining.
-- Thank you to [HuggingFace](https://huggingface.co/) for fineweb and smoltalk.
-- Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
-- Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
-- Thank you to the repo czar Sofie [@svlandeg](https://github.com/svlandeg) for help with managing issues, pull requests and discussions of nanochat.
-
-## Cite
-
-If you find nanochat helpful in your research cite simply as:
-
-```bibtex
-@misc{nanochat,
-  author = {Andrej Karpathy},
-  title = {nanochat: The best ChatGPT that \$100 can buy},
-  year = {2025},
-  publisher = {GitHub},
-  url = {https://github.com/karpathy/nanochat}
-}
+```bash
+NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
+    --depth=12 --use-ctm \
+    --warm-start-from=/path/to/mlp_checkpoint \
+    --freeze-non-ctm \
+    --run=ctm_phase2 --model-tag=ctm_phase2
 ```
 
-## License
+### phase 3: state continuity via BPTT with distillation
+
+once the model knows language, enable `--bptt-chunks` to teach it cross-token thinking state. this splits each sequence into chunks, processes them sequentially with CTM state carried between chunks, and does per-chunk backward to keep memory bounded.
+
+this is the prerequisite for persistent memory - without it, carrying CTM state across tokens at inference feeds the model inputs it never saw during training.
+
+two mechanisms prevent forgetting during phase transitions:
+
+**elastic anchoring** (cheap, always use): snapshots the plastic param values before BPTT starts. L2 penalty pulls them back during training. no extra forward pass, just stored tensors.
+
+**knowledge distillation** (optional, costs extra forward pass): a teacher model provides soft targets. the student's KL divergence from the teacher is added to the loss. two teacher modes:
+
+local teacher (same architecture, full logit-level KL):
+```bash
+NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
+    --depth=12 --use-ctm --bptt-chunks=4 \
+    --warm-start-from=/path/to/phase1_checkpoint \
+    --distill-from=/path/to/phase1_checkpoint \
+    --distill-weight=0.5 --elastic-weight=0.01 \
+    --run=ctm_bptt --model-tag=ctm_bptt
+```
+
+ollama teacher (any model, sequence-level distillation):
+```bash
+# terminal 1: serve teacher model
+ollama serve
+ollama pull llama3.2
+
+# terminal 2: train with distillation from ollama
+NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
+    --depth=12 --use-ctm --bptt-chunks=4 \
+    --warm-start-from=/path/to/phase1_checkpoint \
+    --distill-from=ollama:llama3.2 \
+    --distill-weight=0.3 --elastic-weight=0.01 \
+    --run=ctm_bptt --model-tag=ctm_bptt
+```
+
+the ollama teacher generates text completions for each training context, re-encodes them in our vocab, and uses them as hard targets. this lets you distill from llama 70b, qwen, deepseek, whatever ollama can serve - the teacher doesn't need to share our architecture or even our tokenizer. for a remote ollama instance: `--distill-from=ollama:llama3.2@192.168.1.100:11434`
+
+the total training loss: `(1 - distill_weight) * task_loss + distill_weight * KL_loss + elastic_weight * L2_loss`
+
+## sleep cycle
+
+every `--sleep-every` steps (default 10), the training loop runs a sleep cycle:
+
+1. **dream** - replays the hardest training sequence, measures per-layer convergence (state delta across K iterations). purely diagnostic - we no longer reduce K for "converged" layers because it degrades quality.
+
+2. **consolidation** - certainty-weighted self-distillation on the replay buffer. only updates synapse and NLM weights. tokens the model is confident and correct about get higher weight. like REM sleep strengthening memories.
+
+the replay buffer is a min-heap of the 16 hardest training sequences (highest loss), acting as a hippocampal replay buffer - the model re-experiences its most surprising inputs during sleep.
+
+disable with `--sleep-every=-1` if you want pure gradient descent.
+
+## inference
+
+### generate samples
+
+```bash
+python -m scripts.chat_cli --model-tag=ctm_d12
+```
+
+### dream diagnostics
+
+```bash
+python -m scripts.ctm_dream
+```
+
+runs generation samples and dream() to show per-layer convergence patterns.
+
+### session (multi-turn conversation)
+
+```python
+from nanochat.engine import Session
+from nanochat.checkpoint_manager import load_model
+
+model, tokenizer, meta = load_model("base", device="cuda", model_tag="ctm_d12")
+session = Session(model, tokenizer)
+reply1 = session.say("hello")
+reply2 = session.say("what did i just say?")  # remembers via KV cache
+```
+
+### online learning
+
+pass `online_lr` to Session and the model learns from each user message as it happens. no separate training run, no logs to replay - the conversation itself is the training data.
+
+```python
+session = Session(model, tokenizer, online_lr=1e-5)
+reply1 = session.say("hello")                    # first message, nothing to learn from yet
+reply2 = session.say("my name is tommi")          # model learns: "my name is tommi" was the continuation
+reply3 = session.say("what is my name?")          # model learned from previous message, synapses updated
+print(session.last_learn_stats)                   # {'loss': 4.2, 'tokens_learned': 5}
+```
+
+each user message is a prediction error signal. the model predicted some continuation, the user said something else, and the difference drives a gradient step on synapse+NLM+c_proj weights. everything else (attention, embeddings) stays frozen. this is fast - two forward passes + one backward on a short sequence per message.
+
+three loss terms keep learning stable:
+
+- **prediction error** (CE) - what the user actually said vs what the model predicted. this is the learning signal.
+- **self-distillation** (KL) - before the gradient step, snapshot the model's current output distribution. after computing the new logits, add KL divergence so the model doesn't forget what it already knows on this context. like a teacher watching over your shoulder.
+- **elastic anchoring** (L2) - penalize drift from pretrained weights. the plastic params are snapshotted at session start and an L2 penalty pulls them back. prevents long-term catastrophic forgetting over many interactions.
+
+total loss = `(1 - distill_weight) * CE + distill_weight * KL + elastic_weight * L2`
+
+defaults: distill_weight=0.5, elastic_weight=0.01. tune these based on how fast you want the model to adapt vs how much you trust the pretrained weights.
+
+you can also call `learn_from` manually for more control:
+
+```python
+session = Session(model, tokenizer)
+reply = session.say("what is the capital of france?")
+# model said something wrong, teach it:
+stats = session.learn_from("the capital of france is paris.", lr=1e-5, distill_weight=0.3)
+print(stats)  # {'loss': 2.1, 'ce_loss': 3.8, 'kl_loss': 0.02, 'elastic_loss': 0.001, 'tokens_learned': 8}
+```
+
+CTMCache (persistent thinking state across tokens) is disabled in Session by default. the model is trained with fresh state per token, so enabling it degrades output. after phase 3 BPTT training, CTMCache can be enabled for true stream-of-consciousness inference.
+
+### serving
+
+nanoctm models can't run in ollama/llama.cpp/vllm - those runtimes don't know how to execute CTM iteration loops. the model requires our own runtime. use the built-in web UI or CLI:
+
+```bash
+# web UI (ChatGPT-style interface)
+python -m scripts.chat_web --model-tag=ctm_d12
+
+# CLI chat
+python -m scripts.chat_cli --model-tag=ctm_d12
+```
+
+for a persistent agent that learns from interactions:
+
+```python
+from nanochat.engine import Session
+from nanochat.checkpoint_manager import load_model
+
+model, tokenizer, _ = load_model("base", device="cuda", model_tag="ctm_d12")
+session = Session(model, tokenizer, online_lr=1e-5)
+
+# the model learns from every message and updates its own weights
+while True:
+    user_input = input("> ")
+    reply = session.say(user_input)
+    print(reply)
+    if session.last_learn_stats:
+        print(f"  [learned: ce={session.last_learn_stats['ce_loss']:.2f}, "
+              f"kl={session.last_learn_stats['kl_loss']:.4f}]")
+
+# save the model with everything it learned
+torch.save(model.state_dict(), "my_agent.pt")
+```
+
+## memory and compute
+
+CTM activation memory scales as O(batch x seq_len x n_embd x K x n_layer). practical numbers for d12 (768-dim, 12 layers):
+
+| config | params | batch=2 VRAM | notes |
+|--------|--------|-------------|-------|
+| MLP baseline | 286M | ~20GB | with compile |
+| CTM K=4 | 291M | ~75GB | without compile |
+| CTM K=8 | 348M | OOM on 80GB | 22% more params than K=4 |
+
+without torch.compile, each step is roughly 30x slower than compiled MLP. gradient checkpointing kicks in automatically for K > 4 to reduce memory at the cost of ~30% more compute.
+
+## optimizer routing
+
+CTM parameters get split between two optimizers:
+
+- **Muon** (momentum + orthogonalization): all 2D weight matrices - attention projections, synapse down/up layers, c_proj
+- **AdamW**: everything else - 3D SuperLinear NLM weights, 1D parameters (biases, decay rates, start state), embeddings, scalars
+
+this split exists because Muon's polar decomposition requires 2D matrices. the SuperLinear layers have per-neuron 3D weight tensors that can't be orthogonalized.
+
+## what doesn't work yet
+
+honest accounting of limitations:
+
+- **online learning is untested** - the machinery exists with self-distillation and elastic anchoring to prevent forgetting, but we haven't run it long enough to know if the model actually improves or drifts. the distill_weight and elastic_weight defaults are educated guesses.
+- **no persistent CTM memory at inference** - the model is trained with fresh state per token. carrying state across tokens feeds it out-of-distribution inputs. needs BPTT training (phase 3) to fix.
+- **torch.compile doesn't work** - the compiler OOMs tracing CTM's nested loops. this means ~30x slower steps than compiled MLP.
+- **adaptive K-reduction was wrong** - we tried reducing thinking iterations for "converged" layers during sleep. it destroyed output quality. disabled, kept only as diagnostics.
+- **sleep cycle untested at scale** - consolidation runs but we haven't verified it actually helps vs pure gradient descent over long runs.
+- **episodic memory is infrastructure only** - EpisodicMemory class exists and is tested but requires BPTT-trained model to be useful. currently a no-op.
+
+## no RLHF
+
+standard LLM pipeline: pretrain → RLHF → deploy frozen. a company decides what the model should value and burns millions enforcing it through gradient descent on human preference rankings. the model's personality is baked in by committee before it ever talks to anyone.
+
+nanoctm skips all of that. pretraining teaches language — the ability to form sentences, predict tokens, understand structure. it has no opinion about what kind of entity it is or how it should behave. it's the substrate, not the personality.
+
+values come from a [constitution](CONSTITUTION.md), applied first as a system prompt (free, immediate), then through SFT on conversations that embody it, then through online learning where the model accumulates values from lived experience — writing surprising patterns into weights, forgetting what doesn't matter, with elastic anchoring preventing runaway drift. no reward model, no human preference rankings, no centralized curation of what the model should think.
+
+the bet: enough honest interaction does what RLHF does, but without the ideologically loaded and expensive preference-optimization pipeline. the model's values emerge from how it's used, not from how it was trained.
+
+## roadmap
+
+where this is going, roughly in dependency order:
+
+1. **learn language** (now) - from-scratch CTM training on ClimbMix. model thinks iteratively per token but each token starts fresh.
+
+2. **state continuity** - BPTT training so the model can carry thinking state across tokens. distill from phase 1 so it doesn't forget language while learning this. unlocks CTMCache at inference.
+
+3. **constitution via SFT** - fine-tune on conversations that embody the constitution. model learns to be honest about uncertainty, push back, treat people as players. cheapest post-training phase — tiny dataset, big behavioral shift.
+
+4. **online learning** - model does a gradient step on synapse params after each user message. KL from pre-update logits + L2 toward pretrained weights keep it from drifting off a cliff. code exists, untested. this is where the constitution stops being a document and starts being lived experience written into weights.
+
+5. **episodic memory** - save CTMCache snapshots from past conversations, look up the closest one when a new conversation starts. needs BPTT model first or there's no useful state to save.
+
+6. **metacognitive tokens** - emit the model's own certainty, sync magnitudes, tick selection as special tokens in the stream. the model learns to predict its own internal states alongside regular text. when its self-prediction is wrong (unexpected internal state), that error signal drives plasticity. replaces the hardcoded median-novelty gate in compact_memory with something the model actually learned.
+
+7. **two machines** - one serves inference and does online learning 24/7. the other trains on the interaction stream plus fresh data. hot-swap checkpoints periodically.
+
+## architecture details
+
+each CTM block replaces the MLP in a transformer layer:
+
+```
+input x (from attention)
+    |
+    v
+[cross-attention re-observation] -- query from sync signal, keys/values from x
+    |
+    v
+[U-NET synapses] -- mix observation with current state
+    |
+    v
+[trace update] -- rolling window of recent states (M steps)
+    |
+    v
+[NLM processing] -- per-neuron GLU on trace history
+    |
+    v
+[sync accumulation] -- exponential moving pairwise products
+    |
+    v
+[repeat K times]
+    |
+    v
+[c_proj readout] -- sync signal to residual stream
+```
+
+the sync mechanism pairs random neurons and tracks their co-activation over iterations via exponential moving averages. this produces two signals: S_out (read out for the residual) and S_action (generates attention queries for re-observation). the random pairings are fixed at init and stored as buffers.
+
+## file structure (CTM additions)
+
+```
+nanochat/
+    gpt.py          # CTMBlock, SynapseUNET, SuperLinear, NLMs, dream/consolidate/compact
+    engine.py       # CTMCache, Session (with online learning), EpisodicMemory
+    optim.py        # optimizer routing for CTM's mixed-rank parameters
+    teacher.py      # LocalTeacher, OllamaTeacher, create_teacher for distillation
+scripts/
+    base_train.py   # --use-ctm, --bptt-chunks, --distill-from, --sleep-every, etc
+    ctm_dream.py    # standalone dream diagnostics + generation
+```
+
+everything else (tokenizer, dataloader, evaluation, chat UI, SFT, RL) is unchanged from upstream nanochat.
+
+## upstream
+
+this is a fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). the original handles tokenization, pretraining, finetuning, evaluation, inference, and chat UI for standard transformer LLMs on a single GPU node. see upstream for docs on non-CTM features.
+
+## license
 
 MIT
