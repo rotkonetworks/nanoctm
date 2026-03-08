@@ -486,14 +486,14 @@ class CTMBlock(nn.Module):
             right_out = state[:, self.synch_out_right]
             pp_out = left_out * right_out * dopamine  # dopamine-gated
             alpha_out = r_out * alpha_out + pp_out
-            beta_out = r_out * beta_out + 1
+            beta_out = r_out * beta_out + dopamine  # scale normalizer too so sync magnitude stays stable
 
             # Update S_action synchronisation (for attention queries)
             left_act = state[:, self.synch_act_left]
             right_act = state[:, self.synch_act_right]
             pp_act = left_act * right_act * dopamine  # dopamine-gated
             alpha_act = r_act * alpha_act + pp_act
-            beta_act = r_act * beta_act + 1
+            beta_act = r_act * beta_act + dopamine  # scale normalizer too so sync magnitude stays stable
 
             # Multi-tick: save readout at each k for auxiliary loss
             if multi_tick:
@@ -1327,6 +1327,8 @@ class GPT(nn.Module):
             for p in self.parameters():
                 if p.grad is not None:
                     p.grad = None
+            # Restore training mode (eval was set to skip gradient checkpointing)
+            self.train()
 
         return stats
 
@@ -1386,8 +1388,9 @@ class GPT(nn.Module):
                 baseline_left = ctm.start_state[ctm.synch_out_left]   # (n_synch,)
                 baseline_right = ctm.start_state[ctm.synch_out_right]  # (n_synch,)
                 pp_baseline = baseline_left * baseline_right  # (n_synch,)
-                # Geometric series: sum_{k=0}^{K-1} r^k = (1 - r^K) / (1 - r)
-                beta_baseline = (1 - r_out.pow(K)) / (1 - r_out + 1e-8)  # (n_synch,)
+                # beta = r^K (from init seed) + sum_{k=0}^{K-1} r^k (from K ticks)
+                geo_sum = (1 - r_out.pow(K)) / (1 - r_out + 1e-8)
+                beta_baseline = r_out.pow(K) + geo_sum  # (n_synch,)
                 synch_baseline = pp_baseline * torch.sqrt(beta_baseline)  # (n_synch,)
 
                 # 2. Novelty: how much did sync diverge from baseline?
@@ -1434,7 +1437,7 @@ class GPT(nn.Module):
                     rank1_update = state_delta[:D_out].unsqueeze(1) * input_approx.unsqueeze(0)
                     last_up.weight.data += lr * rank1_update.to(last_up.weight.dtype)
 
-                # 5. Homeostasis: clamp weight norms to at most 1% growth from base
+                # 5. Homeostasis: clamp weight norms to at most 1% growth per call
                 for layer in updated_layers:
                     if hasattr(layer, 'weight'):
                         w = layer.weight.data
@@ -1442,6 +1445,8 @@ class GPT(nn.Module):
                         max_norm = base_norms[id(layer)] * 1.01
                         if current_norm > max_norm:
                             w.mul_(max_norm / current_norm)
+                        # Update base norm so subsequent calls allow incremental growth
+                        layer._plasticity_base_norm = w.norm().clone()
 
                 stats[i] = {
                     'mean_novelty': novelty.mean().item(),
