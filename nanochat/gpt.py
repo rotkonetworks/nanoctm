@@ -413,7 +413,17 @@ class CTMBlock(nn.Module):
         else:
             state = self.start_state.to(dtype).unsqueeze(0).expand(BT, -1)
             trace = self.start_trace.to(dtype).unsqueeze(0).expand(BT, -1, -1).clone()  # (BT, D, M)
-            alpha_out = alpha_act = beta_out = beta_act = None
+            # Seed sync accumulators from start_state (paper: first tick uses raw pairwise product)
+            left_out_init = state[:, self.synch_out_left]
+            right_out_init = state[:, self.synch_out_right]
+            pp_out = left_out_init * right_out_init
+            alpha_out = pp_out
+            beta_out = torch.ones_like(pp_out)
+            left_act_init = state[:, self.synch_act_left]
+            right_act_init = state[:, self.synch_act_right]
+            pp_act = left_act_init * right_act_init
+            alpha_act = pp_act
+            beta_act = torch.ones_like(pp_act)
 
         # Dual synchronisation accumulators
         r_out = torch.exp(-self.decay_out.clamp(0, 15).to(dtype)).unsqueeze(0)
@@ -437,21 +447,14 @@ class CTMBlock(nn.Module):
 
             # --- Core tick computation (optionally checkpointed) ---
             if use_checkpoint:
-                # Pack optional alpha_act/beta_act as zeros when None so checkpoint gets tensors
-                has_act = alpha_act is not None
-                _alpha_act = alpha_act if has_act else torch.zeros(BT, self.n_synch, device=x.device, dtype=x.dtype)
-                _beta_act = beta_act if has_act else torch.ones(BT, self.n_synch, device=x.device, dtype=x.dtype)
                 tick_emb = self.tick_embed[k].unsqueeze(0).expand(BT, -1)
                 state, trace = grad_checkpoint(
-                    self._tick_core, _alpha_act, _beta_act, x, attn_k, attn_v, state, trace, tick_emb,
+                    self._tick_core, alpha_act, beta_act, x, attn_k, attn_v, state, trace, tick_emb,
                     use_reentrant=False,
                 )
             else:
                 # Cross-attention: use S_action to generate query, re-observe input
-                if alpha_act is not None:
-                    synch_act = (alpha_act / torch.sqrt(beta_act)).to(x.dtype)
-                else:
-                    synch_act = torch.zeros(BT, self.n_synch, device=x.device, dtype=x.dtype)
+                synch_act = (alpha_act / torch.sqrt(beta_act)).to(x.dtype)
                 attn_q = norm(self.attn_q_proj(synch_act).view(B, T, H, HD))  # QK norm
                 obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
                 obs = obs.reshape(BT, D)
@@ -482,21 +485,15 @@ class CTMBlock(nn.Module):
             left_out = state[:, self.synch_out_left]
             right_out = state[:, self.synch_out_right]
             pp_out = left_out * right_out * dopamine  # dopamine-gated
-            if alpha_out is None:
-                alpha_out, beta_out = pp_out, torch.ones_like(pp_out)
-            else:
-                alpha_out = r_out * alpha_out + pp_out
-                beta_out = r_out * beta_out + 1
+            alpha_out = r_out * alpha_out + pp_out
+            beta_out = r_out * beta_out + 1
 
             # Update S_action synchronisation (for attention queries)
             left_act = state[:, self.synch_act_left]
             right_act = state[:, self.synch_act_right]
             pp_act = left_act * right_act * dopamine  # dopamine-gated
-            if alpha_act is None:
-                alpha_act, beta_act = pp_act, torch.ones_like(pp_act)
-            else:
-                alpha_act = r_act * alpha_act + pp_act
-                beta_act = r_act * beta_act + 1
+            alpha_act = r_act * alpha_act + pp_act
+            beta_act = r_act * beta_act + 1
 
             # Multi-tick: save readout at each k for auxiliary loss
             if multi_tick:
