@@ -351,10 +351,13 @@ class CTMBlock(nn.Module):
         self.decay_out = nn.Parameter(torch.zeros(n_synch))
         self.decay_act = nn.Parameter(torch.zeros(n_synch))
 
+        # Per-tick embedding: gives each iteration a unique signature so ticks diverge
+        self.tick_embed = nn.Parameter(torch.empty(K, D))
+
         # Output projection: S_out synchronisation -> residual stream
         self.c_proj = Linear(n_synch, D, bias=False)
 
-    def _tick_core(self, alpha_act, beta_act, x, attn_k, attn_v, state, trace):
+    def _tick_core(self, alpha_act, beta_act, x, attn_k, attn_v, state, trace, tick_emb):
         """One iteration of CTM thinking — factored out for gradient checkpointing."""
         B, T, D = x.shape
         BT = B * T
@@ -365,7 +368,7 @@ class CTMBlock(nn.Module):
         obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
         obs = obs.reshape(BT, D)
 
-        new_state = state + self.synapses(torch.cat([obs, state], dim=-1))
+        new_state = state + self.synapses(torch.cat([obs, state + tick_emb], dim=-1))
         trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
 
         h = F.glu(self.nlm1(trace), dim=-1)
@@ -438,8 +441,9 @@ class CTMBlock(nn.Module):
                 has_act = alpha_act is not None
                 _alpha_act = alpha_act if has_act else torch.zeros(BT, self.n_synch, device=x.device, dtype=x.dtype)
                 _beta_act = beta_act if has_act else torch.ones(BT, self.n_synch, device=x.device, dtype=x.dtype)
+                tick_emb = self.tick_embed[k].unsqueeze(0).expand(BT, -1)
                 state, trace = grad_checkpoint(
-                    self._tick_core, _alpha_act, _beta_act, x, attn_k, attn_v, state, trace,
+                    self._tick_core, _alpha_act, _beta_act, x, attn_k, attn_v, state, trace, tick_emb,
                     use_reentrant=False,
                 )
             else:
@@ -453,7 +457,8 @@ class CTMBlock(nn.Module):
                 obs = obs.reshape(BT, D)
 
                 # U-NET synapses: mix observation with current state (residual for gradient flow)
-                new_state = state + self.synapses(torch.cat([obs, state], dim=-1))  # (BT, D)
+                tick_emb = self.tick_embed[k].unsqueeze(0).expand(BT, -1)
+                new_state = state + self.synapses(torch.cat([obs, state + tick_emb], dim=-1))  # (BT, D)
 
                 # Update trace (rolling window: drop oldest, append newest)
                 trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
@@ -648,6 +653,8 @@ class GPT(nn.Module):
                     s_nlm = 1.0 / math.sqrt(nlm.w1.shape[0] + nlm.w1.shape[1])
                     nlm.w1.uniform_(-s_nlm, s_nlm)
                     nlm.b1.zero_()
+                # Tick embeddings: normal init so ticks start different
+                torch.nn.init.normal_(ctm.tick_embed, mean=0.0, std=0.02)
                 # Start states
                 s_d = 1.0 / math.sqrt(ctm.D)
                 ctm.start_state.uniform_(-s_d, s_d)
