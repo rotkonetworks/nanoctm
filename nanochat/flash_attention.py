@@ -66,6 +66,22 @@ USE_FA3 = _resolve_use_fa3()
 # =============================================================================
 # SDPA helpers
 # =============================================================================
+from functools import lru_cache
+
+@lru_cache(maxsize=32)
+def _get_sliding_window_mask(Tq: int, Tk: int, window: int, device_index: int):
+    """Create and cache a sliding window attention mask."""
+    if device_index == -1:
+        device = torch.device("cpu")
+    else:
+        device = torch.device(f"cuda:{device_index}")
+    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
+    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+    mask = col_idx <= row_idx
+    if window >= 0 and window < Tk:
+        mask = mask & ((row_idx - col_idx) <= window)
+    return mask
+
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
     """
     SDPA attention with sliding window support.
@@ -88,16 +104,10 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
             v = v[:, :, start:, :]
         return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
 
-    # Need explicit mask for sliding window/chunk inference
+    # Need explicit mask for sliding window/chunk inference - use cached mask
     device = q.device
-    # For chunk inference (Tq != Tk), is_causal is not aligned to cache position => build an explicit bool mask
-    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
-    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
-    mask = col_idx <= row_idx
-
-    # sliding window (left)
-    if window >= 0 and window < Tk:
-        mask = mask & ((row_idx - col_idx) <= window)
+    device_index = device.index if device.type == "cuda" else -1
+    mask = _get_sliding_window_mask(Tq, Tk, window, device_index)
 
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 

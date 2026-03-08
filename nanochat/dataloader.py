@@ -111,8 +111,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         nonlocal pq_idx, rg_idx, epoch
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        # Pre-convert to tensors once during buffering to avoid repeated torch.tensor() in inner loop
         for tokens in token_lists:
-            doc_buffer.append(tokens)
+            doc_buffer.append(torch.tensor(tokens, dtype=torch.long))
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
@@ -135,33 +136,33 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
                 remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely
+                # Find largest doc that fits entirely (docs are tensors)
                 best_idx = -1
                 best_len = 0
                 for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
+                    doc_len = doc.size(0)
                     if doc_len <= remaining and doc_len > best_len:
                         best_idx = i
                         best_len = doc_len
 
                 if best_idx >= 0:
                     doc = doc_buffer.pop(best_idx)
-                    doc_len = len(doc)
-                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                    doc_len = doc.size(0)
+                    row_buffer[row_idx, pos:pos + doc_len] = doc
                     pos += doc_len
                 else:
                     # No doc fits - crop shortest in buffer to fill remaining and minimize waste
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: doc_buffer[i].size(0))
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    row_buffer[row_idx, pos:pos + remaining] = doc[:remaining]
                     pos += remaining
                     # Remainder reuse: if the cropped document has leftover tokens,
                     # prepend BOS and put the remainder back into the buffer for future rows.
                     # This reduces token waste from ~35% to ~23% by recycling content that
                     # would otherwise be discarded.
                     leftover = doc[remaining:]
-                    if len(leftover) > 1:  # only reuse if remainder is meaningful (>1 token)
-                        remainder_with_bos = [bos_token] + leftover
+                    if leftover.size(0) > 1:  # only reuse if remainder is meaningful (>1 token)
+                        remainder_with_bos = torch.cat([torch.tensor([bos_token], dtype=torch.long), leftover])
                         doc_buffer.append(remainder_with_bos)
 
         # Copy to pinned CPU buffer, then single HtoD transfer
