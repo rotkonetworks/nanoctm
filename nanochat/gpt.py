@@ -507,6 +507,15 @@ class CTMBlock(nn.Module):
         synch = alpha_out / torch.sqrt(beta_out)
         out = self.c_proj(synch).reshape(B, T, D)
 
+        # ROADMAP (phase 5 - metacognitive tokens):
+        # At this point we have per-token internal state that could be emitted as
+        # special tokens into the stream: synch magnitude, state norm, which tick
+        # was most certain, convergence rate. If the model learns to predict these
+        # self-observation tokens, prediction error on them becomes a plasticity
+        # signal richer than external prediction error alone. The model builds a
+        # self-model alongside its world model, and the gap between expected and
+        # actual internal state drives targeted synaptic updates.
+
         # Persist state for next token (stream of consciousness)
         # Only keep the last token's state — during prefill BT = B*T but we
         # only need the final position to seed the next decode step.
@@ -755,6 +764,87 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token
 
+    def set_elastic_anchor(self, elastic_weight=0.01):
+        """Snapshot current plastic params as an anchor for elastic weight consolidation.
+
+        During training, an L2 penalty pulls plastic params toward this snapshot,
+        preventing catastrophic forgetting during phase transitions (e.g. BPTT phase 3).
+        No extra forward pass needed - just stored tensors.
+
+        Args:
+            elastic_weight: L2 penalty weight. higher = more conservative learning.
+        """
+        self._elastic_weight = elastic_weight
+        self._elastic_snapshot = {}
+        if self.config.use_ctm:
+            for block in self.transformer.h:
+                if isinstance(block.mlp, CTMBlock):
+                    for p in block.mlp.parameters():
+                        if p.requires_grad:
+                            self._elastic_snapshot[id(p)] = p.data.clone()
+
+    def set_teacher(self, teacher_fn, distill_weight=0.5, temperature=2.0):
+        """Set a teacher function for knowledge distillation during training.
+
+        The teacher_fn takes token ids (B, T) and returns logits (B, T, V) in our
+        vocab space. This can be:
+        - A frozen local GPT model (same architecture)
+        - An OllamaTeacher that calls an external model and maps to our vocab
+        - Any callable that returns logits
+
+        Args:
+            teacher_fn: callable(idx) -> logits tensor (B, T, V)
+            distill_weight: weight for KL term. 0 = no distillation.
+            temperature: softmax temperature for distillation (higher = softer targets)
+        """
+        self._teacher_fn = teacher_fn
+        self._distill_weight = distill_weight
+        self._distill_temp = temperature
+
+    def clear_teacher(self):
+        """Remove teacher and disable distillation."""
+        self._teacher_fn = None
+        self._distill_weight = 0.0
+
+    def clear_elastic_anchor(self):
+        """Remove elastic anchor."""
+        self._elastic_snapshot = {}
+        self._elastic_weight = 0.0
+
+    def _distill_loss(self, student_logits, idx):
+        """Compute distillation + elastic loss.
+
+        Returns (distill_loss, elastic_loss). Both 0 if no teacher/anchor set.
+        """
+        device = idx.device
+        distill_loss = torch.tensor(0.0, device=device)
+        elastic_loss = torch.tensor(0.0, device=device)
+
+        # KL divergence from teacher
+        dw = getattr(self, '_distill_weight', 0.0)
+        if dw > 0 and hasattr(self, '_teacher_fn') and self._teacher_fn is not None:
+            with torch.no_grad():
+                teacher_logits = self._teacher_fn(idx)
+            T = self._distill_temp
+            teacher_log_probs = F.log_softmax(teacher_logits / T, dim=-1)
+            student_log_probs = F.log_softmax(student_logits / T, dim=-1)
+            teacher_probs = teacher_log_probs.exp()
+            distill_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1).mean() * (T * T)
+
+        # Elastic anchoring toward snapshot
+        ew = getattr(self, '_elastic_weight', 0.0)
+        snapshot = getattr(self, '_elastic_snapshot', {})
+        if ew > 0 and snapshot:
+            penalty = 0.0
+            for block in self.transformer.h:
+                if isinstance(block.mlp, CTMBlock):
+                    for p in block.mlp.parameters():
+                        if id(p) in snapshot:
+                            penalty = penalty + (p - snapshot[id(p)]).pow(2).sum()
+            elastic_loss = penalty
+
+        return distill_loss, elastic_loss
+
     def num_scaling_params(self):
         """
         Return detailed parameter counts for scaling law analysis.
@@ -841,7 +931,7 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
         return logits
 
-    def forward(self, idx, targets=None, kv_cache=None, ctm_cache=None, loss_reduction='mean', pos_offset=0):
+    def forward(self, idx, targets=None, kv_cache=None, ctm_cache=None, loss_reduction='mean', pos_offset=0, diagnostics=None):
         """
         CTMCache is inference-only: during training, all T positions in a sequence process
         independently from start_state (like an MLP). This is intentional — training batches
@@ -866,6 +956,12 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
+        # ROADMAP (phase 5): before embedding, interleave metacognitive tokens into idx.
+        # These would encode the model's internal state from the previous forward pass
+        # (certainty, sync magnitude, tick selection) as special token IDs. The model
+        # learns to predict these alongside regular tokens, building a self-model.
+        # Prediction error on self-tokens gates plasticity: the model updates synapses
+        # most when its self-model is wrong (unexpected internal states = high learning).
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
@@ -890,72 +986,111 @@ class GPT(nn.Module):
             else:
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, ctm_cache=ctm_cache)
 
-        # Forward the lm_head (compute logits)
+        if targets is not None and use_multi_tick and last_layer_ticks:
+            # Multi-tick loss (CTM paper Listing 4): per-token tick selection
+            # Each token independently picks its best tick (argmin loss) and
+            # most certain tick (argmax certainty), matching paper's per-sample approach.
+            # Skip computing logits on final x -- we compute per-tick logits below.
+            flat_targets = targets.view(-1)  # (B*T,)
+            n_tokens = flat_targets.size(0)
+            V = self.config.vocab_size
+            max_entropy = math.log(V)
+
+            # Collect per-token unreduced losses and certainties for each tick
+            # all_losses: (K, B*T), all_certainties: (K, B*T)
+            all_losses = []
+            all_certainties = []
+            for tick_out in last_layer_ticks:
+                tick_logits = self._compute_logits(tick_out)
+                tick_logits_flat = tick_logits.view(-1, V)
+                # Unreduced CE loss per token
+                token_losses = F.cross_entropy(tick_logits_flat, flat_targets, ignore_index=-1, reduction='none')
+                all_losses.append(token_losses)
+                # Certainty = 1 - normalized_entropy per token
+                with torch.no_grad():
+                    probs = F.softmax(tick_logits_flat, dim=-1)
+                    entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)
+                    certainty = 1.0 - entropy / max_entropy
+                all_certainties.append(certainty)
+
+            all_losses = torch.stack(all_losses, dim=0)        # (K, B*T)
+            all_certainties = torch.stack(all_certainties, dim=0)  # (K, B*T)
+
+            # Per-token: select tick with lowest loss and tick with highest certainty
+            token_idx = torch.arange(n_tokens, device=all_losses.device)
+            best_tick_idx = all_losses.argmin(dim=0)     # (B*T,)
+            certain_tick_idx = all_certainties.argmax(dim=0)  # (B*T,)
+
+            loss_argmin = all_losses[best_tick_idx, token_idx].mean()
+            loss_argmax_cert = all_losses[certain_tick_idx, token_idx].mean()
+            task_loss = 0.5 * loss_argmin + 0.5 * loss_argmax_cert
+
+            # Populate diagnostics if requested
+            if diagnostics is not None:
+                with torch.no_grad():
+                    K = all_losses.size(0)
+                    # Per-tick mean loss and certainty
+                    for k in range(K):
+                        diagnostics[f'tick_{k}/loss'] = all_losses[k].mean().item()
+                        diagnostics[f'tick_{k}/certainty'] = all_certainties[k].mean().item()
+                    # Which tick wins most often (tick selection distribution)
+                    tick_counts = torch.bincount(best_tick_idx, minlength=K).float()
+                    for k in range(K):
+                        diagnostics[f'tick_{k}/selected_pct'] = (tick_counts[k] / n_tokens * 100).item()
+                    # Overall certainty stats
+                    final_certainty = all_certainties[-1]
+                    diagnostics['certainty/mean'] = final_certainty.mean().item()
+                    diagnostics['certainty/std'] = final_certainty.std().item()
+                    diagnostics['certainty/min'] = final_certainty.min().item()
+                    diagnostics['certainty/max'] = final_certainty.max().item()
+                    diagnostics['loss/argmin'] = loss_argmin.item()
+                    diagnostics['loss/argmax_cert'] = loss_argmax_cert.item()
+
+            # Distillation: use the last tick's logits as the student output
+            distill_loss, elastic_loss = self._distill_loss(self._compute_logits(last_layer_ticks[-1]), idx)
+            dw = getattr(self, '_distill_weight', 0.0)
+            ew = getattr(self, '_elastic_weight', 0.0)
+            total_loss = (1.0 - dw) * task_loss + dw * distill_loss + ew * elastic_loss
+            if diagnostics is not None:
+                diagnostics['loss/task'] = task_loss.item()
+                diagnostics['loss/distill'] = distill_loss.item()
+                diagnostics['loss/elastic'] = elastic_loss.item()
+            return total_loss
+
+        # Standard path: compute logits once
         logits = self._compute_logits(x)
-
         if targets is not None:
-            # Main loss: cross-entropy on final output (as before)
-            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            distill_loss, elastic_loss = self._distill_loss(logits, idx)
+            dw = getattr(self, '_distill_weight', 0.0)
+            ew = getattr(self, '_elastic_weight', 0.0)
+            total_loss = (1.0 - dw) * ce_loss + dw * distill_loss + ew * elastic_loss
+            if diagnostics is not None:
+                diagnostics['loss/ce'] = ce_loss.item()
+                diagnostics['loss/distill'] = distill_loss.item()
+                diagnostics['loss/elastic'] = elastic_loss.item()
+            return total_loss
+        return logits
 
-            if use_multi_tick and last_layer_ticks:
-                # Multi-tick loss (CTM paper Listing 4): per-token tick selection
-                # Each token independently picks its best tick (argmin loss) and
-                # most certain tick (argmax certainty), matching paper's per-sample approach.
-                flat_targets = targets.view(-1)  # (B*T,)
-                n_tokens = flat_targets.size(0)
-                V = logits.size(-1)
-                max_entropy = math.log(V)
-
-                # Collect per-token unreduced losses and certainties for each tick
-                # all_losses: (K, B*T), all_certainties: (K, B*T)
-                all_losses = []
-                all_certainties = []
-                for tick_out in last_layer_ticks:
-                    tick_logits = self._compute_logits(tick_out)
-                    tick_logits_flat = tick_logits.view(-1, V)
-                    # Unreduced CE loss per token
-                    token_losses = F.cross_entropy(tick_logits_flat, flat_targets, ignore_index=-1, reduction='none')
-                    all_losses.append(token_losses)
-                    # Certainty = 1 - normalized_entropy per token
-                    with torch.no_grad():
-                        probs = F.softmax(tick_logits_flat, dim=-1)
-                        entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)
-                        certainty = 1.0 - entropy / max_entropy
-                    all_certainties.append(certainty)
-
-                all_losses = torch.stack(all_losses, dim=0)        # (K, B*T)
-                all_certainties = torch.stack(all_certainties, dim=0)  # (K, B*T)
-
-                # Per-token: select tick with lowest loss and tick with highest certainty
-                token_idx = torch.arange(n_tokens, device=all_losses.device)
-                best_tick_idx = all_losses.argmin(dim=0)     # (B*T,)
-                certain_tick_idx = all_certainties.argmax(dim=0)  # (B*T,)
-
-                loss_argmin = all_losses[best_tick_idx, token_idx].mean()
-                loss_argmax_cert = all_losses[certain_tick_idx, token_idx].mean()
-                loss = 0.5 * loss_argmin + 0.5 * loss_argmax_cert
-            else:
-                loss = main_loss
-            return loss
-        else:
-            # inference: just return the logits directly
-            return logits
-
-    def forward_chunked_bptt(self, idx, targets, n_chunks=8):
+    def forward_chunked_bptt(self, idx, targets, n_chunks=8, loss_scale=1.0):
         """Phase 3: chunked backpropagation through time for CTM state continuity.
 
         Splits the sequence into n_chunks, processes sequentially with CTM state
-        carried between chunks. Gradients are detached at chunk boundaries
-        (truncated BPTT) to bound memory. Teaches the model to use persistent
-        CTM state — the prerequisite for episodic and semantic memory.
+        carried between chunks. Calls backward() per chunk so activations are
+        freed immediately (real memory savings). Gradients are detached at chunk
+        boundaries (truncated BPTT) to bound memory.
 
         Attention context is local to each chunk (no KV cache carry). Cross-chunk
-        information flows only through CTM state — which is exactly what we're training.
+        information flows only through CTM state -- which is exactly what we're training.
 
         Args:
             idx: token indices (B, T)
             targets: target token indices (B, T)
             n_chunks: number of chunks to split the sequence into
+            loss_scale: multiply loss before backward (e.g. 1/grad_accum_steps)
+
+        Returns:
+            float: mean loss across chunks (for logging). Gradients already on .grad.
         """
         B, T = idx.size()
         assert T % n_chunks == 0, f"seq_len {T} not divisible by n_chunks {n_chunks}"
@@ -973,7 +1108,10 @@ class GPT(nn.Module):
                 ctm_cache=ctm_cache,
                 pos_offset=start,
             )
-            total_loss = total_loss + chunk_loss
+            # Backward per chunk so activations are freed immediately.
+            # Scale by 1/n_chunks for mean, and by loss_scale for grad accumulation.
+            (chunk_loss * (loss_scale / n_chunks)).backward()
+            total_loss += chunk_loss.item()
 
             # Truncated BPTT: detach state at chunk boundaries to cut gradient flow
             if chunk_idx < n_chunks - 1:
@@ -982,6 +1120,7 @@ class GPT(nn.Module):
                         for key in layer_state:
                             layer_state[key] = layer_state[key].detach()
 
+        # Return scalar for logging (gradients already accumulated on .grad)
         return total_loss / n_chunks
 
     @torch.inference_mode()
@@ -1141,7 +1280,10 @@ class GPT(nn.Module):
 
         try:
             optimizer = torch.optim.AdamW(plastic_params, lr=lr, betas=(0.9, 0.999), weight_decay=0.0)
-            self.train()
+            # eval() avoids triggering gradient checkpointing in CTMBlock._tick_core
+            # (use_checkpoint = self.training and K > 4). We still get gradients because
+            # inference_mode is not set and requires_grad is True on plastic params.
+            self.eval()
             V = self.config.vocab_size
             max_entropy = math.log(V)
             stats = {'losses': [], 'mean_certainty': [], 'steps': 0}
@@ -1251,6 +1393,11 @@ class GPT(nn.Module):
                 novelty = sync_delta.abs()
 
                 # Gate: only update where novelty exceeds median (top 50% most novel pairings)
+                # ROADMAP (phase 5): replace this hardcoded threshold with a learned gate.
+                # If the model can predict its own sync patterns via metacognitive tokens,
+                # novelty = prediction error on self-observation, not deviation from a
+                # static baseline. The model decides what's surprising based on its own
+                # self-model, making plasticity adaptive and context-dependent.
                 novelty_threshold = novelty.median()
                 gate = (novelty > novelty_threshold).float()  # (n_synch,)
                 gated_delta = sync_delta * gate  # (n_synch,)
