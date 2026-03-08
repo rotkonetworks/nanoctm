@@ -350,6 +350,340 @@ class Engine:
         return results, masks
 
 
+class Session:
+    """Persistent conversation session with continuous memory.
+
+    Unlike Engine.generate() which creates fresh caches per call, a Session
+    maintains KVCache + CTMCache across multiple turns. You send one message,
+    get a reply, send another — the model remembers everything through:
+
+    - KVCache: all previous token representations (attention can recall any past token)
+    - CTMCache: the thinking state (recurrent state, trace, sync accumulators)
+
+    This is what solves the Clive Wearing problem at inference time. The model
+    has continuity of experience across the entire conversation.
+
+    Usage:
+        session = Session(model, tokenizer, max_seq_len=4096)
+        reply1 = session.say("Hello, who are you?")
+        reply2 = session.say("What did I just ask you?")  # model remembers
+        session.compact(lr=1e-5)  # write this conversation to permanent memory
+        session.save("session_001.pt")  # save for later
+        # Later:
+        session = Session.load("session_001.pt", model, tokenizer)
+    """
+
+    def __init__(self, model, tokenizer, max_seq_len=None, seed=42):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = model.get_device()
+        self.dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.model.to(dtype=self.dtype)  # ensure weights match KV cache dtype
+        self.seed = seed
+
+        m = model.config
+        seq_len = max_seq_len or m.sequence_len
+        kv_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+
+        # Persistent caches — survive across turns
+        self.kv_cache = KVCache(batch_size=1, seq_len=seq_len, device=self.device, dtype=self.dtype, **kv_kwargs)
+        self.ctm_cache = CTMCache(m.n_layer) if m.use_ctm else None
+        self.surprise_ema = None
+
+        # Track all tokens in the conversation
+        self.all_tokens = []
+        self.rng = torch.Generator(device=self.device)
+        self.rng.manual_seed(seed)
+
+    @torch.inference_mode()
+    def _forward_tokens(self, tokens):
+        """Feed tokens through the model, updating KV and CTM caches. Returns logits for last token."""
+        ids = torch.tensor([tokens], dtype=torch.long, device=self.device)
+        logits = self.model.forward(ids, kv_cache=self.kv_cache, ctm_cache=self.ctm_cache)
+        return logits[:, -1, :]  # (1, vocab_size)
+
+    @torch.inference_mode()
+    def say(self, text, max_tokens=512, temperature=0.7, top_k=50):
+        """Send a message, get a reply. Both sides are remembered in the caches.
+
+        Args:
+            text: user message (string)
+            max_tokens: max reply length
+            temperature: sampling temperature
+            top_k: top-k sampling
+
+        Returns: model's reply as string
+        """
+        # Encode user message with chat formatting
+        user_tokens = self.tokenizer.encode(text)
+        self.all_tokens.extend(user_tokens)
+
+        # Prefill: feed user tokens through model (updates KV + CTM caches)
+        logits = self._forward_tokens(user_tokens)
+
+        # Decode: generate reply token by token
+        reply_tokens = []
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+
+        for _ in range(max_tokens):
+            # Sample next token
+            next_id = sample_next_token(logits, self.rng, temperature, top_k)  # (1, 1)
+            token = next_id.item()
+
+            # Stop on end tokens
+            if token == assistant_end or token == bos:
+                break
+
+            # Dopamine: compute surprise and modulate CTM cache
+            if self.ctm_cache is not None:
+                with torch.no_grad():
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    surprise = -log_probs[0, token].item()
+                    if self.surprise_ema is None:
+                        self.surprise_ema = surprise
+                    else:
+                        self.surprise_ema = 0.9 * self.surprise_ema + 0.1 * surprise
+                    self.ctm_cache.dopamine = 1.0 + math.tanh(surprise - self.surprise_ema)
+
+            reply_tokens.append(token)
+            self.all_tokens.append(token)
+
+            # Feed token through model (updates caches)
+            logits = self._forward_tokens([token])
+
+        return self.tokenizer.decode(reply_tokens)
+
+    def compact(self, lr=1e-5):
+        """Write this conversation's memory into permanent weights.
+        Call at the end of a conversation to make the model remember it forever."""
+        if self.ctm_cache is not None:
+            return self.model.compact_memory(self.ctm_cache, lr=lr)
+        return {}
+
+    def save(self, path):
+        """Save session state (caches + token history) to disk for later resumption."""
+        state = {
+            'all_tokens': self.all_tokens,
+            'kv_k': self.kv_cache.k_cache.cpu(),
+            'kv_v': self.kv_cache.v_cache.cpu(),
+            'kv_seqlens': self.kv_cache.cache_seqlens.cpu(),
+            'surprise_ema': self.surprise_ema,
+        }
+        if self.ctm_cache is not None:
+            ctm_state = []
+            for layer in self.ctm_cache.layers:
+                if layer is not None:
+                    ctm_state.append({k: v.cpu() for k, v in layer.items()})
+                else:
+                    ctm_state.append(None)
+            state['ctm_layers'] = ctm_state
+            state['ctm_dopamine'] = self.ctm_cache.dopamine
+        torch.save(state, path)
+
+    @classmethod
+    def load(cls, path, model, tokenizer, max_seq_len=None):
+        """Load a saved session — resume a previous conversation with full memory."""
+        state = torch.load(path, weights_only=False)
+        session = cls(model, tokenizer, max_seq_len=max_seq_len)
+        device = session.device
+
+        # Restore KV cache
+        session.kv_cache.k_cache.copy_(state['kv_k'].to(device))
+        session.kv_cache.v_cache.copy_(state['kv_v'].to(device))
+        session.kv_cache.cache_seqlens.copy_(state['kv_seqlens'].to(device))
+
+        # Restore CTM cache
+        if session.ctm_cache is not None and 'ctm_layers' in state:
+            for i, layer_state in enumerate(state['ctm_layers']):
+                if layer_state is not None:
+                    session.ctm_cache.layers[i] = {k: v.to(device) for k, v in layer_state.items()}
+            session.ctm_cache.dopamine = state.get('ctm_dopamine', 1.0)
+
+        session.all_tokens = state['all_tokens']
+        session.surprise_ema = state.get('surprise_ema')
+        return session
+
+    def get_pos(self):
+        """How many tokens deep into the conversation we are."""
+        return self.kv_cache.get_pos()
+
+    def tokens_remaining(self):
+        """How many tokens until the KV cache is full."""
+        return self.kv_cache.max_seq_len - self.kv_cache.get_pos()
+
+
+class EpisodicMemory:
+    """Long-term episodic memory: a searchable store of past conversation states.
+
+    Brain analog: hippocampus. Stores snapshots of CTMCache (the model's mental state)
+    from past conversations, indexed by a context embedding. When a new conversation
+    starts, finds the most similar past experience and warm-starts the CTMCache from it.
+
+    "I've thought about something like this before" — instead of starting from
+    the learned start_state (blank slate), the model begins with a mental state
+    that's already primed for this type of conversation.
+
+    The context embedding is simply the mean of the input token embeddings — no
+    separate encoder needed. Cosine similarity finds the nearest past experience.
+
+    Usage:
+        memory = EpisodicMemory(model, capacity=100)
+
+        # After a conversation:
+        session.compact(lr=1e-5)  # semantic memory (weights)
+        memory.store(session)     # episodic memory (cache snapshot)
+
+        # Before next conversation:
+        new_session = memory.recall("help me with Python", tokenizer)
+        # → new_session's CTMCache is warm-started from the most similar past session
+
+        # Persist across restarts:
+        memory.save("episodes.pt")
+        memory = EpisodicMemory.load("episodes.pt", model)
+    """
+
+    def __init__(self, model, capacity=100):
+        self.model = model
+        self.capacity = capacity
+        self.episodes = []  # list of {embedding, ctm_layers, summary, tokens_seen}
+
+    @torch.inference_mode()
+    def _embed_text(self, text, tokenizer):
+        """Compute context embedding: mean of token embeddings from wte."""
+        tokens = tokenizer.encode(text)
+        ids = torch.tensor([tokens], dtype=torch.long, device=self.model.get_device())
+        embeds = self.model.transformer.wte(ids)  # (1, T, D)
+        return F.normalize(embeds.mean(dim=1), dim=-1).squeeze(0)  # (D,)
+
+    @torch.inference_mode()
+    def _embed_tokens(self, tokens):
+        """Compute context embedding from raw token ids."""
+        ids = torch.tensor([tokens], dtype=torch.long, device=self.model.get_device())
+        embeds = self.model.transformer.wte(ids)
+        return F.normalize(embeds.mean(dim=1), dim=-1).squeeze(0)
+
+    def store(self, session, summary=None):
+        """Store a session's CTMCache as an episodic memory.
+
+        Args:
+            session: a Session object after conversation
+            summary: optional text summary of what the conversation was about
+        """
+        if session.ctm_cache is None:
+            return
+
+        # Embed the conversation context (use first 256 tokens for speed)
+        context_tokens = session.all_tokens[:256]
+        if not context_tokens:
+            return
+        embedding = self._embed_tokens(context_tokens).cpu()
+
+        # Snapshot the CTM cache (detach + CPU for storage)
+        ctm_snapshot = []
+        for layer in session.ctm_cache.layers:
+            if layer is not None:
+                ctm_snapshot.append({k: v.detach().cpu() for k, v in layer.items()})
+            else:
+                ctm_snapshot.append(None)
+
+        episode = {
+            'embedding': embedding,
+            'ctm_layers': ctm_snapshot,
+            'summary': summary,
+            'tokens_seen': len(session.all_tokens),
+        }
+
+        # If at capacity, evict the oldest episode
+        if len(self.episodes) >= self.capacity:
+            self.episodes.pop(0)
+        self.episodes.append(episode)
+
+    def recall(self, text_or_tokens, tokenizer=None, threshold=0.3):
+        """Find the most similar past experience and return its CTMCache.
+
+        Args:
+            text_or_tokens: prompt text (str) or token list to match against
+            tokenizer: needed if text_or_tokens is a string
+            threshold: minimum cosine similarity to consider a match
+
+        Returns: CTMCache warm-started from best matching episode, or None if no match
+        """
+        if not self.episodes:
+            return None
+
+        # Compute query embedding
+        if isinstance(text_or_tokens, str):
+            assert tokenizer is not None
+            query = self._embed_text(text_or_tokens, tokenizer)
+        else:
+            query = self._embed_tokens(text_or_tokens)
+
+        # Find nearest neighbor by cosine similarity
+        best_sim = -1
+        best_episode = None
+        for episode in self.episodes:
+            sim = F.cosine_similarity(query.unsqueeze(0), episode['embedding'].to(query.device).unsqueeze(0)).item()
+            if sim > best_sim:
+                best_sim = sim
+                best_episode = episode
+
+        if best_sim < threshold:
+            return None
+
+        # Reconstruct CTMCache from snapshot
+        m = self.model.config
+        cache = CTMCache(m.n_layer)
+        device = self.model.get_device()
+        for i, layer_state in enumerate(best_episode['ctm_layers']):
+            if layer_state is not None:
+                cache.layers[i] = {k: v.to(device) for k, v in layer_state.items()}
+        return cache
+
+    def recall_into_session(self, text, tokenizer, session):
+        """Warm-start a session's CTMCache from the most similar past episode.
+
+        Args:
+            text: the new conversation's opening prompt
+            tokenizer: for embedding the prompt
+            session: Session to warm-start (modifies in place)
+
+        Returns: similarity score if matched, None if no match found
+        """
+        cache = self.recall(text, tokenizer)
+        if cache is None:
+            return None
+        # Overwrite session's CTMCache with the recalled episode
+        session.ctm_cache = cache
+        return True
+
+    def save(self, path):
+        """Persist all episodes to disk."""
+        torch.save({
+            'episodes': self.episodes,
+            'capacity': self.capacity,
+        }, path)
+
+    @classmethod
+    def load(cls, path, model):
+        """Load episodic memory from disk."""
+        data = torch.load(path, weights_only=False)
+        memory = cls(model, capacity=data['capacity'])
+        memory.episodes = data['episodes']
+        return memory
+
+    def __len__(self):
+        return len(self.episodes)
+
+    def list_episodes(self):
+        """List stored episodes with summaries and similarity info."""
+        return [{
+            'index': i,
+            'summary': ep.get('summary', '(no summary)'),
+            'tokens_seen': ep['tokens_seen'],
+        } for i, ep in enumerate(self.episodes)]
+
+
 if __name__ == "__main__":
     """
     Quick inline test to make sure that the naive/slow model.generate function
