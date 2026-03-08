@@ -91,6 +91,8 @@ parser.add_argument("--sleep-every", type=int, default=10, help="CTM sleep cycle
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+assert args.target_param_data_ratio > 0 or args.target_param_data_ratio == -1, \
+    "--target-param-data-ratio must be positive or -1 (disabled)"
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -424,8 +426,10 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        # 1-sqrt warmdown (arxiv 2405.18392): steeper initial drop, gentler tail
+        decay_frac = 1 - (num_iterations - it) / warmdown_iters
+        lr_mult = 1 - decay_frac ** 0.5
+        return lr_mult * (1 - args.final_lr_frac) + args.final_lr_frac
 
 # Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):
