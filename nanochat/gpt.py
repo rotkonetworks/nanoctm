@@ -622,7 +622,7 @@ class GPT(nn.Module):
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        s = 3**0.5 * n_embd**-0.5 * 0.68 # sqrt(3) for Uniform std, 0.68x init scale (autoresearch #43)
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
@@ -688,7 +688,7 @@ class GPT(nn.Module):
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=200000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
         if device is None:
@@ -899,9 +899,9 @@ class GPT(nn.Module):
         # Build param_groups with all required fields explicit
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.001),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.003),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
