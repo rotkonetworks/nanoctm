@@ -482,7 +482,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
+            self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
