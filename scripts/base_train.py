@@ -80,12 +80,18 @@ parser.add_argument("--ctm-synapse-depth", type=int, default=6, help="CTM U-NET 
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 parser.add_argument("--freeze-non-ctm", action="store_true", help="freeze attention+embeddings, only train CTM blocks (Phase 2 fine-tuning)")
 parser.add_argument("--bptt-chunks", type=int, default=1, help="Phase 3: split sequences into N chunks for truncated BPTT with CTM state carry-over (1 = disabled)")
+parser.add_argument("--distill-from", type=str, default=None, help="path to teacher checkpoint dir for knowledge distillation (prevents catastrophic forgetting during phase transitions)")
+parser.add_argument("--distill-weight", type=float, default=0.5, help="weight for KL distillation loss term (0 = disabled)")
+parser.add_argument("--elastic-weight", type=float, default=0.01, help="weight for elastic weight anchoring L2 penalty (0 = disabled)")
+parser.add_argument("--distill-temperature", type=float, default=2.0, help="softmax temperature for distillation (higher = softer targets)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--sample-every", type=int, default=100, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--sample-tokens", type=int, default=32, help="max tokens per sample")
+parser.add_argument("--sample-temperature", type=float, default=0.0, help="sampling temperature (0 = greedy)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 parser.add_argument("--sleep-every", type=int, default=10, help="CTM sleep cycle frequency in steps (-1 = disable)")
 # Output
@@ -197,6 +203,28 @@ if args.freeze_non_ctm:
             param.requires_grad_(False)
             n_frozen += param.numel()
     print0(f"Phase 2 freeze: {n_frozen:,} params frozen, {n_trainable:,} CTM params trainable")
+
+# Knowledge distillation: set up teacher model for soft targets
+if args.distill_from:
+    from nanochat.teacher import create_teacher
+    from nanochat.tokenizer import NanochatTokenizer
+    tokenizer_for_teacher = NanochatTokenizer()
+    teacher_fn = create_teacher(
+        args.distill_from,
+        tokenizer=tokenizer_for_teacher,
+        vocab_size=model.config.vocab_size,
+        device=device,
+    )
+    model.set_teacher(teacher_fn,
+                      distill_weight=args.distill_weight,
+                      temperature=args.distill_temperature)
+    print0(f"Distillation: teacher from {args.distill_from}")
+    print0(f"  distill_weight={args.distill_weight}, temperature={args.distill_temperature}")
+
+# Elastic weight anchoring: snapshot current plastic params to prevent drift
+if args.elastic_weight > 0:
+    model.set_elastic_anchor(elastic_weight=args.elastic_weight)
+    print0(f"Elastic anchoring: weight={args.elastic_weight}")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -468,6 +496,11 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# Log data source
+from nanochat.dataset import DATA_DIR
+print0(f"Data: {DATA_DIR}")
+print0(f"Token ratio: {total_batch_size * num_iterations / num_params:.1f} tokens/param (chinchilla optimal ~20)")
+
 # Hippocampal replay buffer: stores high-loss sequences for CTM sleep cycle dreaming.
 # During training, we track which batches had the highest loss (= most surprising/novel).
 # During sleep cycle, we replay these hard examples instead of generic text, so the
@@ -534,7 +567,7 @@ while True:
             for prompt in prompts:
                 tokens = tokenizer(prompt, prepend="<|bos|>")
                 with disable_fp8(orig_model):
-                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=args.sample_tokens, temperature=args.sample_temperature)
                 print0(tokenizer.decode(sample[0]))
         except Exception as e:
             print0(f"Sampling failed: {e}")
@@ -628,17 +661,24 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    # Collect CTM diagnostics periodically (first micro-step only)
+    ctm_diag = {} if (args.use_ctm and step % 10 == 0) else None
     for micro_step in range(grad_accum_steps):
         if args.bptt_chunks > 1 and args.use_ctm:
-            loss = model.forward_chunked_bptt(x, y, n_chunks=args.bptt_chunks)
+            # BPTT does per-chunk backward internally, returns a float (not a tensor).
+            # Pass 1/grad_accum_steps as loss_scale so gradients accumulate correctly.
+            loss_val = model.forward_chunked_bptt(x, y, n_chunks=args.bptt_chunks,
+                                                   loss_scale=1.0 / grad_accum_steps)
+            train_loss = torch.tensor(loss_val)
         else:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+            diag = ctm_diag if micro_step == 0 else None
+            loss = model(x, y, diagnostics=diag)
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
         # Hippocampal replay: remember hard sequences (high loss = high prediction error)
         if args.use_ctm and micro_step == 0:  # only track first micro-step to save memory
             loss_val = train_loss.item()
@@ -697,6 +737,13 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    # Print CTM tick diagnostics every 10 steps
+    if ctm_diag and any(k.startswith('tick_') for k in ctm_diag):
+        K = max(int(k.split('_')[1].split('/')[0]) for k in ctm_diag if k.startswith('tick_')) + 1
+        tick_losses = " ".join(f"{ctm_diag.get(f'tick_{k}/loss', 0):.3f}" for k in range(K))
+        tick_certs = " ".join(f"{ctm_diag.get(f'tick_{k}/certainty', 0):.3f}" for k in range(K))
+        tick_pcts = " ".join(f"{ctm_diag.get(f'tick_{k}/selected_pct', 0):.0f}%" for k in range(K))
+        print0(f"  ticks loss=[{tick_losses}] cert=[{tick_certs}] selected=[{tick_pcts}]")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -709,6 +756,49 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        # CTM-specific logging: gradient norms per param group + diagnostics
+        if args.use_ctm:
+            from nanochat.gpt import CTMBlock
+            synapse_grad_norm = 0.0
+            nlm_grad_norm = 0.0
+            attn_grad_norm = 0.0
+            c_proj_grad_norm = 0.0
+            for block in orig_model.transformer.h:
+                if isinstance(block.mlp, CTMBlock):
+                    ctm = block.mlp
+                    for p in ctm.synapses.parameters():
+                        if p.grad is not None:
+                            synapse_grad_norm += p.grad.norm().item() ** 2
+                    for p in list(ctm.nlm1.parameters()) + list(ctm.nlm2.parameters()):
+                        if p.grad is not None:
+                            nlm_grad_norm += p.grad.norm().item() ** 2
+                    for p in ctm.c_proj.parameters():
+                        if p.grad is not None:
+                            c_proj_grad_norm += p.grad.norm().item() ** 2
+                for p in block.attn.parameters():
+                    if p.grad is not None:
+                        attn_grad_norm += p.grad.norm().item() ** 2
+            log_data["grad_norm/synapse"] = synapse_grad_norm ** 0.5
+            log_data["grad_norm/nlm"] = nlm_grad_norm ** 0.5
+            log_data["grad_norm/attn"] = attn_grad_norm ** 0.5
+            log_data["grad_norm/c_proj"] = c_proj_grad_norm ** 0.5
+            # Weight magnitudes: track if params are growing/shrinking
+            synapse_norm = sum(p.data.norm().item() ** 2 for block in orig_model.transformer.h
+                               if isinstance(block.mlp, CTMBlock) for p in block.mlp.synapses.parameters()) ** 0.5
+            nlm_norm = sum(p.data.norm().item() ** 2 for block in orig_model.transformer.h
+                           if isinstance(block.mlp, CTMBlock) for p in list(block.mlp.nlm1.parameters()) + list(block.mlp.nlm2.parameters())) ** 0.5
+            log_data["weight_norm/synapse"] = synapse_norm
+            log_data["weight_norm/nlm"] = nlm_norm
+            # Start state and decay: are they drifting?
+            for i, block in enumerate(orig_model.transformer.h):
+                if isinstance(block.mlp, CTMBlock):
+                    log_data[f"layer_{i}/start_state_norm"] = block.mlp.start_state.data.norm().item()
+                    log_data[f"layer_{i}/decay_out_mean"] = block.mlp.decay_out.data.mean().item()
+                    log_data[f"layer_{i}/decay_act_mean"] = block.mlp.decay_act.data.mean().item()
+        # CTM forward diagnostics (per-tick loss, certainty, tick selection)
+        if ctm_diag:
+            for k, v in ctm_diag.items():
+                log_data[f"ctm/{k}"] = v
         wandb_run.log(log_data)
 
     # state update
