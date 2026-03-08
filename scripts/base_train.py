@@ -75,7 +75,7 @@ parser.add_argument("--use-ctm", action="store_true", help="use CTM blocks inste
 parser.add_argument("--ctm-iterations", type=int, default=4, help="CTM thinking steps per token")
 parser.add_argument("--ctm-memory-length", type=int, default=16, help="CTM trace history length")
 parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisation neurons (-1 = n_embd//2)")
-parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension")
+parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension (-1 = n_synch // 4, scales with model)")
 parser.add_argument("--ctm-synapse-depth", type=int, default=6, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16.")
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 parser.add_argument("--freeze-non-ctm", action="store_true", help="freeze attention+embeddings, only train CTM blocks (Phase 2 fine-tuning)")

@@ -48,7 +48,7 @@ class GPTConfig:
     ctm_iterations: int = 4       # K thinking steps per token
     ctm_memory_length: int = 16   # rolling trace history length (paper uses 25)
     ctm_n_synch: int = 384        # neuron pairs for synchronisation readout
-    ctm_memory_hidden: int = 32   # NLM hidden dimension
+    ctm_memory_hidden: int = 32   # NLM hidden dimension (-1 = n_synch // 4, scales with model. 32 for training memory budget)
     ctm_n_attn_heads: int = 1     # cross-attention heads for data re-observation
     ctm_synapse_depth: int = 6    # U-NET synapse depth (half down, half up). Paper uses 16.
 
@@ -317,7 +317,7 @@ class CTMBlock(nn.Module):
         K = config.ctm_iterations
         M = config.ctm_memory_length
         n_synch = config.ctm_n_synch
-        hidden = config.ctm_memory_hidden
+        hidden = config.ctm_memory_hidden if config.ctm_memory_hidden > 0 else n_synch // 4
         n_attn_heads = config.ctm_n_attn_heads
 
         self.D = D
