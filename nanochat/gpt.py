@@ -465,11 +465,13 @@ class CTMBlock(nn.Module):
         out = self.c_proj(synch).reshape(B, T, D)
 
         # Persist state for next token (stream of consciousness)
+        # Only keep the last token's state — during prefill BT = B*T but we
+        # only need the final position to seed the next decode step.
         if ctm_cache is not None:
             ctm_cache.layers[layer_idx] = {
-                'state': state, 'trace': trace,
-                'alpha_out': alpha_out, 'beta_out': beta_out,
-                'alpha_act': alpha_act, 'beta_act': beta_act,
+                'state': state[-1:], 'trace': trace[-1:],
+                'alpha_out': alpha_out[-1:], 'beta_out': beta_out[-1:],
+                'alpha_act': alpha_act[-1:], 'beta_act': beta_act[-1:],
             }
 
         if dream:
@@ -1201,6 +1203,8 @@ class GPT(nn.Module):
                     'sync_delta_norm': sync_delta.norm().item(),
                     'state_delta_norm': state_delta.norm().item(),
                 }
+
+        return stats
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
