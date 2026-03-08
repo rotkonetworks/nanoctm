@@ -11,6 +11,7 @@ Notes:
 The whole thing is made as efficient as possible.
 """
 
+import math
 import torch
 import torch.nn.functional as F
 import signal
@@ -19,6 +20,7 @@ from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
+from nanochat.gpt import CTMCache
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -200,8 +202,12 @@ class Engine:
             dtype=dtype,
             **kv_model_kwargs,
         )
+        # Create CTMCache for prefill if model uses CTM
+        ctm_cache_prefill = CTMCache(m.n_layer) if m.use_ctm else None
+        # Reset dopamine EMA for fresh generation session
+        self._surprise_ema = None
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill, ctm_cache=ctm_cache_prefill)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
@@ -215,6 +221,12 @@ class Engine:
         )
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around
+
+        # Replicate CTMCache: extract last token's state, expand for num_samples parallel decode
+        ctm_cache_decode = ctm_cache_prefill.extract_last_and_expand(num_samples) if ctm_cache_prefill is not None else None
+        del ctm_cache_prefill
+        # Store on self so generate_and_compact can access it after generation
+        self._last_ctm_cache = ctm_cache_decode
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
@@ -232,6 +244,22 @@ class Engine:
             # Sample the next token for each row
             next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
             sampled_tokens = next_ids[:, 0].tolist()
+
+            # Dopamine: compute prediction surprise for each sampled token
+            # surprise = -log(p(token)) = cross-entropy of the chosen token
+            if ctm_cache_decode is not None:
+                with torch.no_grad():
+                    log_probs = F.log_softmax(logits, dim=-1)  # (B, vocab_size)
+                    token_surprises = -log_probs.gather(1, next_ids).squeeze(1)  # (B,)
+                    mean_surprise = token_surprises.mean().item()
+                    # Dopamine = 1 + tanh(surprise - running_mean) → range [0, 2]
+                    # Tracks a running mean of surprise to adapt to the text's baseline difficulty
+                    if self._surprise_ema is None:
+                        self._surprise_ema = mean_surprise
+                    else:
+                        self._surprise_ema = 0.9 * self._surprise_ema + 0.1 * mean_surprise
+                    dopamine = 1.0 + math.tanh(mean_surprise - self._surprise_ema)
+                    ctm_cache_decode.dopamine = dopamine
 
             # Process each row: choose the next token, update state, optional tool use
             token_column = [] # contains the next token id along each row
@@ -271,7 +299,31 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            logits = self.model.forward(ids, kv_cache=kv_cache_decode, ctm_cache=ctm_cache_decode)[:, -1, :]  # (B, vocab_size)
+
+    def generate_and_compact(self, tokens, num_samples=1, plasticity_lr=1e-5, **kwargs):
+        """Generate tokens then compact CTMCache memory into permanent weights.
+
+        Runs a full generation session, then calls model.compact_memory() to
+        write the accumulated sync patterns into synapse weights. The model
+        permanently remembers what it experienced during this generation.
+
+        The CTMCache is the one that was built incrementally during generation —
+        not a re-run. It contains the actual accumulated sync statistics from
+        the model's stream of consciousness.
+
+        Returns: (results, masks, plasticity_stats)
+        """
+        results, masks = self.generate_batch(tokens, num_samples, **kwargs)
+
+        # Compact memory using the CTMCache that was populated during generation
+        plasticity_stats = {}
+        ctm_cache = getattr(self, '_last_ctm_cache', None)
+        if ctm_cache is not None and plasticity_lr > 0:
+            plasticity_stats = self.model.compact_memory(ctm_cache, lr=plasticity_lr)
+        self._last_ctm_cache = None  # free memory
+
+        return results, masks, plasticity_stats
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

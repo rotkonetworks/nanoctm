@@ -44,9 +44,11 @@ class GPTConfig:
     # Paper: https://arxiv.org/abs/2505.05522
     use_ctm: bool = False
     ctm_iterations: int = 4       # K thinking steps per token
-    ctm_memory_length: int = 8    # rolling trace history length
+    ctm_memory_length: int = 16   # rolling trace history length (paper uses 25)
     ctm_n_synch: int = 384        # neuron pairs for synchronisation readout
     ctm_memory_hidden: int = 32   # NLM hidden dimension
+    ctm_n_attn_heads: int = 1     # cross-attention heads for data re-observation
+    ctm_synapse_depth: int = 6    # U-NET synapse depth (half down, half up). Paper uses 16.
 
 
 def norm(x):
@@ -152,6 +154,83 @@ class MLP(nn.Module):
 # Each token gets K iterations of synapse -> trace update -> NLM processing.
 # Output is read via synchronisation (pairwise temporal correlation between neurons).
 
+# =============================================================================
+# CTM NEUROPLASTICITY ROADMAP
+# =============================================================================
+# Current implementation: sync-driven Hebbian plasticity via compact_memory().
+# The accumulated S_out sync signal (alpha/sqrt(beta)) from inference is compared
+# to baseline, and novel patterns are written into synapse weights permanently.
+#
+# TODO: Dopamine-gated plasticity
+#   The brain doesn't learn from everything — dopamine gates WHEN plasticity happens.
+#   High dopamine = surprising/rewarding → learn aggressively.
+#   Low dopamine = predictable/boring → don't bother.
+#   Implementation idea: compute prediction error (actual next token vs model's prediction)
+#   during inference. When prediction error spikes (surprise!), set a "dopamine" flag
+#   that amplifies the plasticity lr for that token's patterns. When prediction error
+#   is low (boring text), suppress plasticity. This requires access to the tokenizer
+#   during forward, or a post-hoc surprise signal from the Engine.
+#   Could also gate on certainty: high certainty + wrong = maximum surprise = learn hard.
+#   Low certainty + wrong = expected confusion = don't bother.
+#
+# TODO: Runaway weight growth / synaptic homeostasis
+#   Current: soft Frobenius norm clamp (1% max growth per compact_memory call).
+#   Problem: over many inference sessions, weights can still drift far from training.
+#   Better approaches:
+#   - Synaptic scaling: periodically rescale ALL synapse weights to maintain mean
+#     activation levels (the brain does this during sleep via TNF-alpha signaling).
+#   - Elastic weight consolidation (EWC): track Fisher information per param during
+#     training, penalize plasticity on high-Fisher params (important for old knowledge).
+#   - Hard reset: every N compact_memory calls, re-run consolidate() on the replay
+#     buffer to anchor weights back toward training distribution.
+#   - Per-synapse decay: older plasticity updates fade unless reinforced. Each weight
+#     could track its "last update time" and exponentially decay toward the trained value.
+#
+# TODO: Multi-part memory system (hippocampal-cortical)
+#   The brain has multiple memory systems with different timescales:
+#   - Working memory (seconds): CTMCache state/trace — already implemented
+#   - Episodic memory (hours): a buffer of CTMCache snapshots from recent sessions,
+#     indexed by context. On inference start, retrieve the most similar past session's
+#     cache and warm-start the CTMCache from it. "I've seen text like this before."
+#   - Semantic memory (permanent): synapse weights — what compact_memory writes to.
+#     This is the model's long-term knowledge, updated slowly and carefully.
+#   Implementation: EpisodicMemory class that stores (context_embedding, ctm_cache_snapshot)
+#   pairs. On new inference, embed the prompt, find nearest neighbor, load that cache.
+#   After inference, store the new (context, cache) pair. Bounded by memory budget.
+#   The key insight: CTMCache IS the episodic memory — we just need to persist and
+#   retrieve it across sessions rather than always starting from learned start_state.
+# =============================================================================
+
+
+class CTMCache:
+    """Persistent CTM state across tokens for continuous inference.
+    During autoregressive generation, each new token's thinking starts where
+    the previous token's thinking ended — a stream of consciousness.
+    One state dict per layer, mutated in-place by CTMBlock.forward.
+
+    Dopamine gating: the `dopamine` field (float, default 1.0) scales how strongly
+    each token's pairwise products contribute to the sync accumulators. Set by the
+    Engine based on prediction error — surprised tokens get dopamine > 1, boring
+    tokens get dopamine < 1. This means the sync "remembers harder" for surprising
+    moments, just like the brain's dopaminergic system gates synaptic plasticity."""
+    def __init__(self, n_layers):
+        self.layers = [None] * n_layers  # None until first token populates it
+        self.dopamine = 1.0  # per-token neuromodulatory signal, set by Engine
+
+    def extract_last_and_expand(self, num_samples):
+        """After prefill (B=1, T tokens), extract last token's state and expand for parallel decode.
+        CTMBlock stores state as (BT, D) — after prefill BT=T. We take the last position's state
+        and replicate it num_samples times for parallel generation."""
+        new_cache = CTMCache(len(self.layers))
+        for i, layer_state in enumerate(self.layers):
+            if layer_state is None:
+                continue
+            new_cache.layers[i] = {
+                k: v[-1:].expand(num_samples, *v.shape[1:]).contiguous()
+                for k, v in layer_state.items()
+            }
+        return new_cache
+
 class SuperLinear(nn.Module):
     """N independent linear transforms in parallel — one per neuron.
     Master weights stay fp32 for optimizer precision, cast to input dtype for compute."""
@@ -166,11 +245,68 @@ class SuperLinear(nn.Module):
         return torch.einsum('BNM,MON->BNO', x, self.w1.to(x.dtype)) + self.b1.to(x.dtype)
 
 
+class SynapseUNET(nn.Module):
+    """U-NET synapse model (paper Figure 8, Section C.1).
+    Linearly reduces width from input_dim down to bottleneck (16),
+    then expands back to output_dim, with skip connections + LayerNorm.
+    k layers total (k/2 down, k/2 up)."""
+    def __init__(self, input_dim, output_dim, k=8, bottleneck=16):
+        super().__init__()
+        assert k >= 2 and k % 2 == 0, "k must be even and >= 2"
+        half_k = k // 2
+
+        # Down path widths: linearly from input_dim to bottleneck
+        # e.g. k=8, input=1536, bottleneck=16 -> [1536, 1156, 776, 396, 16]
+        down_widths = [max(bottleneck, round(input_dim + (bottleneck - input_dim) * i / half_k))
+                       for i in range(half_k + 1)]
+        # Up path OUTPUT widths: mirror of down, but final layer outputs output_dim
+        up_out_widths = list(reversed(down_widths[:-1]))
+        up_out_widths[-1] = output_dim  # final layer produces output_dim
+
+        # Down layers
+        self.down_layers = nn.ModuleList()
+        for i in range(half_k):
+            self.down_layers.append(Linear(down_widths[i], down_widths[i + 1], bias=False))
+
+        # Up layers: each receives its own input + skip from matched down layer
+        # First up layer has no skip (takes bottleneck directly)
+        # Subsequent up layers concat with skip from down path
+        self.up_layers = nn.ModuleList()
+        self.up_norms = nn.ModuleList()
+        for i in range(half_k):
+            if i == 0:
+                in_w = down_widths[-1]  # bottleneck output
+            else:
+                in_w = up_out_widths[i - 1] + down_widths[half_k - i]  # prev up output + skip
+            self.up_layers.append(Linear(in_w, up_out_widths[i], bias=False))
+            self.up_norms.append(nn.LayerNorm(up_out_widths[i]))
+
+    def forward(self, x):
+        # Down path: save activations for skip connections
+        skips = []
+        h = x
+        for layer in self.down_layers:
+            h = F.silu(layer(h))
+            skips.append(h)
+
+        # Up path: concat with skip connections from down path
+        h = skips.pop()  # bottleneck output
+        for i, (layer, ln) in enumerate(zip(self.up_layers, self.up_norms)):
+            if i > 0 and skips:
+                h = torch.cat([h, skips.pop()], dim=-1)
+            h = ln(F.silu(layer(h)))
+        return h
+
+
 class CTMBlock(nn.Module):
     """Continuous Thought Machine block — drop-in replacement for MLP.
-    Input/output: (B, T, D). Each token position is processed independently.
-    NOTE: like the rest of the model, __init__ runs in meta device context.
-    All actual data initialization happens in GPT.init_weights()."""
+    Input/output: (B, T, D).
+    Key features (following paper more closely):
+    1. Cross-attention data re-observation: at each tick, S_action generates a query
+       that cross-attends to input features, so the model "looks at" different parts each tick.
+    2. Dual synchronisation: S_out (for prediction readout) and S_action (for attention queries).
+    3. U-NET synapse model: deeper cross-neuron interaction with skip connections (Figure 8).
+    NOTE: __init__ runs in meta device context. Real init in GPT.init_weights()."""
     def __init__(self, config):
         super().__init__()
         D = config.n_embd
@@ -178,16 +314,24 @@ class CTMBlock(nn.Module):
         M = config.ctm_memory_length
         n_synch = config.ctm_n_synch
         hidden = config.ctm_memory_hidden
+        n_attn_heads = config.ctm_n_attn_heads
 
         self.D = D
         self.K = K           # max iterations (from config)
         self.active_K = K    # current iterations (can be reduced by sleep-cycle scheduler)
         self.M = M
         self.n_synch = n_synch
+        self.n_attn_heads = n_attn_heads
+        self.attn_head_dim = D // n_attn_heads
 
-        # Synapses: concat(input, state) -> new pre-activations
-        self.synapse_fc = Linear(2 * D, 2 * D, bias=False)
-        self.synapse_ln = nn.LayerNorm(D)
+        # Cross-attention for data re-observation at each tick
+        # S_action sync -> query; input features -> key, value (computed once)
+        self.attn_q_proj = Linear(n_synch, D, bias=False)
+        self.attn_k_proj = Linear(D, D, bias=False)
+        self.attn_v_proj = Linear(D, D, bias=False)
+
+        # U-NET synapse model (paper Figure 8): concat(obs, state) -> pre-activations
+        self.synapses = SynapseUNET(2 * D, D, k=config.ctm_synapse_depth)
 
         # NLMs: per-neuron trace processing (deep variant with GLU)
         self.nlm1 = SuperLinear(M, 2 * hidden, D)
@@ -197,47 +341,76 @@ class CTMBlock(nn.Module):
         self.start_state = nn.Parameter(torch.empty(D))
         self.start_trace = nn.Parameter(torch.empty(D, M))
 
-        # Synchronisation: buffers for neuron pairings (filled in init_weights) + learnable decay
-        self.register_buffer('synch_left', torch.zeros(n_synch, dtype=torch.long))
-        self.register_buffer('synch_right', torch.zeros(n_synch, dtype=torch.long))
-        self.decay = nn.Parameter(torch.zeros(n_synch))
+        # Dual synchronisation: S_out (readout) and S_action (attention queries)
+        for name in ('synch_out_left', 'synch_out_right', 'synch_act_left', 'synch_act_right'):
+            self.register_buffer(name, torch.zeros(n_synch, dtype=torch.long))
+        self.decay_out = nn.Parameter(torch.zeros(n_synch))
+        self.decay_act = nn.Parameter(torch.zeros(n_synch))
 
-        # Output projection: synchronisation -> residual stream
+        # Output projection: S_out synchronisation -> residual stream
         self.c_proj = Linear(n_synch, D, bias=False)
 
-    def forward(self, x, dream=False, intervene=None):
+    def forward(self, x, dream=False, intervene=None, multi_tick=False, adaptive=False, ctm_cache=None, layer_idx=None):
         """
         Args:
             x: input tensor (B, T, D)
             dream: if True, collect per-iteration state deltas for convergence diagnostics
             intervene: optional callback fn(k, state, trace) -> state
-                       Called after each iteration k. Can modify state for neuroplasticity.
-                       Return modified state or None to keep unchanged.
+            multi_tick: if True, return outputs at ALL K ticks for multi-tick loss
+            adaptive: if True, stop early at confidence peak (delta starts rising)
+            ctm_cache: CTMCache for persistent state across tokens (inference only)
+            layer_idx: which layer this is (needed for ctm_cache indexing)
         """
         B, T, D = x.shape
         BT = B * T
-        x_flat = x.reshape(BT, D)
-        K = self.active_K  # may be reduced by sleep-cycle scheduler
+        K = self.active_K
+        H = self.n_attn_heads
+        HD = self.attn_head_dim
 
-        # Initialize recurrent state
-        state = self.start_state.unsqueeze(0).expand(BT, -1)
-        trace = self.start_trace.unsqueeze(0).expand(BT, -1, -1).clone()  # (BT, D, M)
+        # Precompute keys and values from input (constant across ticks)
+        attn_k = norm(self.attn_k_proj(x).view(B, T, H, HD))  # QK norm on keys
+        attn_v = self.attn_v_proj(x).view(B, T, H, HD)
 
-        # Synchronisation accumulators
-        r = torch.exp(-self.decay.clamp(0, 15)).unsqueeze(0)  # (1, n_synch)
-        decay_alpha = None
-        decay_beta = None
+        # Initialize recurrent state: from cache (continuing thought) or learned params (new thought)
+        cached = ctm_cache.layers[layer_idx] if ctm_cache is not None and ctm_cache.layers[layer_idx] is not None else None
+        if cached is not None:
+            state = cached['state']
+            trace = cached['trace']
+            alpha_out, beta_out = cached['alpha_out'], cached['beta_out']
+            alpha_act, beta_act = cached['alpha_act'], cached['beta_act']
+        else:
+            state = self.start_state.unsqueeze(0).expand(BT, -1)
+            trace = self.start_trace.unsqueeze(0).expand(BT, -1, -1).clone()  # (BT, D, M)
+            alpha_out = alpha_act = beta_out = beta_act = None
 
-        # Dream mode: collect per-iteration state deltas to measure convergence
-        deltas = [] if dream else None
+        # Dual synchronisation accumulators
+        r_out = torch.exp(-self.decay_out.clamp(0, 15)).unsqueeze(0)
+        r_act = torch.exp(-self.decay_act.clamp(0, 15)).unsqueeze(0)
+
+        # Dopamine gating: scales how strongly this token's sync gets accumulated
+        # dopamine > 1 = surprising token, remember harder. dopamine < 1 = boring, dampen.
+        # Default 1.0 = no modulation (training, or inference without Engine dopamine tracking)
+        dopamine = ctm_cache.dopamine if ctm_cache is not None else 1.0
+
+        # Track per-iteration state deltas and intermediate outputs
+        track_deltas = dream or adaptive
+        deltas = [] if track_deltas else None
+        tick_outputs = [] if multi_tick else None
 
         for k in range(K):
-            prev_state = state if dream else None
+            prev_state = state
 
-            # Synapses: mix external input with current state
-            pre = torch.cat([x_flat, state], dim=-1)
-            new_state = F.glu(self.synapse_fc(pre), dim=-1)
-            new_state = self.synapse_ln(new_state)
+            # Cross-attention: use S_action to generate query, re-observe input
+            if alpha_act is not None:
+                synch_act = (alpha_act / torch.sqrt(beta_act)).to(x.dtype)
+            else:
+                synch_act = torch.zeros(BT, self.n_synch, device=x.device, dtype=x.dtype)
+            attn_q = norm(self.attn_q_proj(synch_act).view(B, T, H, HD))  # QK norm
+            obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
+            obs = obs.reshape(BT, D)
+
+            # U-NET synapses: mix observation with current state
+            new_state = self.synapses(torch.cat([obs, state], dim=-1))  # (BT, D)
 
             # Update trace (rolling window: drop oldest, append newest)
             trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
@@ -246,49 +419,84 @@ class CTMBlock(nn.Module):
             h = F.glu(self.nlm1(trace), dim=-1)       # (BT, D, hidden)
             state = F.glu(self.nlm2(h), dim=-1).squeeze(-1)  # (BT, D)
 
-            if dream:
-                # Measure how much state changed this iteration (convergence signal)
-                delta = (state - prev_state).norm(dim=-1).mean().item()
-                deltas.append(delta)
+            # Track state delta (convergence / confidence signal)
+            if track_deltas:
+                delta = (state - prev_state).norm(dim=-1).mean()
+                deltas.append(delta.item() if dream else delta)
 
-            # Neuroplasticity hook: external intervention on internal state
+            # Neuroplasticity hook
             if intervene is not None:
                 modified = intervene(k, state, trace)
                 if modified is not None:
                     state = modified
 
-            # Update synchronisation (exponential moving correlation)
-            left = state[:, self.synch_left]
-            right = state[:, self.synch_right]
-            pp = left * right
-            if decay_alpha is None:
-                decay_alpha = pp
-                decay_beta = torch.ones_like(pp)
+            # Update S_out synchronisation (for readout)
+            left_out = state[:, self.synch_out_left]
+            right_out = state[:, self.synch_out_right]
+            pp_out = left_out * right_out * dopamine  # dopamine-gated
+            if alpha_out is None:
+                alpha_out, beta_out = pp_out, torch.ones_like(pp_out)
             else:
-                decay_alpha = r * decay_alpha + pp
-                decay_beta = r * decay_beta + 1
+                alpha_out = r_out * alpha_out + pp_out
+                beta_out = r_out * beta_out + 1
 
-        # Readout: synchronisation -> output projection
-        synch = decay_alpha / torch.sqrt(decay_beta)
+            # Update S_action synchronisation (for attention queries)
+            left_act = state[:, self.synch_act_left]
+            right_act = state[:, self.synch_act_right]
+            pp_act = left_act * right_act * dopamine  # dopamine-gated
+            if alpha_act is None:
+                alpha_act, beta_act = pp_act, torch.ones_like(pp_act)
+            else:
+                alpha_act = r_act * alpha_act + pp_act
+                beta_act = r_act * beta_act + 1
+
+            # Multi-tick: save readout at each k for auxiliary loss
+            if multi_tick:
+                synch_k = alpha_out / torch.sqrt(beta_out)
+                tick_outputs.append(self.c_proj(synch_k).reshape(B, T, D))
+
+            # Adaptive: stop at confidence peak
+            if adaptive and k >= 2 and track_deltas:
+                if deltas[-1] > deltas[-2]:
+                    break
+
+        # Readout: S_out synchronisation -> output projection
+        synch = alpha_out / torch.sqrt(beta_out)
         out = self.c_proj(synch).reshape(B, T, D)
+
+        # Persist state for next token (stream of consciousness)
+        if ctm_cache is not None:
+            ctm_cache.layers[layer_idx] = {
+                'state': state, 'trace': trace,
+                'alpha_out': alpha_out, 'beta_out': beta_out,
+                'alpha_act': alpha_act, 'beta_act': beta_act,
+            }
+
         if dream:
             return out, deltas
+        if multi_tick:
+            return out, tick_outputs
         return out
 
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = CTMBlock(config) if config.use_ctm else MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, dream=False):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, dream=False, multi_tick=False, adaptive=False, ctm_cache=None):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        if dream and isinstance(self.mlp, CTMBlock):
-            mlp_out, deltas = self.mlp(norm(x), dream=True)
+        if isinstance(self.mlp, CTMBlock) and (dream or multi_tick or adaptive):
+            mlp_out, extras = self.mlp(norm(x), dream=dream, multi_tick=multi_tick, adaptive=adaptive,
+                                       ctm_cache=ctm_cache, layer_idx=self.layer_idx)
             x = x + mlp_out
-            return x, deltas
-        x = x + self.mlp(norm(x))
+            return x, extras  # extras = deltas (dream) or tick_outputs (multi_tick)
+        if isinstance(self.mlp, CTMBlock):
+            x = x + self.mlp(norm(x), ctm_cache=ctm_cache, layer_idx=self.layer_idx)
+        else:
+            x = x + self.mlp(norm(x))
         return x
 
 
@@ -364,8 +572,17 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if isinstance(block.mlp, CTMBlock):
                 ctm = block.mlp
-                # Synapse: uniform like c_fc
-                torch.nn.init.uniform_(ctm.synapse_fc.weight, -s, s)
+                # Cross-attention projections: uniform like c_q/c_k/c_v
+                torch.nn.init.uniform_(ctm.attn_q_proj.weight, -s, s)
+                torch.nn.init.uniform_(ctm.attn_k_proj.weight, -s, s)
+                torch.nn.init.uniform_(ctm.attn_v_proj.weight, -s, s)
+                # U-NET synapse model: uniform for Linear layers, standard for LayerNorm
+                for module in ctm.synapses.modules():
+                    if isinstance(module, Linear):
+                        torch.nn.init.uniform_(module.weight, -s, s)
+                    elif isinstance(module, nn.LayerNorm):
+                        module.weight.fill_(1.0)
+                        module.bias.zero_()
                 # Output projection: zero for clean residual at init
                 torch.nn.init.zeros_(ctm.c_proj.weight)
                 # NLMs: Xavier-like per neuron
@@ -378,13 +595,11 @@ class GPT(nn.Module):
                 ctm.start_state.uniform_(-s_d, s_d)
                 s_dm = 1.0 / math.sqrt(ctm.D + ctm.M)
                 ctm.start_trace.uniform_(-s_dm, s_dm)
-                # Synapse LayerNorm
-                ctm.synapse_ln.weight.fill_(1.0)
-                ctm.synapse_ln.bias.zero_()
-                # Synchronisation: random neuron pairings
-                ctm.synch_left.copy_(torch.from_numpy(np.random.choice(ctm.D, size=ctm.n_synch, replace=True)))
-                ctm.synch_right.copy_(torch.from_numpy(np.random.choice(ctm.D, size=ctm.n_synch, replace=True)))
-                ctm.decay.zero_()
+                # Dual synchronisation: random neuron pairings for S_out and S_action
+                for buf_name in ('synch_out_left', 'synch_out_right', 'synch_act_left', 'synch_act_right'):
+                    getattr(ctm, buf_name).copy_(torch.from_numpy(np.random.choice(ctm.D, size=ctm.n_synch, replace=True)))
+                ctm.decay_out.zero_()
+                ctm.decay_act.zero_()
             else:
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -566,8 +781,30 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def _compute_logits(self, x):
+        """Shared logit computation: norm -> lm_head -> crop -> softcap."""
+        softcap = 20
+        logits = self.lm_head(norm(x))
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+        return logits
+
+    def forward(self, idx, targets=None, kv_cache=None, ctm_cache=None, loss_reduction='mean'):
+        """
+        CTMCache is inference-only: during training, all T positions in a sequence process
+        independently from start_state (like an MLP). This is intentional — training batches
+        are randomly shuffled chunks with no temporal continuity between them. Inter-token
+        communication during training comes from the cross-attention (causal, via S_action queries),
+        not from sequential state flow. The cache enables cross-SEQUENCE continuity in inference
+        (stream of consciousness), which doesn't exist in training.
+
+        Dopamine gating is also inference-only (set by Engine): during training, the multi-tick
+        loss already acts as an implicit dopamine signal — tokens where the model struggles get
+        stronger gradients through the argmin tick selection. No separate modulation needed.
+        """
         B, T = idx.size()
+        use_multi_tick = self.config.use_ctm and targets is not None  # multi-tick loss during CTM training
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -582,23 +819,72 @@ class GPT(nn.Module):
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        last_layer_ticks = None
+        n_layers = len(self.transformer.h)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-        x = norm(x)
+            if use_multi_tick and i == n_layers - 1:
+                # Only collect multi-tick outputs from the last layer (closest to logits)
+                # Save x before block so we can reconstruct full residual for each tick
+                x_pre_block = x
+                result = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, multi_tick=True, ctm_cache=ctm_cache)
+                x, last_layer_ticks = result
+                # tick_outputs are MLP outputs (B,T,D). Build full residual for each:
+                # x_pre_block + attn_out + tick_mlp_out. Since x = x_pre_block + attn + final_mlp,
+                # and we know final_mlp = x - x_pre_block - attn, it's easier to just use:
+                # x_at_tick_k = x - final_mlp_out + tick_mlp_out
+                final_mlp_out = last_layer_ticks[-1]  # last tick = same as what block used
+                last_layer_ticks = [x - final_mlp_out + tick_out for tick_out in last_layer_ticks]
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, ctm_cache=ctm_cache)
 
         # Forward the lm_head (compute logits)
-        softcap = 20 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        logits = self._compute_logits(x)
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Main loss: cross-entropy on final output (as before)
+            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+
+            if use_multi_tick and last_layer_ticks:
+                # Multi-tick loss (CTM paper Listing 4): per-token tick selection
+                # Each token independently picks its best tick (argmin loss) and
+                # most certain tick (argmax certainty), matching paper's per-sample approach.
+                flat_targets = targets.view(-1)  # (B*T,)
+                n_tokens = flat_targets.size(0)
+                V = logits.size(-1)
+                max_entropy = math.log(V)
+
+                # Collect per-token unreduced losses and certainties for each tick
+                # all_losses: (K, B*T), all_certainties: (K, B*T)
+                all_losses = []
+                all_certainties = []
+                for tick_out in last_layer_ticks:
+                    tick_logits = self._compute_logits(tick_out)
+                    tick_logits_flat = tick_logits.view(-1, V)
+                    # Unreduced CE loss per token
+                    token_losses = F.cross_entropy(tick_logits_flat, flat_targets, ignore_index=-1, reduction='none')
+                    all_losses.append(token_losses)
+                    # Certainty = 1 - normalized_entropy per token
+                    with torch.no_grad():
+                        probs = F.softmax(tick_logits_flat, dim=-1)
+                        entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)
+                        certainty = 1.0 - entropy / max_entropy
+                    all_certainties.append(certainty)
+
+                all_losses = torch.stack(all_losses, dim=0)        # (K, B*T)
+                all_certainties = torch.stack(all_certainties, dim=0)  # (K, B*T)
+
+                # Per-token: select tick with lowest loss and tick with highest certainty
+                token_idx = torch.arange(n_tokens, device=all_losses.device)
+                best_tick_idx = all_losses.argmin(dim=0)     # (B*T,)
+                certain_tick_idx = all_certainties.argmax(dim=0)  # (B*T,)
+
+                loss_argmin = all_losses[best_tick_idx, token_idx].mean()
+                loss_argmax_cert = all_losses[certain_tick_idx, token_idx].mean()
+                loss = 0.5 * loss_argmin + 0.5 * loss_argmax_cert
+            else:
+                loss = main_loss
             return loss
         else:
             # inference: just return the logits directly
@@ -710,6 +996,212 @@ class GPT(nn.Module):
 
         return results
 
+    def consolidate(self, replay_batches, lr=1e-4, steps=4):
+        """Sleep consolidation: certainty-weighted self-distillation on replay buffer.
+
+        Brain analog: during slow-wave sleep, the brain replays recent experiences and
+        selectively strengthens synapses that "know what they know" while weakening
+        uncertain ones. No external reward needed — certainty IS the reward signal.
+
+        The loss: for each token at each tick, compute certainty (1 - normalized entropy).
+        Upweight loss on tokens where model is certain AND correct (reinforce confident knowledge).
+        Downweight loss on tokens where model is uncertain (don't consolidate confusion).
+
+        Only updates synapse weights (U-NET) and NLM weights — the "synaptic" parameters.
+        Attention, embeddings, and projection weights are frozen during consolidation.
+
+        Args:
+            replay_batches: list of (x, y) tensor pairs from the replay buffer
+            lr: learning rate for consolidation (should be small — gentle nudges)
+            steps: number of gradient steps per replay batch
+
+        Returns: dict with consolidation stats
+        """
+        if not self.config.use_ctm:
+            return {}
+
+        # Collect only synapse/NLM params — the "plastic" parameters
+        plastic_params = set()
+        for block in self.transformer.h:
+            if not isinstance(block.mlp, CTMBlock):
+                continue
+            ctm = block.mlp
+            plastic_params.update(p for p in ctm.synapses.parameters() if p.requires_grad)
+            plastic_params.update(p for p in ctm.nlm1.parameters() if p.requires_grad)
+            plastic_params.update(p for p in ctm.nlm2.parameters() if p.requires_grad)
+        plastic_params = list(plastic_params)
+
+        if not plastic_params:
+            return {}
+
+        # Freeze non-plastic params to avoid wasted gradient computation
+        plastic_set = set(id(p) for p in plastic_params)
+        frozen = []
+        for p in self.parameters():
+            if p.requires_grad and id(p) not in plastic_set:
+                p.requires_grad_(False)
+                frozen.append(p)
+
+        try:
+            optimizer = torch.optim.AdamW(plastic_params, lr=lr, betas=(0.9, 0.999), weight_decay=0.0)
+            self.train()
+            V = self.config.vocab_size
+            max_entropy = math.log(V)
+            stats = {'losses': [], 'mean_certainty': [], 'steps': 0}
+
+            for x, y in replay_batches:
+                for _ in range(steps):
+                    optimizer.zero_grad()
+
+                    logits = self.forward(x, targets=None)
+                    flat_y = y.view(-1)
+                    logits_flat = logits.view(-1, logits.size(-1))
+
+                    # Per-token certainty from final output
+                    with torch.no_grad():
+                        probs = F.softmax(logits_flat, dim=-1)
+                        entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)  # (B*T,)
+                        certainty = (1.0 - entropy / max_entropy).clamp(0, 1)  # (B*T,)
+                        correct = (logits_flat.argmax(dim=-1) == flat_y).float()  # (B*T,)
+                        weight = certainty * correct  # (B*T,)
+                        weight = weight / (weight.sum() + 1e-8) * weight.numel()
+
+                    token_losses = F.cross_entropy(logits_flat, flat_y, ignore_index=-1, reduction='none')
+                    loss = (token_losses * weight).mean()
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(plastic_params, 1.0)
+                    optimizer.step()
+
+                    stats['losses'].append(loss.item())
+                    stats['mean_certainty'].append(certainty.mean().item())
+                    stats['steps'] += 1
+        finally:
+            # Always re-enable gradients on frozen params
+            for p in frozen:
+                p.requires_grad_(True)
+            # Zero all grads so the main optimizer doesn't see stale consolidation gradients
+            for p in self.parameters():
+                if p.grad is not None:
+                    p.grad = None
+
+        return stats
+
+    def compact_memory(self, ctm_cache, lr=1e-5):
+        """Compact inference-time memory (CTMCache) into permanent synapse weights.
+
+        Brain analog: hippocampal → cortical memory transfer. During inference, the
+        CTMCache accumulates sync statistics (alpha/beta) that encode which neuron pairs
+        have been consistently co-activating. This method writes those patterns into the
+        synapse weights permanently — the model literally remembers what it experienced.
+
+        Three mechanisms work together:
+        1. Sync-driven Hebbian update: the accumulated S_out sync signal (alpha/sqrt(beta))
+           encodes pairwise co-activation history. We use this as a teaching signal for
+           the synapse weights — not a crude outer product, but the actual running statistics
+           the model has been computing all along.
+        2. Novelty gating: compare accumulated sync to "baseline" sync (from start state).
+           Only update where the sync has diverged significantly — don't waste plasticity
+           on patterns the model already knows.
+        3. Homeostasis: after each update, renormalize synapse layer weights to prevent
+           unbounded drift. Weight magnitude stays stable, only direction changes.
+
+        Args:
+            ctm_cache: CTMCache from a completed inference session
+            lr: plasticity learning rate (should be tiny — 1e-5 to 1e-4)
+
+        Returns: dict with per-layer plasticity stats
+        """
+        if ctm_cache is None or not self.config.use_ctm:
+            return {}
+
+        stats = {}
+        with torch.no_grad():
+            for i, block in enumerate(self.transformer.h):
+                if not isinstance(block.mlp, CTMBlock):
+                    continue
+                cached = ctm_cache.layers[i]
+                if cached is None:
+                    continue
+
+                ctm = block.mlp
+                alpha_out = cached['alpha_out']   # (BT, n_synch)
+                beta_out = cached['beta_out']     # (BT, n_synch)
+                state = cached['state']           # (BT, D)
+
+                # 1. Compute accumulated sync signal (what the model learned during inference)
+                synch_accumulated = alpha_out / torch.sqrt(beta_out)  # (BT, n_synch)
+
+                # Compute baseline sync: what start_state produces after K iterations of sync accumulation
+                # with no input variation. This is what the sync "resting state" looks like.
+                # For K iterations with constant pairwise products and decay r:
+                #   alpha_K = pp * (1 + r + r^2 + ... + r^(K-1)) = pp * (1 - r^K) / (1 - r + eps)
+                #   beta_K = 1 + r + r^2 + ... + r^(K-1) = (1 - r^K) / (1 - r + eps)
+                #   sync_baseline = alpha_K / sqrt(beta_K) = pp * sqrt(beta_K)
+                r_out = torch.exp(-ctm.decay_out.clamp(0, 15))  # (n_synch,)
+                K = ctm.active_K
+                baseline_left = ctm.start_state[ctm.synch_out_left]   # (n_synch,)
+                baseline_right = ctm.start_state[ctm.synch_out_right]  # (n_synch,)
+                pp_baseline = baseline_left * baseline_right  # (n_synch,)
+                # Geometric series: sum_{k=0}^{K-1} r^k = (1 - r^K) / (1 - r)
+                beta_baseline = (1 - r_out.pow(K)) / (1 - r_out + 1e-8)  # (n_synch,)
+                synch_baseline = pp_baseline * torch.sqrt(beta_baseline)  # (n_synch,)
+
+                # 2. Novelty: how much did sync diverge from baseline?
+                # Mean across batch dimension, compare to baseline
+                synch_mean = synch_accumulated.mean(dim=0)  # (n_synch,)
+                sync_delta = synch_mean - synch_baseline  # (n_synch,)
+                novelty = sync_delta.abs()
+
+                # Gate: only update where novelty exceeds median (top 50% most novel pairings)
+                novelty_threshold = novelty.median()
+                gate = (novelty > novelty_threshold).float()  # (n_synch,)
+                gated_delta = sync_delta * gate  # (n_synch,)
+
+                # 3. Capture base norms BEFORE any updates (for homeostasis)
+                updated_layers = [ctm.c_proj]
+                last_up = ctm.synapses.up_layers[-1]
+                if hasattr(last_up, 'weight'):
+                    updated_layers.append(last_up)
+                base_norms = {}
+                for layer in updated_layers:
+                    if hasattr(layer, 'weight'):
+                        if not hasattr(layer, '_plasticity_base_norm'):
+                            layer._plasticity_base_norm = layer.weight.data.norm().clone()
+                        base_norms[id(layer)] = layer._plasticity_base_norm
+
+                # 4. Apply gated sync delta to c_proj
+                # c_proj maps n_synch -> D. Nudge it to amplify novel sync channels.
+                n_synch_dim, D = ctm.c_proj.weight.shape[1], ctm.c_proj.weight.shape[0]
+                state_scale = state.abs().mean()
+                update = gated_delta.unsqueeze(0) * state_scale  # (1, n_synch) broadcast
+                ctm.c_proj.weight.data += lr * update.expand(D, -1).to(ctm.c_proj.weight.dtype)
+
+                # Also nudge last synapse up-layer using state delta from baseline
+                baseline_state = ctm.start_state.unsqueeze(0).expand_as(state)
+                state_delta = (state - baseline_state).mean(dim=0)  # (D,)
+                if hasattr(last_up, 'weight'):
+                    D_out, D_in = last_up.weight.shape
+                    input_approx = last_up.weight.data.mean(dim=0)  # (D_in,)
+                    rank1_update = state_delta[:D_out].unsqueeze(1) * input_approx.unsqueeze(0)
+                    last_up.weight.data += lr * rank1_update.to(last_up.weight.dtype)
+
+                # 5. Homeostasis: clamp weight norms to at most 1% growth from base
+                for layer in updated_layers:
+                    if hasattr(layer, 'weight'):
+                        w = layer.weight.data
+                        current_norm = w.norm()
+                        max_norm = base_norms[id(layer)] * 1.01
+                        if current_norm > max_norm:
+                            w.mul_(max_norm / current_norm)
+
+                stats[i] = {
+                    'mean_novelty': novelty.mean().item(),
+                    'gated_fraction': gate.mean().item(),
+                    'sync_delta_norm': sync_delta.norm().item(),
+                    'state_delta_norm': state_delta.norm().item(),
+                }
+
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         """
@@ -725,6 +1217,9 @@ class GPT(nn.Module):
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
+        # NOTE: this naive generate recomputes full sequence each step (no KV cache).
+        # CTMCache is NOT used here because state dims depend on BT which changes each step.
+        # For proper CTM state persistence, use Engine.generate which does token-by-token with caches.
         for _ in range(max_tokens):
             logits = self.forward(ids) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)

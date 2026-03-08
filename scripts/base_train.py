@@ -73,9 +73,10 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 # CTM
 parser.add_argument("--use-ctm", action="store_true", help="use CTM blocks instead of MLP")
 parser.add_argument("--ctm-iterations", type=int, default=4, help="CTM thinking steps per token")
-parser.add_argument("--ctm-memory-length", type=int, default=8, help="CTM trace history length")
+parser.add_argument("--ctm-memory-length", type=int, default=16, help="CTM trace history length")
 parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisation neurons (-1 = n_embd//2)")
 parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension")
+parser.add_argument("--ctm-synapse-depth", type=int, default=6, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16.")
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -84,6 +85,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--sleep-every", type=int, default=10, help="CTM sleep cycle frequency in steps (-1 = disable)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -149,7 +151,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         use_ctm=args.use_ctm, ctm_iterations=args.ctm_iterations,
         ctm_memory_length=args.ctm_memory_length, ctm_n_synch=ctm_n_synch,
-        ctm_memory_hidden=args.ctm_memory_hidden,
+        ctm_memory_hidden=args.ctm_memory_hidden, ctm_synapse_depth=args.ctm_synapse_depth,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -439,7 +441,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # convergence diagnostics reflect actual difficulty, not easy-to-process filler.
 import heapq
 replay_buffer_size = 16  # keep top-N hardest sequences
-replay_buffer = []  # min-heap of (loss, x_clone) — lowest loss gets evicted first
+replay_buffer = []  # min-heap of (loss, x_clone, y_clone) — lowest loss gets evicted first
 
 # Go!
 while True:
@@ -505,11 +507,11 @@ while True:
     # once in a while: run CTM sleep cycle (dream + compaction) to adapt per-layer K
     # Uses hippocampal replay: dreams on the hardest sequences from training, not generic text.
     # This ensures convergence diagnostics reflect actual model difficulty.
-    if args.use_ctm and args.eval_every > 0 and (step > 0 and step % args.eval_every == 0) and master_process:
-        print0(f"Step {step:05d} | Running CTM sleep cycle (dream + compaction)...")
+    if args.use_ctm and args.sleep_every > 0 and (step > 0 and step % args.sleep_every == 0) and master_process:
+        print0(f"Step {step:05d} | Running CTM sleep cycle (dream + compaction + consolidation)...")
         if replay_buffer:
             # Dream on the hardest sequence (highest loss = most surprising)
-            hardest_loss, hardest_x = max(replay_buffer, key=lambda t: t[0])
+            hardest_loss, hardest_x, hardest_y = max(replay_buffer, key=lambda t: t[0])
             sleep_idx = hardest_x[:1]  # take first sample from batch
             print0(f"  Replaying hardest sequence (loss={hardest_loss:.4f}) for dream diagnostics")
         else:
@@ -518,6 +520,8 @@ while True:
             sleep_tokens = tokenizer(sleep_text, prepend="<|bos|>")
             sleep_idx = torch.tensor([sleep_tokens], device=device)
             print0(f"  No replay data yet, using fallback text")
+
+        # Phase 1: REM — dream to measure convergence
         sleep_results = orig_model.sleep_cycle(sleep_idx, convergence_threshold=0.3, min_k=2)
         for layer_i, info in sorted(sleep_results.items()):
             delta_str = " -> ".join(f"{d:.4f}" for d in info['deltas'])
@@ -527,15 +531,32 @@ while True:
         total_k = sum(orig_model.transformer.h[i].mlp.active_K for i in sleep_results)
         max_k = sum(orig_model.transformer.h[i].mlp.K for i in sleep_results)
         print0(f"  Converged: {converged}/{len(sleep_results)} layers | Total active K: {total_k}/{max_k}")
-        avg_replay_loss = sum(l for l, _ in replay_buffer) / len(replay_buffer) if replay_buffer else 0
-        wandb_run.log({
+
+        # Phase 2: Consolidation — certainty-weighted replay on synapse/NLM weights
+        consolidation_stats = {}
+        if replay_buffer and len(replay_buffer) >= 4:
+            # Pick top-4 hardest sequences for consolidation
+            sorted_replay = sorted(replay_buffer, key=lambda t: t[0], reverse=True)
+            consolidation_batches = [(entry[1][:1], entry[2][:1]) for entry in sorted_replay[:4]]
+            consolidation_stats = orig_model.consolidate(consolidation_batches, lr=1e-4, steps=2)
+            if consolidation_stats.get('steps', 0) > 0:
+                mean_loss = sum(consolidation_stats['losses']) / len(consolidation_stats['losses'])
+                mean_cert = sum(consolidation_stats['mean_certainty']) / len(consolidation_stats['mean_certainty'])
+                print0(f"  Consolidation: {consolidation_stats['steps']} steps, loss={mean_loss:.4f}, certainty={mean_cert:.4f}")
+
+        avg_replay_loss = sum(l for l, _, _ in replay_buffer) / len(replay_buffer) if replay_buffer else 0
+        log_dict = {
             "step": step,
             "ctm/converged_layers": converged,
             "ctm/total_active_k": total_k,
             "ctm/max_k": max_k,
             "ctm/replay_hardest_loss": hardest_loss if replay_buffer else 0,
             "ctm/replay_avg_loss": avg_replay_loss,
-        })
+        }
+        if consolidation_stats.get('steps', 0) > 0:
+            log_dict["ctm/consolidation_loss"] = sum(consolidation_stats['losses']) / len(consolidation_stats['losses'])
+            log_dict["ctm/consolidation_certainty"] = sum(consolidation_stats['mean_certainty']) / len(consolidation_stats['mean_certainty'])
+        wandb_run.log(log_dict)
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
@@ -582,10 +603,11 @@ while True:
         # Hippocampal replay: remember hard sequences (high loss = high prediction error)
         if args.use_ctm and micro_step == 0:  # only track first micro-step to save memory
             loss_val = train_loss.item()
+            replay_entry = (loss_val, x.detach().clone(), y.detach().clone())
             if len(replay_buffer) < replay_buffer_size:
-                heapq.heappush(replay_buffer, (loss_val, x.detach().clone()))
+                heapq.heappush(replay_buffer, replay_entry)
             elif loss_val > replay_buffer[0][0]:
-                heapq.heapreplace(replay_buffer, (loss_val, x.detach().clone()))
+                heapq.heapreplace(replay_buffer, replay_entry)
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
