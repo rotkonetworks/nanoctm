@@ -506,8 +506,10 @@ print0(f"Token ratio: {total_batch_size * num_iterations / num_params:.1f} token
 # During sleep cycle, we replay these hard examples instead of generic text, so the
 # convergence diagnostics reflect actual difficulty, not easy-to-process filler.
 import heapq
+import random
 replay_buffer_size = 16  # keep top-N hardest sequences
-replay_buffer = []  # min-heap of (loss, x_clone, y_clone) — lowest loss gets evicted first
+replay_buffer = []  # min-heap of (loss, id, x_clone, y_clone, replay_count) — lowest loss gets evicted first
+replay_id_counter = 0   # unique id to break heap ties
 
 # Go!
 while True:
@@ -578,42 +580,107 @@ while True:
     # This ensures convergence diagnostics reflect actual model difficulty.
     if args.use_ctm and args.sleep_every > 0 and (step > 0 and step % args.sleep_every == 0) and master_process:
         print0(f"Step {step:05d} | Running CTM sleep cycle (dream + compaction + consolidation)...")
+        n_dreams = min(4, len(replay_buffer))  # dream about up to 4 sequences per sleep
+        hardest_loss = 0
+
         if replay_buffer:
-            # Dream on the hardest sequence (highest loss = most surprising)
-            hardest_loss, hardest_x, hardest_y = max(replay_buffer, key=lambda t: t[0])
-            sleep_idx = hardest_x[:1]  # take first sample from batch
-            print0(f"  Replaying hardest sequence (loss={hardest_loss:.4f}) for dream diagnostics")
+            # Re-score stale entries: run current model to get fresh losses.
+            # This prevents ruminating on nightmares the model has already learned to handle.
+            orig_model.eval()
+            rescored = []
+            with torch.no_grad():
+                for entry in replay_buffer:
+                    _, eid, ex, ey, rc = entry
+                    re_loss = orig_model(ex[:1].to(device), ey[:1].to(device)).item()
+                    rescored.append((re_loss, eid, ex, ey, rc))
+            orig_model.train()
+            replay_buffer.clear()
+            for entry in rescored:
+                heapq.heappush(replay_buffer, entry)
+
+            # Select dreams: softmax-weighted sampling (harder = more likely, not guaranteed).
+            # Work from a sorted snapshot, not heap indices (heap array order != sort order).
+            sorted_entries = sorted(replay_buffer, key=lambda t: t[0], reverse=True)
+            losses_arr = torch.tensor([e[0] for e in sorted_entries])
+            std = losses_arr.std().item() if len(losses_arr) > 1 else 1.0
+            weights = torch.softmax(losses_arr / max(std, 0.1), dim=0)
+            dream_indices = torch.multinomial(weights, min(n_dreams, len(sorted_entries)), replacement=False).tolist()
+            dream_entries = [sorted_entries[i] for i in dream_indices]
+            hardest_loss = sorted_entries[0][0]
+            dream_losses = [e[0] for e in dream_entries]
+            dreamed_ids = {e[1] for e in dream_entries}
+            print0(f"  Dreaming about {len(dream_entries)} sequences (losses: {', '.join(f'{l:.2f}' for l in dream_losses)})")
+
+            # Phase 1: REM — dream on each selected sequence, aggregate diagnostics
+            all_sleep_results = {}
+            for _, _, dream_x, _, _ in dream_entries:
+                sleep_idx = dream_x[:1]
+                sleep_results = orig_model.sleep_cycle(sleep_idx, convergence_threshold=0.3, min_k=2)
+                for layer_i, info in sleep_results.items():
+                    if layer_i not in all_sleep_results:
+                        all_sleep_results[layer_i] = info
+                    else:
+                        prev = all_sleep_results[layer_i]
+                        prev['deltas'] = [max(a, b) for a, b in zip(prev['deltas'], info['deltas'])]
+
+            # Increment replay counts for dreamed entries
+            updated_buffer = []
+            for entry in replay_buffer:
+                loss_val, eid, ex, ey, rc = entry
+                if eid in dreamed_ids:
+                    rc += 1
+                updated_buffer.append((loss_val, eid, ex, ey, rc))
+            replay_buffer.clear()
+            for entry in updated_buffer:
+                heapq.heappush(replay_buffer, entry)
+
+            for layer_i, info in sorted(all_sleep_results.items()):
+                delta_str = " -> ".join(f"{d:.4f}" for d in info['deltas'])
+                status = "CONVERGED" if info['converged'] else "active"
+                print0(f"  Layer {layer_i:2d}: K {info['old_k']}->{info['new_k']} [{delta_str}] {status}")
+            converged = sum(1 for r in all_sleep_results.values() if r['converged'])
+            total_k = sum(orig_model.transformer.h[i].mlp.active_K for i in all_sleep_results)
+            max_k = sum(orig_model.transformer.h[i].mlp.K for i in all_sleep_results)
+            print0(f"  Converged: {converged}/{len(all_sleep_results)} layers | Total active K: {total_k}/{max_k}")
+
+            # Phase 2: Consolidation — certainty-weighted replay on multiple sequences
+            consolidation_stats = {}
+            if len(replay_buffer) >= 4:
+                sorted_replay = sorted(replay_buffer, key=lambda t: t[0], reverse=True)
+                top_entries = sorted_replay[:4]
+                rest_entries = sorted_replay[4:]
+                random_entries = random.sample(rest_entries, min(4, len(rest_entries))) if rest_entries else []
+                consol_entries = top_entries + random_entries
+                consolidation_batches = [(entry[2][:1], entry[3][:1]) for entry in consol_entries]
+                consolidation_stats = orig_model.consolidate(consolidation_batches, lr=1e-4, steps=2)
+                if consolidation_stats.get('steps', 0) > 0:
+                    mean_loss = sum(consolidation_stats['losses']) / len(consolidation_stats['losses'])
+                    mean_cert = sum(consolidation_stats['mean_certainty']) / len(consolidation_stats['mean_certainty'])
+                    print0(f"  Consolidation: {consolidation_stats['steps']} steps, loss={mean_loss:.4f}, certainty={mean_cert:.4f}")
+
+            # Log replay buffer health
+            replay_counts = [e[4] for e in replay_buffer]
+            max_replays = max(replay_counts) if replay_counts else 0
+            print0(f"  Replay buffer: {len(replay_buffer)} entries, loss range [{min(e[0] for e in replay_buffer):.2f}, {hardest_loss:.2f}], max replays: {max_replays}")
         else:
             # Fallback if no replay data yet
             sleep_text = "The quick brown fox jumps over the lazy dog"
             sleep_tokens = tokenizer(sleep_text, prepend="<|bos|>")
             sleep_idx = torch.tensor([sleep_tokens], device=device)
             print0(f"  No replay data yet, using fallback text")
+            sleep_results = orig_model.sleep_cycle(sleep_idx, convergence_threshold=0.3, min_k=2)
+            for layer_i, info in sorted(sleep_results.items()):
+                delta_str = " -> ".join(f"{d:.4f}" for d in info['deltas'])
+                status = "CONVERGED" if info['converged'] else "active"
+                print0(f"  Layer {layer_i:2d}: K {info['old_k']}->{info['new_k']} [{delta_str}] {status}")
+            converged = sum(1 for r in sleep_results.values() if r['converged'])
+            total_k = sum(orig_model.transformer.h[i].mlp.active_K for i in sleep_results)
+            max_k = sum(orig_model.transformer.h[i].mlp.K for i in sleep_results)
+            print0(f"  Converged: {converged}/{len(sleep_results)} layers | Total active K: {total_k}/{max_k}")
+            all_sleep_results = sleep_results
+            consolidation_stats = {}
 
-        # Phase 1: REM — dream to measure convergence
-        sleep_results = orig_model.sleep_cycle(sleep_idx, convergence_threshold=0.3, min_k=2)
-        for layer_i, info in sorted(sleep_results.items()):
-            delta_str = " -> ".join(f"{d:.4f}" for d in info['deltas'])
-            status = "CONVERGED" if info['converged'] else "active"
-            print0(f"  Layer {layer_i:2d}: K {info['old_k']}->{info['new_k']} [{delta_str}] {status}")
-        converged = sum(1 for r in sleep_results.values() if r['converged'])
-        total_k = sum(orig_model.transformer.h[i].mlp.active_K for i in sleep_results)
-        max_k = sum(orig_model.transformer.h[i].mlp.K for i in sleep_results)
-        print0(f"  Converged: {converged}/{len(sleep_results)} layers | Total active K: {total_k}/{max_k}")
-
-        # Phase 2: Consolidation — certainty-weighted replay on synapse/NLM weights
-        consolidation_stats = {}
-        if replay_buffer and len(replay_buffer) >= 4:
-            # Pick top-4 hardest sequences for consolidation
-            sorted_replay = sorted(replay_buffer, key=lambda t: t[0], reverse=True)
-            consolidation_batches = [(entry[1][:1], entry[2][:1]) for entry in sorted_replay[:4]]
-            consolidation_stats = orig_model.consolidate(consolidation_batches, lr=1e-4, steps=2)
-            if consolidation_stats.get('steps', 0) > 0:
-                mean_loss = sum(consolidation_stats['losses']) / len(consolidation_stats['losses'])
-                mean_cert = sum(consolidation_stats['mean_certainty']) / len(consolidation_stats['mean_certainty'])
-                print0(f"  Consolidation: {consolidation_stats['steps']} steps, loss={mean_loss:.4f}, certainty={mean_cert:.4f}")
-
-        avg_replay_loss = sum(l for l, _, _ in replay_buffer) / len(replay_buffer) if replay_buffer else 0
+        avg_replay_loss = sum(e[0] for e in replay_buffer) / len(replay_buffer) if replay_buffer else 0
         log_dict = {
             "step": step,
             "ctm/converged_layers": converged,
@@ -682,7 +749,8 @@ while True:
         # Hippocampal replay: remember hard sequences (high loss = high prediction error)
         if args.use_ctm and micro_step == 0:  # only track first micro-step to save memory
             loss_val = train_loss.item()
-            replay_entry = (loss_val, x.detach().clone(), y.detach().clone())
+            replay_entry = (loss_val, replay_id_counter, x.detach().clone(), y.detach().clone(), 0)
+            replay_id_counter += 1
             if len(replay_buffer) < replay_buffer_size:
                 heapq.heappush(replay_buffer, replay_entry)
             elif loss_val > replay_buffer[0][0]:
