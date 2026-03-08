@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
-from nanochat.gpt import CTMCache
+from nanochat.gpt import CTMCache, CTMBlock
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -373,20 +373,22 @@ class Session:
     Usage:
         session = Session(model, tokenizer, max_seq_len=4096)
         reply1 = session.say("Hello, who are you?")
-        reply2 = session.say("What did I just ask you?")  # model remembers
-        session.compact(lr=1e-5)  # write this conversation to permanent memory
-        session.save("session_001.pt")  # save for later
+        reply2 = session.say("What did I just ask you?")  # model remembers via KV cache
+        # compact() and EpisodicMemory require CTMCache (BPTT-trained model)
         # Later:
         session = Session.load("session_001.pt", model, tokenizer)
     """
 
-    def __init__(self, model, tokenizer, max_seq_len=None, seed=42):
+    def __init__(self, model, tokenizer, max_seq_len=None, seed=42, online_lr=0.0):
         self.model = model
         self.tokenizer = tokenizer
         self.device = model.get_device()
         self.dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-        self.model.to(dtype=self.dtype)  # ensure weights match KV cache dtype
+        # Don't cast the model's master weights - they stay fp32 for optimizer precision.
+        # The model's Linear layers cast weights to input dtype in their forward().
+        self.model.eval()
         self.seed = seed
+        self.online_lr = online_lr  # >0 enables automatic learning from user messages
 
         m = model.config
         seq_len = max_seq_len or m.sequence_len
@@ -405,6 +407,12 @@ class Session:
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(seed)
 
+        # Online learning: persistent optimizer for plastic params (lazy init)
+        self._plastic_params = None
+        self._optimizer = None
+        self._frozen_params = None
+        self.last_learn_stats = {}  # stats from most recent learn_from call
+
     @torch.inference_mode()
     def _forward_tokens(self, tokens):
         """Feed tokens through the model, updating KV and CTM caches. Returns logits for last token."""
@@ -416,6 +424,11 @@ class Session:
     def say(self, text, max_tokens=512, temperature=0.7, top_k=50):
         """Send a message, get a reply. Both sides are remembered in the caches.
 
+        If online_lr > 0, the model learns from the user's message before replying.
+        The user's text is a prediction error signal - what the model should have
+        anticipated as the next part of the conversation. One gradient step on
+        synapse+NLM params, then inference continues with the updated weights.
+
         Args:
             text: user message (string)
             max_tokens: max reply length
@@ -424,6 +437,12 @@ class Session:
 
         Returns: model's reply as string
         """
+        # Online learning: learn from user's message before replying
+        # (runs outside inference_mode via learn_from's own context)
+        if self.online_lr > 0 and self.all_tokens:
+            with torch.inference_mode(False):
+                self.last_learn_stats = self.learn_from(text, lr=self.online_lr)
+
         # Encode user message with chat formatting
         user_tokens = self.tokenizer.encode(text)
         self.all_tokens.extend(user_tokens)
@@ -470,6 +489,163 @@ class Session:
         if self.ctm_cache is not None:
             return self.model.compact_memory(self.ctm_cache, lr=lr)
         return {}
+
+    def _init_online_learning(self, lr):
+        """Lazy init: collect plastic params, snapshot pretrained weights, build optimizer."""
+        if self._plastic_params is not None:
+            return
+
+        self._plastic_params = []
+        for block in self.model.transformer.h:
+            if not isinstance(block.mlp, CTMBlock):
+                continue
+            ctm = block.mlp
+            self._plastic_params.extend(p for p in ctm.synapses.parameters() if p.requires_grad)
+            self._plastic_params.extend(p for p in ctm.nlm1.parameters() if p.requires_grad)
+            self._plastic_params.extend(p for p in ctm.nlm2.parameters() if p.requires_grad)
+            self._plastic_params.extend(p for p in ctm.c_proj.parameters() if p.requires_grad)
+
+        if not self._plastic_params:
+            return
+
+        # Snapshot pretrained weights for elastic anchoring (EWC-lite).
+        # These are the "home base" weights that prevent catastrophic forgetting.
+        self._pretrained_snapshot = [p.data.clone() for p in self._plastic_params]
+
+        self._optimizer = torch.optim.AdamW(
+            self._plastic_params, lr=lr, betas=(0.9, 0.999), weight_decay=0.0,
+        )
+
+        # Freeze everything else so backward only computes gradients we need
+        plastic_set = set(id(p) for p in self._plastic_params)
+        self._frozen_params = []
+        for p in self.model.parameters():
+            if p.requires_grad and id(p) not in plastic_set:
+                p.requires_grad_(False)
+                self._frozen_params.append(p)
+
+    def _cleanup_online_learning(self):
+        """Restore requires_grad on frozen params."""
+        if self._frozen_params:
+            for p in self._frozen_params:
+                p.requires_grad_(True)
+
+    def _elastic_penalty(self):
+        """L2 penalty toward pretrained weight snapshot. Prevents catastrophic forgetting."""
+        penalty = 0.0
+        for p, p0 in zip(self._plastic_params, self._pretrained_snapshot):
+            penalty = penalty + (p - p0).pow(2).sum()
+        return penalty
+
+    def learn_from(self, text, lr=1e-5, context_len=256, distill_weight=0.5, elastic_weight=0.01):
+        """Online learning from prediction error with self-distillation.
+
+        The model learns from the conversation as it happens. Three loss terms
+        keep learning stable:
+
+        1. prediction error: CE loss on the user's actual text (what we should
+           have predicted). this is the learning signal.
+
+        2. self-distillation: KL divergence between the model's current output
+           distribution and what it predicted before the gradient step. keeps
+           the model from forgetting what it already knows on this context.
+
+        3. elastic anchoring: L2 penalty toward the pretrained weight snapshot.
+           prevents long-term drift from the base model over many interactions.
+
+        total loss = (1 - distill_weight) * CE + distill_weight * KL + elastic_weight * L2
+
+        ROADMAP (phase 5 - metacognitive tokens): currently the learning signal is
+        purely external (user text vs model prediction). With metacognitive tokens,
+        the model would also observe its own internal states (certainty, sync
+        magnitudes) as tokens in the stream. Prediction error on self-observation
+        becomes a fourth loss term -- the model learns not just what the world does,
+        but what it does, and uses that self-knowledge to gate plasticity adaptively.
+
+        Args:
+            text: the user's actual reply (what we should have predicted)
+            lr: learning rate (small - one gentle nudge per interaction)
+            context_len: how many preceding tokens to use as context
+            distill_weight: weight for self-distillation KL term (0 = pure prediction error)
+            elastic_weight: weight for elastic anchoring L2 penalty (0 = no anchoring)
+
+        Returns: dict with loss components, or empty dict if not CTM
+        """
+        if not self.model.config.use_ctm:
+            return {}
+
+        self._init_online_learning(lr)
+        if not self._plastic_params:
+            return {}
+
+        # Build input: recent context tokens + the new text
+        new_tokens = self.tokenizer.encode(text)
+        if not new_tokens:
+            return {}
+
+        # Use recent conversation as context for prediction
+        context = self.all_tokens[-context_len:] if len(self.all_tokens) > context_len else self.all_tokens[:]
+        sequence = context + new_tokens
+
+        # Input is sequence[:-1], target is sequence[1:] (standard LM)
+        if len(sequence) < 2:
+            return {}
+
+        ids = torch.tensor([sequence[:-1]], dtype=torch.long, device=self.device)
+        targets = torch.tensor([sequence[1:]], dtype=torch.long, device=self.device)
+
+        # Only compute loss on the new tokens (not the context)
+        # Mask context positions with -1 (ignored by cross_entropy)
+        n_context = len(context) - 1  # -1 because targets are shifted
+        if n_context > 0:
+            targets[:, :n_context] = -1
+
+        self.model.eval()  # no grad checkpointing
+
+        # Step 1: get teacher logits (current model's predictions before update)
+        with torch.no_grad():
+            teacher_logits = self.model.forward(ids, targets=None)  # (1, T, V)
+
+        # Step 2: forward with gradients for student loss
+        self._optimizer.zero_grad()
+        student_logits = self.model.forward(ids, targets=None)  # (1, T, V)
+
+        # Prediction error: CE on new tokens only
+        flat_targets = targets.view(-1)
+        flat_logits = student_logits.view(-1, student_logits.size(-1))
+        ce_loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=-1)
+
+        # Self-distillation: KL divergence from teacher on ALL positions (context + new)
+        # The model should stay close to its pre-update predictions everywhere
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        # KL(teacher || student) = sum(teacher * (log_teacher - log_student))
+        teacher_probs = teacher_log_probs.exp()
+        kl_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1).mean()
+
+        # Elastic anchoring: L2 toward pretrained weights
+        elastic_loss = self._elastic_penalty()
+
+        # Combined loss
+        loss = (1.0 - distill_weight) * ce_loss + distill_weight * kl_loss + elastic_weight * elastic_loss
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self._plastic_params, 1.0)
+        self._optimizer.step()
+
+        # Clear grads to not pollute inference
+        self._optimizer.zero_grad()
+        for p in self._plastic_params:
+            if p.grad is not None:
+                p.grad = None
+
+        return {
+            'loss': loss.item(),
+            'ce_loss': ce_loss.item(),
+            'kl_loss': kl_loss.item(),
+            'elastic_loss': elastic_loss.item(),
+            'tokens_learned': len(new_tokens),
+        }
 
     def save(self, path):
         """Save session state (caches + token history) to disk for later resumption."""
@@ -576,8 +752,13 @@ class EpisodicMemory:
     def store(self, session, summary=None):
         """Store a session's CTMCache as an episodic memory.
 
+        Requires the session to have an active CTMCache (i.e. model trained with
+        BPTT state continuity). Without CTMCache, there's no thinking state to
+        store - the session's memory lives only in the KV cache which is an
+        ephemeral computational artifact, not transferable episodic memory.
+
         Args:
-            session: a Session object after conversation
+            session: a Session object after conversation (must have ctm_cache)
             summary: optional text summary of what the conversation was about
         """
         if session.ctm_cache is None:
