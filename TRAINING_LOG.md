@@ -299,10 +299,25 @@ this confirms the scaling insight: early training is pure language learning.
 CTM's extra machinery (cross-attention, U-NET, NLM) adds no value at this
 stage — it just slows things down. FFN bruteforces the same result 12x faster.
 
-plan: let FFN run to 10k steps (~46 min total), then warm-start CTM from
-the FFN checkpoint. the CTM blocks start fresh but attention + embeddings
-get a 10k-step head start. compare this warm-started CTM against our
-from-scratch CTM to measure the benefit.
+FFN completed 10k steps in 46 minutes. final bpb: 0.908.
+
+bpb curve (FFN d12):
+- step 1000: 1.112 (matches CTM K=3 at same step)
+- step 3000: 1.017
+- step 5000: 0.985 (our CTM K=1 at step 3300 is still at ~1.06)
+- step 8000: 0.922 (diminishing returns)
+- step 10000: 0.908 (flattening hard, ~0.001/100 steps)
+
+generation at step 10k: "The capital of France is Paris", knows all 8 planets
+in order, "opposite of hot is cold", "gold is soft silvery-white metal".
+factual knowledge solid. still loops after first sentence — 286M param ceiling.
+
+the model is hitting its size limit. more training would squeeze out 0.01-0.02
+bpb at best. this is a good warm-start checkpoint for CTM.
+
+next: rsync ffn_d12 checkpoint to H200, warm-start CTM with `--warm-start-from`.
+the CTM blocks will start fresh but attention + embeddings get a 10k-step
+head start with 0.908 bpb foundation instead of training from scratch.
 
 ### why CTM can't scale like FFN on GPU clusters
 
