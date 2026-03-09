@@ -275,9 +275,34 @@ blocks from the trained FFN weights (we already have `--warm-start-from` for
 this). the CTM blocks would only need to learn their synapse/NLM/cross-attention
 behavior on top of already-solid language representations.
 
-**TODO**: benchmark K=1 CTM vs FFN on same hardware (H200 NVL) to measure the
-actual speed gap. if FFN is 5x+ faster per token, the optimal path might be:
-FFN base training → warm-start CTM at K=1 → ramp K as model matures.
+## FFN baseline run (2026-03-09)
+
+rented a second H100 NVL ($1.49/hr) to train a d12 FFN (no CTM) in parallel.
+same data, same tokenizer, same hyperparams except no `--use-ctm`.
+
+**FFN vs CTM at step 1500:**
+
+| metric | FFN | CTM K=3 | CTM K=1 |
+|--------|-----|---------|---------|
+| val bpb | 1.073 | 1.075 | ~1.53 (tick 0 only) |
+| loss | 3.64 | 3.56 | 3.83 |
+| tok/sec | 239k | 4.1k | 20.3k |
+| step time | 275ms | 15.8s | 3.0s |
+| wall time to 1500 | 7 min | ~14 hrs | ~75 min |
+| MFU | 30% | ~8% | ~8% |
+
+same quality, 12x faster. FFN reaches step 1500 in 7 minutes vs 14 hours for
+CTM K=3. generation quality identical — both produce sentence fragments that
+collapse into repetition.
+
+this confirms the scaling insight: early training is pure language learning.
+CTM's extra machinery (cross-attention, U-NET, NLM) adds no value at this
+stage — it just slows things down. FFN bruteforces the same result 12x faster.
+
+plan: let FFN run to 10k steps (~46 min total), then warm-start CTM from
+the FFN checkpoint. the CTM blocks start fresh but attention + embeddings
+get a 10k-step head start. compare this warm-started CTM against our
+from-scratch CTM to measure the benefit.
 
 ### why CTM can't scale like FFN on GPU clusters
 
