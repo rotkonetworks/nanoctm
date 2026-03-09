@@ -222,7 +222,7 @@ throughput: 3k tok/sec (H100, no compile) → 4.1k tok/sec (H200, partial compil
 ## step 1500 — K=5 → K=1 switch (2026-03-09)
 
 reverting to checkpoint 1500 (K=3 baseline, loss 3.56, bpb 1.075).
-switching to K=1 with batch=3. discarding K=5 experiment data (150 steps).
+switching to K=1 with batch=6. discarding K=5 experiment data (150 steps).
 
 rationale: at 1500 steps the model is still GPT-2 stupid — it produces
 sentence fragments but collapses into repetition after 5-10 tokens.
