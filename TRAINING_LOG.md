@@ -165,12 +165,8 @@ early training slows step time proportionally for something the model can't
 yet use. we went K=3 from step 0, costing ~1.7x in step time. K=5 made it
 2.7x. the right move is K=1 until the model speaks coherently, then ramp up.
 
-switching to K=1 with batch=3 from checkpoint 1500. expected speedup:
-- K=1 vs K=5: ~5x fewer tick iterations
-- batch=3 vs batch=2: 1.5x more tokens per step
-- combined: roughly 3-4x more tokens per wall-clock hour
-
-this is the dogu optimal strategy: fast base, deep thinking later.
+switching to K=1 with batch=6 from checkpoint 1500. this is the dogu optimal
+strategy: fast base, deep thinking later.
 
 ---
 
@@ -227,8 +223,8 @@ switching to K=1 with batch=6. discarding K=5 experiment data (150 steps).
 rationale: at 1500 steps the model is still GPT-2 stupid — it produces
 sentence fragments but collapses into repetition after 5-10 tokens.
 it needs raw language hours, not deeper thinking. K=1 removes all tick
-overhead, batch=3 increases token throughput. expected ~3-4x more tokens
-per wall-clock hour compared to K=5.
+overhead, batch=6 increases token throughput. ~5x more tokens per wall-clock
+hour compared to K=3, ~8.5x compared to K=5.
 
 plan: run K=1 until the model speaks coherent sentences (~loss 2.5-3.0?),
 then add ticks back incrementally. this is the dogu optimal path.
