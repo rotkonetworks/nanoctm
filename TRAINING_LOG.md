@@ -363,3 +363,21 @@ retrieval. the model doesn't remember, it re-reads. CTM's episodic memory
 and weight plasticity are designed to be actual remembering — experience
 changing the model itself, not just its input buffer. whether this works
 in practice is unproven. we're building it to find out.
+
+### scaling implications: foundation model, not foundation runs
+
+if neuroplasticity works, CTM doesn't need to scale like LLMs. the industry
+spends billions on ever-larger pretraining runs because LLMs are frozen after
+training — all capability must be baked in during one massive compute phase.
+
+CTM could flip this. train one foundation model (moderate compute, single GPU),
+deploy it, and it keeps learning through interaction. capability accumulates
+over the model's lifetime, not just during pretraining. a thousand users
+running their own CTM instance, each diverging through experience — a thousand
+unique minds grown from one seed, trained locally on local hardware with
+local data.
+
+no datacenter needed for the growth phase. no retraining every 6 months.
+the foundation model is the seed, not the product. this is unproven — but
+if it works, the economics of AI completely change. you don't need scale-out
+training infrastructure, you need one good seed and plasticity that works.
