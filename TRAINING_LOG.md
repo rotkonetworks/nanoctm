@@ -62,9 +62,11 @@ moved on to bigger single GPU.
 
 moved to 1x H200 NVL, 140GB VRAM, Xeon 6747P 192 cores, 2TB RAM. $1.95/hr.
 
-first win: torch.compile works on the full model now. the old H100 had 80GB
-system RAM and the compiler OOMed. this machine has 2TB. compile traces the
-CTM forward including the K=3 loop.
+torch.compile attempted on the full model. the old H100 instance had only 80GB
+system RAM and the compiler OOMed during tracing (compile uses CPU RAM, not
+VRAM). this machine has 2TB system RAM so tracing completes, but the CTMBlock
+still isn't fully compiled — Python loops and branches cause graph breaks.
+attention modules compile, CTM blocks stay interpreted.
 
 gotchas along the way:
 - 32GB overlay disk filled up from training data + pip cache. moved data to
@@ -72,9 +74,6 @@ gotchas along the way:
   (not /dev/shm which is noexec).
 - muon_step_fused hits recompile limit with fullgraph=True. added
   NANOCHAT_NO_OPTIM_COMPILE env var to skip just optimizer compile.
-- compile message: "compiled 12 attention modules (CTMBlock left interpreted)"
-  — actually the CTMBlock still isn't fully compiled despite our attempt.
-  the compiler handles it but doesn't speed it up much.
 
 results at step ~1150:
 - 15.8s/step, 4.1k tok/sec (was 21.5s on old H100 — 27% faster)
