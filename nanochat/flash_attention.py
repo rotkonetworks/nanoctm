@@ -87,6 +87,9 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     SDPA attention with sliding window support.
     q, k, v are (B, H, T, D) format.
     """
+    # Ensure all tensors share the same dtype (KV cache may be bf16 while query is float32)
+    if q.dtype != k.dtype:
+        q = q.to(k.dtype)
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
