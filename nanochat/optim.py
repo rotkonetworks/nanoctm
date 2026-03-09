@@ -90,7 +90,8 @@ polar_express_coeffs = [
 ]
 
 import os as _os
-_muon_compile = torch.compile(dynamic=False, fullgraph=True) if not _os.environ.get("NANOCHAT_NO_COMPILE") else lambda fn: fn
+_no_compile = _os.environ.get("NANOCHAT_NO_COMPILE") or _os.environ.get("NANOCHAT_NO_OPTIM_COMPILE")
+_muon_compile = torch.compile(dynamic=False, fullgraph=True) if not _no_compile else lambda fn: fn
 
 @_muon_compile
 def muon_step_fused(
@@ -376,13 +377,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
-            if p.numel() < 1024:
-                # Small params: all_reduce (no scatter/gather needed)
+            if p.numel() < 1024 or grad.shape[0] % world_size != 0:
+                # Small params or indivisible shape: all_reduce (no scatter/gather needed)
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
                 # Large params: reduce_scatter
-                assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()

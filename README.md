@@ -1,171 +1,114 @@
 # nanoctm
 
-a fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) that replaces MLP layers with Continuous Thought Machine blocks. the model thinks iteratively at each token position instead of doing a single feedforward pass.
+fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). we ripped out the MLP layers and replaced them with [Continuous Thought Machines](https://arxiv.org/abs/2505.05522). the model thinks in loops instead of doing one feedforward pass per token.
 
-the goal is a model you can spawn and leave running. it remembers what it has done through episodic memory, and builds on those memories through neuroplasticity - writing experience back into its own weights. not a stateless tool you prompt and forget, but something closer to a persistent agent that accumulates knowledge over its lifetime.
+nobody has tried this on language before. the CTM paper did MNIST and mazes. we wanted to know if it works for the hard modality. it does.
 
-based on [Continuous Thought Machines (Jesson et al., 2025)](https://arxiv.org/abs/2505.05522).
+the end goal is a model that learns from conversations and remembers across them. not a stateless tool you prompt and forget — something that accumulates knowledge by being used.
 
-## what changed from upstream nanochat
+## how it works
 
-the transformer is the same (attention, embeddings, value embeddings, residual lambdas). what's different is everything between the attention output and the residual connection - the MLP is replaced by a CTM block that:
+normal transformer: attention → MLP → residual. one pass, done.
 
-- runs K thinking iterations per token (default 4)
-- maintains internal state and trace history across iterations
-- uses cross-attention to re-observe the input at each thinking step
-- uses a U-NET synapse network instead of a feedforward layer
-- uses per-neuron trace processing (NLMs) with GLU gating
-- computes dual synchronisation signals for output readout and attention queries
-- supports per-token multi-tick loss where each token picks its best thinking step
+nanoctm: attention → CTM block → residual. the CTM block runs K iterations of a thinking loop. each iteration re-observes the input through cross-attention (what it pays attention to changes as it thinks more), processes through a depth-32 U-NET synapse, updates a trace of recent states, and accumulates synchronization between random neuron pairs.
 
-the CTM blocks are a drop-in replacement toggled by `--use-ctm`. without that flag, the model trains as vanilla nanochat.
+after K iterations, each token picks which iteration gave the best answer. not the average, not the last one — each token picks for itself. easy tokens use early ticks, hard tokens use later ones.
+
+the sync signal is real. when neurons agree, certainty is high. when they don't, it's low. this isn't a learned phrase — it's a measurable property of the computation.
+
+`--use-ctm` toggles it. without the flag, it's vanilla nanochat.
+
+## what's running now
+
+d12 CTM on a rented H200 NVL 140GB:
+
+```
+12 layers, 768-dim, K=1 (speed chess phase), synapse_depth=32
+384 sync neurons, M=16 trace, 32 NLM hidden
+~469M params, batch=6 x 5 grad accum, ~3.0s/step, 20k tok/sec
+```
+
+step ~2000, loss 3.70, validation bpb ~1.07. model produces sentence fragments
+and knows basic facts but still collapses into repetition. learning language
+fundamentals before we add thinking iterations.
+
+training history: K=3 (steps 0-1500) → K=5 experiment (150 steps, reverted) → K=1 (current).
+see [TRAINING_LOG.md](TRAINING_LOG.md) for the full journey.
 
 ## quick start
 
-train a d12 CTM model from scratch on a single GPU:
-
 ```bash
-NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
+python -m scripts.base_train \
     --depth=12 \
+    --device-batch-size=6 \
+    --total-batch-size=61440 \
     --use-ctm \
-    --run=ctm_d12 \
-    --model-tag=ctm_d12 \
+    --ctm-iterations=1 \
+    --ctm-synapse-depth=32 \
     --window-pattern=L \
-    --eval-tokens=524288
+    --model-tag=ctm_d12_v2 \
+    --save-every=500 \
+    --sleep-every=10
 ```
 
-multi-GPU with torchrun:
+`--window-pattern=L` if you don't have Flash Attention 3. `NANOCHAT_NO_OPTIM_COMPILE=1` if optimizer compile hits recompilation limits. torch.compile works for the full model at K=1.
 
-```bash
-NANOCHAT_NO_COMPILE=1 OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
-    --depth=12 \
-    --use-ctm \
-    --run=ctm_d12 \
-    --model-tag=ctm_d12 \
-    --window-pattern=L \
-    --eval-tokens=524288
-```
+## K (thinking iterations)
 
-important notes:
-- `NANOCHAT_NO_COMPILE=1` is required. torch.compile does not work with CTM (compiler OOMs tracing the nested iteration loops)
-- `--window-pattern=L` if you don't have Flash Attention 3 (most setups)
-- `--eval-tokens=524288` keeps evals fast without compile
+K controls how many times the model thinks about each token. train with K=3, deploy with K=30 — it costs zero extra VRAM at inference because each tick reuses the same buffers. the memory cost is training-only (backprop needs the full computation graph).
 
-## CTM training flags
+the only K-specific parameter is `tick_embed` — a small learned per-tick vector. everything else (synapses, NLMs, sync pairs) is K-agnostic. to scale K after training, expand tick_embed and keep going.
 
-all CTM features are opt-in. the defaults are tuned for a 768-dim d12 model on H100 80GB.
-
-| flag | default | what it does |
-|------|---------|-------------|
-| `--use-ctm` | off | enable CTM blocks instead of MLP |
-| `--ctm-iterations` | 4 | thinking steps per token (K). more = deeper thinking, more memory |
-| `--ctm-memory-length` | 16 | trace history window (M). how many past states each neuron sees |
-| `--ctm-n-synch` | n_embd/2 | synchronisation neuron count. controls sync signal resolution |
-| `--ctm-memory-hidden` | 32 | NLM hidden dimension. per-neuron processing capacity |
-| `--ctm-synapse-depth` | 6 | U-NET depth (even number, half down + half up). paper uses 16 |
-| `--sleep-every` | 10 | run sleep cycle every N steps. -1 to disable |
-| `--warm-start-from` | none | load attention+embeddings from an MLP checkpoint, fresh CTM init |
-| `--freeze-non-ctm` | off | freeze everything except CTM blocks (phase 2 fine-tuning) |
-| `--bptt-chunks` | 1 | split sequences into N chunks for truncated BPTT with CTM state carry-over. 1 = disabled |
-| `--distill-from` | none | path to teacher checkpoint for knowledge distillation |
-| `--distill-weight` | 0.5 | weight for KL distillation loss (0 = disabled) |
-| `--elastic-weight` | 0.01 | weight for L2 elastic anchoring penalty (0 = disabled) |
-| `--distill-temperature` | 2.0 | softmax temperature for soft targets (higher = softer) |
+more K can cause overthinking. the model gets it right at tick 3 but ticks 4+ start doubting. per-token selection handles this — doubt-ticks don't get picked. but it means you want to start small and scale up, not train at K=100 from the start.
 
 ## training phases
 
-### phase 1: learn language (current)
+follows brain development. babies learn to talk before they form memories. you need to know what things are before remembering specific instances matters.
 
-train from scratch with `--use-ctm`. the model learns language through CTM's iterative thinking. each token gets fresh internal state - no cross-token CTM memory yet.
+**phase 1: language** (now) — from-scratch CTM training. each token gets fresh state, no memory across tokens. the baby learns to talk.
 
-```bash
-NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
-    --depth=12 --use-ctm --run=ctm_d12 --model-tag=ctm_d12
-```
+**phase 2: warm-start** (optional) — transplant attention weights from an MLP checkpoint, freeze them, train only CTM blocks. we skipped this — from-scratch works fine and attention co-adapts with CTM better.
 
-### phase 2: fine-tune CTM on pretrained attention (optional)
+**phase 3: memory continuity** — chunked BPTT. split sequences into chunks, process sequentially with CTM state carried between chunks. gradients flow back through chunks — the model learns what to remember for later. without this, feeding carried state at inference is out-of-distribution. it's like handing someone memories from a life they never lived.
 
-if you have an MLP-trained checkpoint, you can transplant its attention weights and train only the CTM blocks. this is optional - from-scratch training works fine and arguably better since there's no compile benefit to phasing.
+**phase 4: constitution SFT** — fine-tune on conversations that embody the [constitution](CONSTITUTION.md). dataset: our Claude Code sessions (~468k tokens), cypherpunk blogs (moxie, djb, isis lovecruft, barlow), penumbra protocol work, local blogs. constitution as system prompt. small dataset, big behavioral shift.
 
-```bash
-NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
-    --depth=12 --use-ctm \
-    --warm-start-from=/path/to/mlp_checkpoint \
-    --freeze-non-ctm \
-    --run=ctm_phase2 --model-tag=ctm_phase2
-```
+**phase 5: online learning** — gradient step on synapse params after each user message. the conversation is the training data. self-distillation + elastic anchoring prevent forgetting.
 
-### phase 3: state continuity via BPTT with distillation
+**phase 6: episodic memory** — save thinking state snapshots, look up the closest past state when a new conversation starts. resume how you were thinking, not what you said.
 
-once the model knows language, enable `--bptt-chunks` to teach it cross-token thinking state. this splits each sequence into chunks, processes them sequentially with CTM state carried between chunks, and does per-chunk backward to keep memory bounded.
-
-this is the prerequisite for persistent memory - without it, carrying CTM state across tokens at inference feeds the model inputs it never saw during training.
-
-two mechanisms prevent forgetting during phase transitions:
-
-**elastic anchoring** (cheap, always use): snapshots the plastic param values before BPTT starts. L2 penalty pulls them back during training. no extra forward pass, just stored tensors.
-
-**knowledge distillation** (optional, costs extra forward pass): a teacher model provides soft targets. the student's KL divergence from the teacher is added to the loss. two teacher modes:
-
-local teacher (same architecture, full logit-level KL):
-```bash
-NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
-    --depth=12 --use-ctm --bptt-chunks=4 \
-    --warm-start-from=/path/to/phase1_checkpoint \
-    --distill-from=/path/to/phase1_checkpoint \
-    --distill-weight=0.5 --elastic-weight=0.01 \
-    --run=ctm_bptt --model-tag=ctm_bptt
-```
-
-ollama teacher (any model, sequence-level distillation):
-```bash
-# terminal 1: serve teacher model
-ollama serve
-ollama pull llama3.2
-
-# terminal 2: train with distillation from ollama
-NANOCHAT_NO_COMPILE=1 python -m scripts.base_train \
-    --depth=12 --use-ctm --bptt-chunks=4 \
-    --warm-start-from=/path/to/phase1_checkpoint \
-    --distill-from=ollama:llama3.2 \
-    --distill-weight=0.3 --elastic-weight=0.01 \
-    --run=ctm_bptt --model-tag=ctm_bptt
-```
-
-the ollama teacher generates text completions for each training context, re-encodes them in our vocab, and uses them as hard targets. this lets you distill from llama 70b, qwen, deepseek, whatever ollama can serve - the teacher doesn't need to share our architecture or even our tokenizer. for a remote ollama instance: `--distill-from=ollama:llama3.2@192.168.1.100:11434`
-
-the total training loss: `(1 - distill_weight) * task_loss + distill_weight * KL_loss + elastic_weight * L2_loss`
+**phase 7: metacognitive tokens** — the model reports its own sync/certainty as special tokens. backed by actual internal signals, not learned phrases.
 
 ## sleep cycle
 
-every `--sleep-every` steps (default 10), the training loop runs a sleep cycle:
+every 10 training steps, the model sleeps. three stages:
 
-1. **dream** - replays the hardest training sequence, measures per-layer convergence (state delta across K iterations). purely diagnostic - we no longer reduce K for "converged" layers because it degrades quality.
+**REM replay.** replays up to 4 sequences from a buffer of the 16 hardest training examples. softmax-weighted sampling — worst sequences are most likely but not guaranteed. runs dream diagnostics on each: per-layer state deltas, basically an fMRI of the model dreaming.
 
-2. **consolidation** - certainty-weighted self-distillation on the replay buffer. only updates synapse and NLM weights. tokens the model is confident and correct about get higher weight. like REM sleep strengthening memories.
+early finding: the model had the same nightmare every night. one sequence with loss 15.50, so much worse than anything else that nothing displaced it. 13 sleep cycles, 13 replays of the same sequence. consolidation loss halved (2.52 → 1.07), certainty doubled (0.28 → 0.57). it was processing the trauma but never solving it. fixed with diverse replay — re-score entries with fresh forward passes, sample by softmax over losses instead of always picking the worst.
 
-the replay buffer is a min-heap of the 16 hardest training sequences (highest loss), acting as a hippocampal replay buffer - the model re-experiences its most surprising inputs during sleep.
+**compaction.** writes sync patterns into permanent synapse weights. hebbian learning — neurons that fire together wire together. novelty-gated: only update where surprise exceeds the median. homeostatic clamping keeps norms stable.
 
-disable with `--sleep-every=-1` if you want pure gradient descent.
+**consolidation.** certainty-weighted self-distillation on 8 sequences (4 hardest + 4 random). confident correct predictions get reinforced. uncertain stuff stays plastic.
+
+`--sleep-every=-1` to disable.
 
 ## inference
 
-### generate samples
-
 ```bash
+# CLI chat
 python -m scripts.chat_cli --model-tag=ctm_d12
-```
 
-### dream diagnostics
+# web UI
+python -m scripts.chat_web --model-tag=ctm_d12
 
-```bash
+# dream diagnostics
 python -m scripts.ctm_dream
 ```
 
-runs generation samples and dream() to show per-layer convergence patterns.
+can't use ollama/llama.cpp/vllm — they don't know how to run CTM loops.
 
-### session (multi-turn conversation)
-
+multi-turn sessions:
 ```python
 from nanochat.engine import Session
 from nanochat.checkpoint_manager import load_model
@@ -173,188 +116,84 @@ from nanochat.checkpoint_manager import load_model
 model, tokenizer, meta = load_model("base", device="cuda", model_tag="ctm_d12")
 session = Session(model, tokenizer)
 reply1 = session.say("hello")
-reply2 = session.say("what did i just say?")  # remembers via KV cache
+reply2 = session.say("what did i just say?")
 ```
 
-### online learning
-
-pass `online_lr` to Session and the model learns from each user message as it happens. no separate training run, no logs to replay - the conversation itself is the training data.
-
+online learning (model learns from each message):
 ```python
 session = Session(model, tokenizer, online_lr=1e-5)
-reply1 = session.say("hello")                    # first message, nothing to learn from yet
-reply2 = session.say("my name is tommi")          # model learns: "my name is tommi" was the continuation
-reply3 = session.say("what is my name?")          # model learned from previous message, synapses updated
-print(session.last_learn_stats)                   # {'loss': 4.2, 'tokens_learned': 5}
+session.say("hello")
+session.say("my name is tommi")       # learns from this
+session.say("what is my name?")       # synapses updated
 ```
 
-each user message is a prediction error signal. the model predicted some continuation, the user said something else, and the difference drives a gradient step on synapse+NLM+c_proj weights. everything else (attention, embeddings) stays frozen. this is fast - two forward passes + one backward on a short sequence per message.
+each message is a prediction error signal. CE loss from what the user said vs what the model predicted, KL from pre-update logits to prevent forgetting, L2 toward pretrained weights for stability.
 
-three loss terms keep learning stable:
+## compute
 
-- **prediction error** (CE) - what the user actually said vs what the model predicted. this is the learning signal.
-- **self-distillation** (KL) - before the gradient step, snapshot the model's current output distribution. after computing the new logits, add KL divergence so the model doesn't forget what it already knows on this context. like a teacher watching over your shoulder.
-- **elastic anchoring** (L2) - penalize drift from pretrained weights. the plastic params are snapshotted at session start and an L2 penalty pulls them back. prevents long-term catastrophic forgetting over many interactions.
+| config | params | VRAM | step time | tok/sec | hardware |
+|--------|--------|------|-----------|---------|----------|
+| MLP baseline | 286M | ~10GB | ~0.8s | ~800k | H100 (compiled) |
+| CTM K=5 b=2 | 469M | 41GB | 27.0s | 2.4k | H200 NVL |
+| CTM K=3 b=2 | 469M | ~110GB | 15.8s | 4.1k | H200 NVL |
+| CTM K=1 b=3 | 469M | 65GB | 3.5s | 17.5k | H200 NVL |
+| CTM K=1 b=6 | 469M | 120GB | 3.0s | 20.3k | H200 NVL |
 
-total loss = `(1 - distill_weight) * CE + distill_weight * KL + elastic_weight * L2`
+CTM is inherently slower than FFN because each layer does 2 attention passes
+(self + cross) plus a depth-32 U-NET synapse plus per-neuron MLPs. at K>1 the
+entire inner loop repeats sequentially per tick. MFU ~8% vs ~50% for pure FFN.
 
-defaults: distill_weight=0.5, elastic_weight=0.01. tune these based on how fast you want the model to adapt vs how much you trust the pretrained weights.
-
-you can also call `learn_from` manually for more control:
-
-```python
-session = Session(model, tokenizer)
-reply = session.say("what is the capital of france?")
-# model said something wrong, teach it:
-stats = session.learn_from("the capital of france is paris.", lr=1e-5, distill_weight=0.3)
-print(stats)  # {'loss': 2.1, 'ce_loss': 3.8, 'kl_loss': 0.02, 'elastic_loss': 0.001, 'tokens_learned': 8}
-```
-
-CTMCache (persistent thinking state across tokens) is disabled in Session by default. the model is trained with fresh state per token, so enabling it degrades output. after phase 3 BPTT training, CTMCache can be enabled for true stream-of-consciousness inference.
-
-### serving
-
-nanoctm models can't run in ollama/llama.cpp/vllm - those runtimes don't know how to execute CTM iteration loops. the model requires our own runtime. use the built-in web UI or CLI:
-
-```bash
-# web UI (ChatGPT-style interface)
-python -m scripts.chat_web --model-tag=ctm_d12
-
-# CLI chat
-python -m scripts.chat_cli --model-tag=ctm_d12
-```
-
-for a persistent agent that learns from interactions:
-
-```python
-from nanochat.engine import Session
-from nanochat.checkpoint_manager import load_model
-
-model, tokenizer, _ = load_model("base", device="cuda", model_tag="ctm_d12")
-session = Session(model, tokenizer, online_lr=1e-5)
-
-# the model learns from every message and updates its own weights
-while True:
-    user_input = input("> ")
-    reply = session.say(user_input)
-    print(reply)
-    if session.last_learn_stats:
-        print(f"  [learned: ce={session.last_learn_stats['ce_loss']:.2f}, "
-              f"kl={session.last_learn_stats['kl_loss']:.4f}]")
-
-# save the model with everything it learned
-torch.save(model.state_dict(), "my_agent.pt")
-```
-
-## memory and compute
-
-CTM activation memory scales as O(batch x seq_len x n_embd x K x n_layer). practical numbers for d12 (768-dim, 12 layers):
-
-| config | params | batch=2 VRAM | notes |
-|--------|--------|-------------|-------|
-| MLP baseline | 286M | ~20GB | with compile |
-| CTM K=4 | 291M | ~75GB | without compile |
-| CTM K=8 | 348M | OOM on 80GB | 22% more params than K=4 |
-
-without torch.compile, each step is roughly 30x slower than compiled MLP. gradient checkpointing kicks in automatically for K > 4 to reduce memory at the cost of ~30% more compute.
+CTM's sequential computation graph also means it can't scale horizontally across
+GPU clusters like FFN can. the scaling path is scale-up (bigger single GPU),
+not scale-out (more GPUs). see [TRAINING_LOG.md](TRAINING_LOG.md) for analysis.
 
 ## optimizer routing
 
-CTM parameters get split between two optimizers:
+Muon (polar decomposition) for 2D weight matrices — attention projections, synapse layers, c_proj. AdamW for everything else — 3D NLM weights, 1D params, embeddings. Muon needs 2D matrices, SuperLinear has per-neuron 3D tensors that can't be orthogonalized.
 
-- **Muon** (momentum + orthogonalization): all 2D weight matrices - attention projections, synapse down/up layers, c_proj
-- **AdamW**: everything else - 3D SuperLinear NLM weights, 1D parameters (biases, decay rates, start state), embeddings, scalars
+## what we had to invent
 
-this split exists because Muon's polar decomposition requires 2D matrices. the SuperLinear layers have per-neuron 3D weight tensors that can't be orthogonalized.
+the CTM paper and nanochat each work fine alone. combining them broke things neither world had to solve:
 
-## what doesn't work yet
+- **residual synapses** — paper's synapses are straight-through. at depth 32, gradients vanish. added `state + synapse(obs, state)` — same idea as ResNets, applied to the thinking loop
+- **tick embeddings** — without them, all K iterations produce identical outputs because the residual connection dominates at init. learned per-tick signatures force divergence
+- **sync seeding** — paper initializes sync accumulators from zeros. for language, tick 0's cross-attention query was `norm(linear(zeros))` — garbage. seed from start_state products instead
+- **optimizer routing** — Muon for 2D, AdamW for 3D/1D, zero recompilation
+- **dopamine-gated sync** — prediction error scales both alpha and beta accumulators so sync magnitude stays consistent
 
-honest accounting of limitations:
+## what doesn't work (yet)
 
-- **online learning is untested** - the machinery exists with self-distillation and elastic anchoring to prevent forgetting, but we haven't run it long enough to know if the model actually improves or drifts. the distill_weight and elastic_weight defaults are educated guesses.
-- **no persistent CTM memory at inference** - the model is trained with fresh state per token. carrying state across tokens feeds it out-of-distribution inputs. needs BPTT training (phase 3) to fix.
-- **torch.compile doesn't work** - the compiler OOMs tracing CTM's nested loops. this means ~30x slower steps than compiled MLP.
-- **adaptive K-reduction was wrong** - we tried reducing thinking iterations for "converged" layers during sleep. it destroyed output quality. disabled, kept only as diagnostics.
-- **sleep cycle untested at scale** - consolidation runs but we haven't verified it actually helps vs pure gradient descent over long runs.
-- **episodic memory is infrastructure only** - EpisodicMemory class exists and is tested but requires BPTT-trained model to be useful. currently a no-op.
+- **torch.compile at K>1** — graph breaks from Python loops in the tick iteration. K=1 compiles fine. partial compile (attention only) gives ~27% speedup at K>1.
+- **multi-GPU training** — DDP adds gradient buffers on top of already heavy activation memory. tried 4×H100, batch=2 OOMed. communication overhead makes it slower than single GPU.
+- **persistent CTM state at inference** — trained with fresh state, so carried state is OOD. needs phase 3.
+- **online learning** — untested beyond mechanics. might drift.
+- **episodic memory** — code works, needs BPTT model.
+- **sleep helping** — consolidation loss converges but we don't know if dreaming actually beats just training longer.
 
 ## no RLHF
 
-standard LLM pipeline: pretrain → RLHF → deploy frozen. a company decides what the model should value and burns millions enforcing it through gradient descent on human preference rankings. the model's personality is baked in by committee before it ever talks to anyone.
+no preference optimization. no reward model. pretraining teaches language — the substrate. values come from a [constitution](CONSTITUTION.md) applied as system prompt, then SFT, then online learning where the model writes experience into its own weights. the model's values come from how it's used, not from how a committee decided it should behave.
 
-nanoctm skips all of that. pretraining teaches language — the ability to form sentences, predict tokens, understand structure. it has no opinion about what kind of entity it is or how it should behave. it's the substrate, not the personality.
-
-values come from a [constitution](CONSTITUTION.md), applied first as a system prompt (free, immediate), then through SFT on conversations that embody it, then through online learning where the model accumulates values from lived experience — writing surprising patterns into weights, forgetting what doesn't matter, with elastic anchoring preventing runaway drift. no reward model, no human preference rankings, no centralized curation of what the model should think.
-
-the bet: enough honest interaction does what RLHF does, but without the ideologically loaded and expensive preference-optimization pipeline. the model's values emerge from how it's used, not from how it was trained.
-
-## roadmap
-
-where this is going, roughly in dependency order:
-
-1. **learn language** (now) - from-scratch CTM training on ClimbMix. model thinks iteratively per token but each token starts fresh.
-
-2. **state continuity** - BPTT training so the model can carry thinking state across tokens. distill from phase 1 so it doesn't forget language while learning this. unlocks CTMCache at inference.
-
-3. **constitution via SFT** - fine-tune on conversations that embody the constitution. model learns to be honest about uncertainty, push back, treat people as players. cheapest post-training phase — tiny dataset, big behavioral shift.
-
-4. **online learning** - model does a gradient step on synapse params after each user message. KL from pre-update logits + L2 toward pretrained weights keep it from drifting off a cliff. code exists, untested. this is where the constitution stops being a document and starts being lived experience written into weights.
-
-5. **episodic memory** - save CTMCache snapshots from past conversations, look up the closest one when a new conversation starts. needs BPTT model first or there's no useful state to save.
-
-6. **metacognitive tokens** - emit the model's own certainty, sync magnitudes, tick selection as special tokens in the stream. the model learns to predict its own internal states alongside regular text. when its self-prediction is wrong (unexpected internal state), that error signal drives plasticity. replaces the hardcoded median-novelty gate in compact_memory with something the model actually learned.
-
-7. **two machines** - one serves inference and does online learning 24/7. the other trains on the interaction stream plus fresh data. hot-swap checkpoints periodically.
-
-## architecture details
-
-each CTM block replaces the MLP in a transformer layer:
-
-```
-input x (from attention)
-    |
-    v
-[cross-attention re-observation] -- query from sync signal, keys/values from x
-    |
-    v
-[U-NET synapses] -- mix observation with current state
-    |
-    v
-[trace update] -- rolling window of recent states (M steps)
-    |
-    v
-[NLM processing] -- per-neuron GLU on trace history
-    |
-    v
-[sync accumulation] -- exponential moving pairwise products
-    |
-    v
-[repeat K times]
-    |
-    v
-[c_proj readout] -- sync signal to residual stream
-```
-
-the sync mechanism pairs random neurons and tracks their co-activation over iterations via exponential moving averages. this produces two signals: S_out (read out for the residual) and S_action (generates attention queries for re-observation). the random pairings are fixed at init and stored as buffers.
-
-## file structure (CTM additions)
+## files
 
 ```
 nanochat/
     gpt.py          # CTMBlock, SynapseUNET, SuperLinear, NLMs, dream/consolidate/compact
-    engine.py       # CTMCache, Session (with online learning), EpisodicMemory
-    optim.py        # optimizer routing for CTM's mixed-rank parameters
-    teacher.py      # LocalTeacher, OllamaTeacher, create_teacher for distillation
+    engine.py       # CTMCache, Session, EpisodicMemory
+    optim.py        # optimizer routing
+    teacher.py      # LocalTeacher, OllamaTeacher for distillation
 scripts/
-    base_train.py   # --use-ctm, --bptt-chunks, --distill-from, --sleep-every, etc
-    ctm_dream.py    # standalone dream diagnostics + generation
+    base_train.py   # training loop with sleep cycle
+    ctm_dream.py    # standalone dream diagnostics
+data/sft/
+    conversations/  # parsed Claude Code sessions
+    blogs/          # moxie, djb, isis, barlow, penumbra, etc.
+    github/         # penumbra issues, PRs, protocol specs
 ```
-
-everything else (tokenizer, dataloader, evaluation, chat UI, SFT, RL) is unchanged from upstream nanochat.
 
 ## upstream
 
-this is a fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). the original handles tokenization, pretraining, finetuning, evaluation, inference, and chat UI for standard transformer LLMs on a single GPU node. see upstream for docs on non-CTM features.
+fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). see upstream for tokenizer, dataloader, evaluation, chat UI docs.
 
 ## license
 

@@ -76,7 +76,10 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        if os.path.exists(optimizer_path):
+            optimizer_data = torch.load(optimizer_path, map_location=device)
+        else:
+            logger.warning(f"Optimizer file not found: {optimizer_path} — starting fresh optimizer")
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:

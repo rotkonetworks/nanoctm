@@ -76,7 +76,7 @@ parser.add_argument("--ctm-iterations", type=int, default=4, help="CTM thinking 
 parser.add_argument("--ctm-memory-length", type=int, default=16, help="CTM trace history length")
 parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisation neurons (-1 = n_embd//2)")
 parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension (-1 = n_synch // 4, scales with model)")
-parser.add_argument("--ctm-synapse-depth", type=int, default=6, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16.")
+parser.add_argument("--ctm-synapse-depth", type=int, default=16, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16, we use 32.")
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 parser.add_argument("--freeze-non-ctm", action="store_true", help="freeze attention+embeddings, only train CTM blocks (Phase 2 fine-tuning)")
 parser.add_argument("--bptt-chunks", type=int, default=1, help="Phase 3: split sequences into N chunks for truncated BPTT with CTM state carry-over (1 = disabled)")
@@ -234,6 +234,22 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    # Resize tick_embed if K changed (e.g. K=3 checkpoint → K=5 or K=1)
+    for key in list(model_data.keys()):
+        if 'tick_embed' in key:
+            old_K = model_data[key].shape[0]
+            new_K = args.ctm_iterations
+            if old_K != new_K:
+                print0(f"Resizing {key} from K={old_K} to K={new_K}")
+                old_embed = model_data[key]
+                if new_K > old_K:
+                    # Growing: preserve old ticks, init new ones with noise
+                    new_embed = torch.randn(new_K, *old_embed.shape[1:], dtype=old_embed.dtype, device=old_embed.device) * 0.01
+                    new_embed[:old_K] = old_embed
+                else:
+                    # Shrinking: keep first new_K ticks
+                    new_embed = old_embed[:new_K].clone()
+                model_data[key] = new_embed
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -321,15 +337,10 @@ orig_model = model # original, uncompiled model, for saving raw model state_dict
 if os.environ.get("NANOCHAT_NO_COMPILE"):
     print0("torch.compile disabled via NANOCHAT_NO_COMPILE")
 elif model.config.use_ctm:
-    # CTMBlock has a K-iteration loop + mixed-rank params that torch.compile can't handle
-    # (compiler OOMs trying to unroll the loop). Instead, compile just the attention modules.
-    from nanochat.gpt import CausalSelfAttention, Block
-    n_compiled = 0
-    for block in model.transformer.h:
-        if isinstance(block, Block):
-            block.attn = torch.compile(block.attn, dynamic=False)
-            n_compiled += 1
-    print0(f"Partial torch.compile: compiled {n_compiled} attention modules (CTMBlock left interpreted)")
+    # Compile whole model — torch.compile can unroll K loop since K is a Python int constant.
+    # The conditional branches (dream/adaptive/ctm_cache) specialize for training path.
+    model = torch.compile(model, dynamic=False)
+    print0(f"torch.compile: full model (CTM K={orig_model.config.ctm_iterations})")
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
@@ -404,7 +415,7 @@ optimizer = model.setup_optimizer(
     weight_decay=weight_decay_scaled,
 )
 
-if resuming:
+if resuming and optimizer_data is not None:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
