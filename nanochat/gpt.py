@@ -32,6 +32,8 @@ from nanochat.flash_attention import flash_attn
 
 @dataclass
 class GPTConfig:
+    # TODO (upstream 6ed7d1d, requires from-scratch restart):
+    #   - ve_gate_channels: 32 -> 12 (changes weight shape, can't resize mid-training)
     sequence_len: int = 2048
     vocab_size: int = 32768
     n_layer: int = 12
@@ -50,7 +52,7 @@ class GPTConfig:
     ctm_n_synch: int = 384        # neuron pairs for synchronisation readout
     ctm_memory_hidden: int = 32   # NLM hidden dimension (-1 = n_synch // 4, scales with model. 32 for training memory budget)
     ctm_n_attn_heads: int = 1     # cross-attention heads for data re-observation
-    ctm_synapse_depth: int = 6    # U-NET synapse depth (half down, half up). Paper uses 16.
+    ctm_synapse_depth: int = 32   # U-NET synapse depth (half down, half up). Paper uses 16.
 
 
 def norm(x):
@@ -105,13 +107,15 @@ class CausalSelfAttention(nn.Module):
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
+        q = q * 1.15  # post-QK-norm scaling for sharper attention (upstream 6ed7d1d)
+        k = k * 1.15
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
@@ -619,7 +623,7 @@ class GPT(nn.Module):
         """
 
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)  # upstream 6ed7d1d
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
@@ -663,7 +667,7 @@ class GPT(nn.Module):
                 ctm.decay_out.zero_()
                 ctm.decay_act.zero_()
             else:
-                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.5, s * 0.5)  # 0.5x init scale (upstream 6ed7d1d)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
@@ -674,10 +678,10 @@ class GPT(nn.Module):
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
 
-        # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
+        # Gate weights init with small positive values so gates start slightly above neutral (upstream 6ed7d1d)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+                torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -724,7 +728,7 @@ class GPT(nn.Module):
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
         # Map characters to window sizes
         long_window = config.sequence_len
-        short_window = long_window // 2
+        short_window = -(-long_window // 3 // 128) * 128  # ceil to FA3 tile size (upstream 6ed7d1d)
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
@@ -878,7 +882,8 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+        # Per-group Adam betas (upstream 6ed7d1d) — no more global adam_betas param
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -900,24 +905,24 @@ class GPT(nn.Module):
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-        # Build param_groups with all required fields explicit
+        # Build param_groups with per-group betas (upstream 6ed7d1d)
         param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.003),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            # AdamW groups (embeddings, lm_head, scalars) — each with tuned betas
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
         # CTM non-matrix params (SuperLinear 3D weights, decay params, start states, LayerNorm)
         if ctm_other_params:
-            param_groups.append(dict(kind='adamw', params=ctm_other_params, lr=matrix_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=ctm_other_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
@@ -928,7 +933,7 @@ class GPT(nn.Module):
 
     def _compute_logits(self, x):
         """Shared logit computation: norm -> lm_head -> crop -> softcap."""
-        softcap = 20
+        softcap = 15  # upstream 6ed7d1d: tighter softcap
         logits = self.lm_head(norm(x))
         logits = logits[..., :self.config.vocab_size]
         logits = logits.float()
@@ -995,7 +1000,7 @@ class GPT(nn.Module):
             # Each token independently picks its best tick (argmin loss) and
             # most certain tick (argmax certainty), matching paper's per-sample approach.
             # Skip computing logits on final x -- we compute per-tick logits below.
-            flat_targets = targets.view(-1)  # (B*T,)
+            flat_targets = targets.reshape(-1)  # (B*T,)
             n_tokens = flat_targets.size(0)
             V = self.config.vocab_size
             max_entropy = math.log(V)

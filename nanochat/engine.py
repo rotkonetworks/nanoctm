@@ -134,6 +134,21 @@ class KVCache:
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
+def _safe_multinomial(probs, rng):
+    """Multinomial that won't poison the CUDA context with device-side asserts."""
+    # Clamp NaN/inf/negative to zero, re-normalize. Falls back to uniform if all-zero.
+    bad = torch.isnan(probs) | torch.isinf(probs) | (probs < 0)
+    if bad.any():
+        probs = probs.clone()
+        probs[bad] = 0.0
+        sums = probs.sum(dim=-1, keepdim=True)
+        zero_rows = (sums == 0).squeeze(-1)
+        if zero_rows.any():
+            probs[zero_rows] = 1.0 / probs.size(-1)  # uniform fallback
+        else:
+            probs = probs / sums
+    return torch.multinomial(probs, num_samples=1, generator=rng)
+
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
     assert temperature >= 0.0, "temperature must be non-negative"
@@ -144,12 +159,12 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
         vals, idx = torch.topk(logits, k, dim=-1)
         vals = vals / temperature
         probs = F.softmax(vals, dim=-1)
-        choice = torch.multinomial(probs, num_samples=1, generator=rng)
+        choice = _safe_multinomial(probs, rng)
         return idx.gather(1, choice)
     else:
         logits = logits / temperature
         probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1, generator=rng)
+        return _safe_multinomial(probs, rng)
 
 # -----------------------------------------------------------------------------
 
@@ -169,8 +184,8 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, repetition_penalty=1.0):
+        """Generate tokens with optional repetition penalty to fight attractor collapse."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
         # NOTE: setting the dtype here and in this way is an ugly hack.
@@ -240,6 +255,16 @@ class Engine:
             # Stop condition: all rows are completed
             if all(state.completed for state in row_states):
                 break
+
+            # Apply repetition penalty: penalize tokens that appeared in context
+            if repetition_penalty != 1.0:
+                for i, state in enumerate(row_states):
+                    seen = set(state.current_tokens[-64:])  # look back 64 tokens
+                    for token_id in seen:
+                        if logits[i, token_id] > 0:
+                            logits[i, token_id] /= repetition_penalty
+                        else:
+                            logits[i, token_id] *= repetition_penalty
 
             # Sample the next token for each row
             next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)

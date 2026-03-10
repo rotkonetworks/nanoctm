@@ -68,6 +68,21 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
+def prune_checkpoints(checkpoint_dir, keep=3, rank=0):
+    """Delete oldest checkpoints, keeping the most recent `keep` ones."""
+    if rank != 0 or keep < 0:
+        return
+    model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "model_*.pt")))
+    if len(model_files) <= keep:
+        return
+    to_delete = model_files[:len(model_files) - keep]
+    for model_path in to_delete:
+        step_str = os.path.basename(model_path).replace("model_", "").replace(".pt", "")
+        for pattern in [f"model_{step_str}.pt", f"meta_{step_str}.json", f"optim_{step_str}_rank*.pt"]:
+            for f in glob.glob(os.path.join(checkpoint_dir, pattern)):
+                os.remove(f)
+                logger.info(f"Pruned old checkpoint file: {f}")
+
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")

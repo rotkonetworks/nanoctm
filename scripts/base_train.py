@@ -25,11 +25,11 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, CTMCache
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, prune_checkpoints
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3, default_window_pattern
@@ -59,16 +59,17 @@ parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help=
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
-parser.add_argument("--embedding-lr", type=float, default=0.9, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.005, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
+parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
-parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
-parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
-parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
+# NOTE: adam-beta1/beta2 are no longer used — per-group betas are set in setup_optimizer (upstream 6ed7d1d)
+parser.add_argument("--adam-beta1", type=float, default=0.8, help="(deprecated) Adam beta1 — per-group betas in setup_optimizer")
+parser.add_argument("--adam-beta2", type=float, default=0.95, help="(deprecated) Adam beta2 — per-group betas in setup_optimizer")
+parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
+parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
+parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # CTM
 parser.add_argument("--use-ctm", action="store_true", help="use CTM blocks instead of MLP")
@@ -76,13 +77,13 @@ parser.add_argument("--ctm-iterations", type=int, default=4, help="CTM thinking 
 parser.add_argument("--ctm-memory-length", type=int, default=16, help="CTM trace history length")
 parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisation neurons (-1 = n_embd//2)")
 parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension (-1 = n_synch // 4, scales with model)")
-parser.add_argument("--ctm-synapse-depth", type=int, default=16, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16, we use 32.")
+parser.add_argument("--ctm-synapse-depth", type=int, default=32, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16, we use 32.")
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 parser.add_argument("--freeze-non-ctm", action="store_true", help="freeze attention+embeddings, only train CTM blocks (Phase 2 fine-tuning)")
 parser.add_argument("--bptt-chunks", type=int, default=1, help="Phase 3: split sequences into N chunks for truncated BPTT with CTM state carry-over (1 = disabled)")
 parser.add_argument("--distill-from", type=str, default=None, help="path to teacher checkpoint dir for knowledge distillation (prevents catastrophic forgetting during phase transitions)")
 parser.add_argument("--distill-weight", type=float, default=0.5, help="weight for KL distillation loss term (0 = disabled)")
-parser.add_argument("--elastic-weight", type=float, default=0.01, help="weight for elastic weight anchoring L2 penalty (0 = disabled)")
+parser.add_argument("--elastic-weight", type=float, default=0.0, help="weight for elastic weight anchoring L2 penalty (0 = disabled)")
 parser.add_argument("--distill-temperature", type=float, default=2.0, help="softmax temperature for distillation (higher = softer targets)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -93,7 +94,22 @@ parser.add_argument("--sample-every", type=int, default=100, help="sample from m
 parser.add_argument("--sample-tokens", type=int, default=32, help="max tokens per sample")
 parser.add_argument("--sample-temperature", type=float, default=0.0, help="sampling temperature (0 = greedy)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--keep-checkpoints", type=int, default=3, help="max checkpoints to keep on disk (oldest pruned first, -1 = keep all)")
 parser.add_argument("--sleep-every", type=int, default=10, help="CTM sleep cycle frequency in steps (-1 = disable)")
+# Scheduled sampling (exposure bias fix)
+parser.add_argument("--scheduled-sampling", type=float, default=0.0, help="scheduled sampling ratio: probability of replacing input tokens with model's own predictions (0.0 = pure teacher forcing)")
+parser.add_argument("--scheduled-sampling-warmup", type=int, default=500, help="steps to linearly ramp scheduled sampling ratio from 0 to target")
+# Cache-aware training
+parser.add_argument("--cache-aware-ratio", type=float, default=0.0, help="target fraction of micro-steps that use cache-aware training (0.0 = disabled). With adaptive ramp, this is the ceiling.")
+parser.add_argument("--cache-aware-ramp-step", type=int, default=0, help="ramp cache-aware ratio every N steps (0 = no ramp, use fixed ratio)")
+parser.add_argument("--cache-aware-ramp-increment", type=float, default=0.05, help="how much to increase cache-aware ratio at each ramp step")
+parser.add_argument("--cache-aware-ramp-threshold", type=float, default=0.03, help="max loss increase from baseline before holding the ramp (adaptive backpressure)")
+# K ramp (automatic plateau-based K increase)
+parser.add_argument("--k-ramp", type=str, default=None, help="K ramp schedule: 'plateau' for auto-detect, or explicit 'K1:step1,K2:step2,...' (e.g. '1:0,2:8000,4:10000')")
+parser.add_argument("--k-plateau-window", type=int, default=500, help="eval steps to look back for plateau detection")
+parser.add_argument("--k-plateau-threshold", type=float, default=0.002, help="min bpb improvement over window to NOT be considered plateau")
+parser.add_argument("--k-plateau-patience", type=int, default=3, help="consecutive plateau detections before ramping K")
+parser.add_argument("--k-max", type=int, default=4, help="maximum K for auto-plateau ramp")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -235,11 +251,13 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     # Resize tick_embed if K changed (e.g. K=3 checkpoint → K=5 or K=1)
+    k_changed = False
     for key in list(model_data.keys()):
         if 'tick_embed' in key:
             old_K = model_data[key].shape[0]
             new_K = args.ctm_iterations
             if old_K != new_K:
+                k_changed = True
                 print0(f"Resizing {key} from K={old_K} to K={new_K}")
                 old_embed = model_data[key]
                 if new_K > old_K:
@@ -250,6 +268,9 @@ if resuming:
                     # Shrinking: keep first new_K ticks
                     new_embed = old_embed[:new_K].clone()
                 model_data[key] = new_embed
+    if k_changed:
+        print0(f"K changed — discarding optimizer state (momentum buffers sized for old K)")
+        optimizer_data = None
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -405,11 +426,10 @@ if weight_decay_scaled != args.weight_decay:
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
+    # AdamW hyperparameters (per-group betas now set inside setup_optimizer)
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
-    adam_betas=(args.adam_beta1, args.adam_beta2),
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
@@ -438,9 +458,13 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
 assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
 if args.num_iterations > 0:
-    # Override num_iterations to a specific value if given
+    # num_iterations is the TOTAL step count (not additional steps from resume point)
+    # e.g. --num-iterations=10000 --resume-from-step=3000 trains steps 3000→10000
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
+    if resuming and args.resume_from_step >= num_iterations:
+        print0(f"WARNING: resume step {args.resume_from_step} >= num_iterations {num_iterations}, nothing to train")
+        print0(f"  If you want to train MORE steps, increase --num-iterations")
 elif args.target_flops > 0:
     # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
     num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
@@ -458,7 +482,7 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
-    warmup_iters = round(args.warmup_ratio * num_iterations)
+    warmup_iters = args.warmup_steps  # upstream 6ed7d1d: absolute steps instead of ratio
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     if it < warmup_iters:
         return (it + 1) / warmup_iters
@@ -470,15 +494,89 @@ def get_lr_multiplier(it):
         lr_mult = 1 - decay_frac ** 0.5
         return lr_mult * (1 - args.final_lr_frac) + args.final_lr_frac
 
-# Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
+# Momentum scheduler for Muon optimizer (warms up to 0.97 over the first 400 steps)
 def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
+    frac = min(it / 400, 1)
+    momentum = (1 - frac) * 0.85 + frac * 0.97
     return momentum
 
 # Weight decay scheduler for Muon optimizer (linearly decays to zero over the course of training)
 def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
+
+# -----------------------------------------------------------------------------
+# K ramp: parse schedule and set up plateau detection state
+
+k_ramp_schedule = None  # dict of {step: K} for explicit schedule
+k_ramp_auto = False     # True if using plateau detection
+bpb_history = []        # list of (step, bpb) for plateau detection
+plateau_strikes = 0     # consecutive plateau detections
+best_bpb_since_ramp = float('inf')  # best bpb since last K change
+best_bpb_step = 0       # step where best bpb was achieved
+current_K = args.ctm_iterations
+
+if args.use_ctm and args.k_ramp:
+    if args.k_ramp == 'plateau':
+        k_ramp_auto = True
+        print0(f"K ramp: auto-plateau (window={args.k_plateau_window}, threshold={args.k_plateau_threshold}, max_K={args.k_max})")
+    else:
+        # Parse explicit schedule like "1:0,2:8000,4:10000"
+        k_ramp_schedule = {}
+        for part in args.k_ramp.split(','):
+            k_val, step_val = part.strip().split(':')
+            k_ramp_schedule[int(step_val)] = int(k_val)
+        print0(f"K ramp: explicit schedule {k_ramp_schedule}")
+
+def ramp_k(new_K, reason=""):
+    """Increase K on all CTM layers, resize tick_embed, reset optimizer, recompile."""
+    global current_K, model, optimizer
+    old_K = current_K
+    if new_K <= old_K:
+        return False
+
+    print0(f"{'='*60}")
+    print0(f"K RAMP: {old_K} -> {new_K} {reason}")
+    print0(f"{'='*60}")
+
+    # 1) Update config
+    orig_model.config.ctm_iterations = new_K
+
+    # 2) Resize tick_embed and update K on all CTM blocks
+    from nanochat.gpt import CTMBlock
+    for name, param in orig_model.named_parameters():
+        if 'tick_embed' in name:
+            old_embed = param.data
+            new_embed = torch.randn(new_K, *old_embed.shape[1:], dtype=old_embed.dtype, device=old_embed.device) * 0.01
+            new_embed[:old_K] = old_embed
+            param.data = new_embed
+            print0(f"  Resized {name}: {old_K} -> {new_K}")
+
+    for block in orig_model.transformer.h:
+        if isinstance(block.mlp, CTMBlock):
+            block.mlp.K = new_K
+            block.mlp.active_K = new_K
+
+    # 3) Reset optimizer (momentum buffers shaped for old K)
+    print0(f"  Resetting optimizer (momentum buffers sized for K={old_K})")
+    optimizer = orig_model.setup_optimizer(
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        scalar_lr=args.scalar_lr * batch_lr_scale,
+        matrix_lr=args.matrix_lr * batch_lr_scale,
+        weight_decay=weight_decay_scaled,
+    )
+
+    # 4) Recompile (torch.compile bakes K into the trace)
+    if not os.environ.get("NANOCHAT_NO_COMPILE"):
+        model = torch.compile(orig_model, dynamic=False)
+        print0(f"  Recompiled model with K={new_K}")
+    else:
+        model = orig_model
+
+    current_K = new_K
+    print0(f"K ramp complete. Training continues with K={new_K}")
+    print0(f"  WARNING: higher K uses more VRAM. If OOM occurs, restart with lower --device-batch-size")
+    return True
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -497,6 +595,22 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+
+# Cache-aware adaptive ramp state
+cache_aware_current_ratio = 0.0
+cache_aware_baseline_loss = None  # loss before last ramp increase
+cache_aware_last_ramp_step = step if resuming else 0
+if args.cache_aware_ratio > 0 and args.cache_aware_ramp_step <= 0:
+    # No ramp — use fixed ratio immediately
+    cache_aware_current_ratio = args.cache_aware_ratio
+elif args.cache_aware_ratio > 0 and args.cache_aware_ramp_step > 0:
+    # Start at one increment (not zero — give it something to learn from)
+    cache_aware_current_ratio = args.cache_aware_ramp_increment
+    cache_aware_last_ramp_step = step if resuming else 0
+    print0(f"Cache-aware ramp: starting at {cache_aware_current_ratio:.2f}, "
+           f"target {args.cache_aware_ratio:.2f}, "
+           f"+{args.cache_aware_ramp_increment:.2f} every {args.cache_aware_ramp_step} steps "
+           f"(hold if loss spikes >{args.cache_aware_ramp_threshold:.3f})")
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -544,6 +658,57 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
+
+        # K ramp: check for plateau or scheduled K increase
+        if args.use_ctm and args.k_ramp and current_K < args.k_max:
+            bpb_history.append((step, val_bpb))
+            did_ramp = False
+
+            if k_ramp_auto:
+                # Plateau detection: best bpb hasn't improved by threshold in k_plateau_window steps.
+                # Must trigger k_plateau_patience consecutive evals before ramping.
+                if val_bpb < best_bpb_since_ramp:
+                    best_bpb_since_ramp = val_bpb
+                    best_bpb_step = step
+                    plateau_strikes = 0  # new best = reset strikes
+                else:
+                    steps_since_best = step - best_bpb_step
+                    if steps_since_best >= args.k_plateau_window:
+                        plateau_strikes += 1
+                    else:
+                        plateau_strikes = 0
+                print0(f"  Plateau check: best={best_bpb_since_ramp:.4f} (step {best_bpb_step}), current={val_bpb:.4f}, stale for {step - best_bpb_step} steps, strikes={plateau_strikes}/{args.k_plateau_patience}")
+                if plateau_strikes >= args.k_plateau_patience:
+                    next_K = current_K + 1
+                    if next_K <= args.k_max:
+                        save_checkpoint(checkpoint_dir, step, orig_model.state_dict(), optimizer.state_dict(),
+                            {"step": step, "val_bpb": val_bpb, "model_config": model_config_kwargs,
+                             "user_config": user_config, "device_batch_size": args.device_batch_size,
+                             "max_seq_len": args.max_seq_len, "total_batch_size": total_batch_size,
+                             "dataloader_state_dict": dataloader_state_dict,
+                             "loop_state": {"min_val_bpb": min_val_bpb, "smooth_train_loss": smooth_train_loss, "total_training_time": total_training_time}},
+                            rank=ddp_rank)
+                        did_ramp = ramp_k(next_K, reason=f"(plateau: best bpb {best_bpb_since_ramp:.4f} unchanged for {step - best_bpb_step} steps, {plateau_strikes} strikes)")
+                        if did_ramp:
+                            best_bpb_since_ramp = float('inf')
+                            best_bpb_step = step
+                            plateau_strikes = 0
+
+            elif k_ramp_schedule:
+                # Check if any scheduled K change should have triggered by now
+                # (schedule steps might not align with eval steps)
+                pending_K = max((k for s, k in k_ramp_schedule.items() if s <= step), default=None)
+                if pending_K is not None and pending_K > current_K:
+                    save_checkpoint(checkpoint_dir, step, orig_model.state_dict(), optimizer.state_dict(),
+                        {"step": step, "val_bpb": val_bpb, "model_config": model_config_kwargs,
+                         "user_config": user_config, "device_batch_size": args.device_batch_size,
+                         "max_seq_len": args.max_seq_len, "total_batch_size": total_batch_size,
+                         "dataloader_state_dict": dataloader_state_dict,
+                         "loop_state": {"min_val_bpb": min_val_bpb, "smooth_train_loss": smooth_train_loss, "total_training_time": total_training_time}},
+                        rank=ddp_rank)
+                    did_ramp = ramp_k(pending_K, reason=f"(scheduled at step {step})")
+                    if did_ramp:
+                        bpb_history.clear()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -729,6 +894,7 @@ while True:
             },
             rank=ddp_rank,
         )
+        prune_checkpoints(checkpoint_dir, keep=args.keep_checkpoints, rank=ddp_rank)
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -742,7 +908,53 @@ while True:
     # Collect CTM diagnostics periodically (first micro-step only)
     ctm_diag = {} if (args.use_ctm and step % 10 == 0) else None
     for micro_step in range(grad_accum_steps):
-        if args.bptt_chunks > 1 and args.use_ctm:
+        # Scheduled sampling: replace some input positions with model's own predictions
+        # This teaches the model to handle its own output during autoregressive generation
+        ss_ratio = args.scheduled_sampling
+        if ss_ratio > 0 and step >= args.resume_from_step:
+            # Linear warmup
+            steps_since = step - args.resume_from_step
+            if steps_since < args.scheduled_sampling_warmup:
+                ss_ratio = ss_ratio * steps_since / args.scheduled_sampling_warmup
+            if ss_ratio > 0:
+                with torch.no_grad():
+                    pred_logits = model(x)
+                    pred_tokens = pred_logits.argmax(dim=-1)  # (B, T)
+                    # Random mask: which positions use model's prediction vs ground truth
+                    mask = torch.rand(x.shape, device=x.device) < ss_ratio
+                    # Never replace position 0 (BOS token)
+                    mask[:, 0] = False
+                    x = torch.where(mask, pred_tokens, x)
+
+        # Cache-aware training: split sequence, forward first half to populate CTMCache,
+        # then train on second half with accumulated state. Teaches model to use persistent cache.
+        use_cache_aware = (args.use_ctm and cache_aware_current_ratio > 0
+                          and torch.rand(1).item() < cache_aware_current_ratio)
+
+        if use_cache_aware:
+            T = x.shape[1]
+            mid = T // 2
+            x1, x2 = x[:, :mid], x[:, mid:]
+            y2 = y[:, mid:]
+            # Forward first half to populate cache (no gradients — just building state)
+            ctm_cache = CTMCache(len(orig_model.transformer.h))
+            with torch.no_grad():
+                model(x1, ctm_cache=ctm_cache)
+            # Detach all cached tensors so gradients don't flow back through first half
+            for layer_state in ctm_cache.layers:
+                if layer_state is not None:
+                    for k in layer_state:
+                        layer_state[k] = layer_state[k].detach()
+            # Forward second half with accumulated cache — this is what we train on
+            diag = ctm_diag if micro_step == 0 else None
+            loss = model(x2, y2, ctm_cache=ctm_cache, pos_offset=mid, diagnostics=diag)
+            train_loss = loss.detach()
+            loss = loss / grad_accum_steps
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+        elif args.bptt_chunks > 1 and args.use_ctm:
             # BPTT does per-chunk backward internally, returns a float (not a tensor).
             # Pass 1/grad_accum_steps as loss_scale so gradients accumulate correctly.
             loss_val = model.forward_chunked_bptt(x, y, n_chunks=args.bptt_chunks,
@@ -823,6 +1035,30 @@ while True:
         tick_certs = " ".join(f"{ctm_diag.get(f'tick_{k}/certainty', 0):.3f}" for k in range(K))
         tick_pcts = " ".join(f"{ctm_diag.get(f'tick_{k}/selected_pct', 0):.0f}%" for k in range(K))
         print0(f"  ticks loss=[{tick_losses}] cert=[{tick_certs}] selected=[{tick_pcts}]")
+    # Adaptive cache-aware ramp: increase ratio when model has absorbed current level
+    if (args.cache_aware_ramp_step > 0 and args.cache_aware_ratio > 0
+            and cache_aware_current_ratio < args.cache_aware_ratio
+            and step > 0 and (step - cache_aware_last_ramp_step) >= args.cache_aware_ramp_step):
+        if cache_aware_baseline_loss is None:
+            # First ramp check — record current loss as baseline
+            cache_aware_baseline_loss = debiased_smooth_loss
+            old_ratio = cache_aware_current_ratio
+            cache_aware_current_ratio = min(cache_aware_current_ratio + args.cache_aware_ramp_increment, args.cache_aware_ratio)
+            cache_aware_last_ramp_step = step
+            print0(f"  cache-aware ramp: {old_ratio:.2f} -> {cache_aware_current_ratio:.2f} (baseline loss: {cache_aware_baseline_loss:.4f})")
+        else:
+            loss_delta = debiased_smooth_loss - cache_aware_baseline_loss
+            if loss_delta <= args.cache_aware_ramp_threshold:
+                # Model absorbed the last increase — bump ratio
+                cache_aware_baseline_loss = debiased_smooth_loss
+                old_ratio = cache_aware_current_ratio
+                cache_aware_current_ratio = min(cache_aware_current_ratio + args.cache_aware_ramp_increment, args.cache_aware_ratio)
+                cache_aware_last_ramp_step = step
+                print0(f"  cache-aware ramp: {old_ratio:.2f} -> {cache_aware_current_ratio:.2f} (loss delta: {loss_delta:+.4f}, baseline: {cache_aware_baseline_loss:.4f})")
+            else:
+                # Loss still too high — hold and wait
+                cache_aware_last_ramp_step = step  # reset timer, check again in N steps
+                print0(f"  cache-aware ramp: HOLD at {cache_aware_current_ratio:.2f} (loss delta: {loss_delta:+.4f} > threshold {args.cache_aware_ramp_threshold:.3f})")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -835,6 +1071,8 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if args.cache_aware_ratio > 0:
+            log_data["train/cache_aware_ratio"] = cache_aware_current_ratio
         # CTM-specific logging: gradient norms per param group + diagnostics
         if args.use_ctm:
             from nanochat.gpt import CTMBlock
