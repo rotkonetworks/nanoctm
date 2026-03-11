@@ -111,6 +111,7 @@ parser.add_argument("--k-plateau-window", type=int, default=500, help="eval step
 parser.add_argument("--k-plateau-threshold", type=float, default=0.002, help="min bpb improvement over window to NOT be considered plateau")
 parser.add_argument("--k-plateau-patience", type=int, default=3, help="consecutive plateau detections before ramping K")
 parser.add_argument("--k-max", type=int, default=4, help="maximum K for auto-plateau ramp")
+parser.add_argument("--k-ramp-strategy", type=str, default="linear", choices=["linear", "fibonacci"], help="how to increase K: 'linear' (+1) or 'fibonacci' (1,2,3,5,8,13,21,34,55,...)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -680,8 +681,16 @@ while True:
                         plateau_strikes = 0
                 print0(f"  Plateau check: best={best_bpb_since_ramp:.4f} (step {best_bpb_step}), current={val_bpb:.4f}, stale for {step - best_bpb_step} steps, strikes={plateau_strikes}/{args.k_plateau_patience}")
                 if plateau_strikes >= args.k_plateau_patience:
-                    next_K = current_K + 1
-                    if next_K <= args.k_max:
+                    if args.k_ramp_strategy == "fibonacci":
+                        # Fibonacci: find next fib >= current_K
+                        a, b = 1, 2
+                        while b <= current_K:
+                            a, b = b, a + b
+                        next_K = b  # next fibonacci after current_K
+                    else:
+                        next_K = current_K + 1
+                    next_K = min(next_K, args.k_max)
+                    if next_K > current_K:
                         save_checkpoint(checkpoint_dir, step, orig_model.state_dict(), optimizer.state_dict(),
                             {"step": step, "val_bpb": val_bpb, "model_config": model_config_kwargs,
                              "user_config": user_config, "device_batch_size": args.device_batch_size,
@@ -1041,8 +1050,15 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    # Per-step wandb logging (lightweight — just loss and tick data)
-    wandb_run.log({"step": step, "train/loss_step": debiased_smooth_loss, "train/raw_loss": train_loss_f})
+    # Per-step wandb logging (lightweight — just loss, tick data, and system metrics)
+    step_log = {"step": step, "train/loss_step": debiased_smooth_loss, "train/raw_loss": train_loss_f,
+                "perf/dt_ms": dt * 1000, "perf/tok_per_sec": tok_per_sec, "train/lr_multiplier": lrm}
+    if args.use_ctm:
+        step_log["ctm/K"] = current_K
+    if device.type == "cuda" and step % 10 == 0:
+        step_log["system/vram_gb"] = torch.cuda.memory_allocated() / 1e9
+        step_log["system/vram_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+    wandb_run.log(step_log)
     # Print CTM tick diagnostics every 10 steps
     if ctm_diag and any(k.startswith('tick_') for k in ctm_diag):
         K = max(int(k.split('_')[1].split('/')[0]) for k in ctm_diag if k.startswith('tick_')) + 1

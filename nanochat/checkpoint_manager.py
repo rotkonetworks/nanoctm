@@ -164,6 +164,24 @@ def build_model(checkpoint_dir, step, device, phase):
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     strict = not (model_config.use_ctm and ctm_layers_have_mlp)
+    # Handle tick_embed K mismatch: checkpoint may have different K than config
+    if model_config.use_ctm:
+        import torch.nn as nn
+        for key in list(model_data.keys()):
+            if 'tick_embed' in key:
+                ckpt_K = model_data[key].shape[0]
+                if ckpt_K != model_config.ctm_iterations:
+                    log0(f"Resizing {key}: checkpoint K={ckpt_K}, config K={model_config.ctm_iterations}")
+                    model_config.ctm_iterations = ckpt_K
+                    # Update model's tick_embed to match checkpoint K
+                    parts = key.split('.')
+                    layer_idx = int(parts[parts.index('h') + 1])
+                    block = model.transformer.h[layer_idx]
+                    if hasattr(block.mlp, 'tick_embed'):
+                        old = block.mlp.tick_embed
+                        block.mlp.tick_embed = nn.Parameter(torch.empty(ckpt_K, *old.shape[1:], device=device))
+                        block.mlp.K = ckpt_K
+                        block.mlp.active_K = ckpt_K
     model.load_state_dict(model_data, strict=strict, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
