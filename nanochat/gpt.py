@@ -530,10 +530,16 @@ class CTMBlock(nn.Module):
         r_out = torch.exp(-self.decay_out.clamp(0, 15).to(dtype)).unsqueeze(0)
         r_act = torch.exp(-self.decay_act.clamp(0, 15).to(dtype)).unsqueeze(0)
 
-        # Dopamine gating: scales how strongly this token's sync gets accumulated
-        # dopamine > 1 = surprising token, remember harder. dopamine < 1 = boring, dampen.
-        # Default 1.0 = no modulation (training, or inference without Engine dopamine tracking)
+        # Dopamine gating: scales how strongly each token's sync gets accumulated.
+        # Three-factor rule: ΔSync = pre × post × dopamine (neuromodulator).
+        # dopamine > 1 = surprising token = remember harder.
+        # dopamine < 1 = predictable = dampen.
+        # Supports scalar (all tokens equal) or tensor (BT,) for per-token gating.
+        # Default 1.0 = no modulation (training, or inference without dopamine tracking).
         dopamine = ctm_cache.dopamine if ctm_cache is not None else 1.0
+        # Reshape for broadcasting: scalar stays scalar, (BT,) → (BT, 1)
+        if isinstance(dopamine, torch.Tensor) and dopamine.dim() >= 1:
+            dopamine = dopamine.view(BT, 1)  # (BT, 1) broadcasts with (BT, n_synch)
 
         # Track per-iteration state deltas and intermediate outputs
         track_deltas = dream or adaptive

@@ -1,5 +1,5 @@
 """
-Train CTMBlock on frozen Qwen2.5-0.5B backbone.
+Train CTMBlock on frozen Qwen backbone.
 
 Usage:
     python3 -m scripts.train_qwen_ctm --run qwen_ctm_k4
@@ -31,7 +31,7 @@ parser = argparse.ArgumentParser(description="Train CTM on Qwen backbone")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables)")
 # Model
-parser.add_argument("--backbone", type=str, default="Qwen/Qwen2.5-0.5B", help="HuggingFace model name")
+parser.add_argument("--backbone", type=str, default="Qwen/Qwen3-0.6B", help="HuggingFace model name")
 parser.add_argument("--ctm-iterations", type=int, default=4, help="CTM thinking steps (K)")
 parser.add_argument("--ctm-n-synch", type=int, default=-1, help="sync neurons (-1 = n_embd//2)")
 parser.add_argument("--ctm-memory-length", type=int, default=16, help="trace history length")

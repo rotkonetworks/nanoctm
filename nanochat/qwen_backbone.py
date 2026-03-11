@@ -1,12 +1,12 @@
 """
-Qwen2.5 backbone with CTMBlock on last layer.
+Qwen backbone with CTMBlock on last layer.
 
-Loads pretrained Qwen2.5-0.5B (or similar) as a frozen backbone,
+Loads pretrained Qwen (default: Qwen3-0.6B) as a frozen backbone,
 replaces the last layer's MLP with our CTMBlock. Only the CTM
 parameters are trainable.
 
 Usage:
-    model = QwenBackboneGPT.from_pretrained("Qwen/Qwen2.5-0.5B", ctm_kwargs={...})
+    model = QwenBackboneGPT.from_pretrained("Qwen/Qwen3-0.6B", ctm_kwargs={...})
     model.to(device)
 """
 
@@ -78,7 +78,7 @@ class QwenTokenizer:
 
 
 class QwenBackboneGPT(nn.Module):
-    """Qwen2.5 backbone with CTMBlock replacing the last layer's MLP.
+    """Qwen backbone with CTMBlock replacing the last layer's MLP.
 
     Presents a compatible interface with nanochat's GPT class:
     - forward(idx, targets, kv_cache, ctm_cache, ...)
@@ -136,14 +136,14 @@ class QwenBackboneGPT(nn.Module):
         self._cache_position = 0
 
     @classmethod
-    def from_pretrained(cls, model_name="Qwen/Qwen2.5-0.5B", ctm_kwargs=None,
+    def from_pretrained(cls, model_name="Qwen/Qwen3-0.6B", ctm_kwargs=None,
                         ctm_layer_idx=-1, device="cpu"):
         """Load Qwen backbone and attach CTMBlock."""
         from transformers import AutoModelForCausalLM
         print0(f"Loading backbone: {model_name}")
         backbone = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_implementation="sdpa",  # use PyTorch SDPA (works everywhere)
         )
         ctm_kwargs = ctm_kwargs or {}
@@ -296,8 +296,8 @@ class QwenBackboneGPT(nn.Module):
                 return self._multi_tick_loss(x, logits, tick_outputs, targets, residual, ctm_out)
             else:
                 loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
+                    logits.reshape(-1, logits.size(-1)),
+                    targets.reshape(-1),
                     ignore_index=-1,
                 )
                 return logits, loss
@@ -321,7 +321,7 @@ class QwenBackboneGPT(nn.Module):
             x_at_tick = pre_ctm_residual + tick_out
             x_at_tick = self.backbone.model.norm(x_at_tick)
             tick_logits = self.backbone.lm_head(x_at_tick)
-            tick_logits_flat = tick_logits.view(-1, V)
+            tick_logits_flat = tick_logits.reshape(-1, V)
 
             token_losses = F.cross_entropy(tick_logits_flat, flat_targets, ignore_index=-1, reduction='none')
             all_losses.append(token_losses)
@@ -399,9 +399,201 @@ class QwenBackboneGPT(nn.Module):
         }
         return results
 
-    def compact_memory(self, ctm_cache, lr=1e-5):
-        """Hebbian plasticity update on CTM synapses."""
-        return self.ctm_block.compact_memory_standalone(ctm_cache, lr) if hasattr(self.ctm_block, 'compact_memory_standalone') else {}
+    def compact_memory(self, teaching_ids, target_ids, lr=1e-3, steps=20):
+        """Three-factor neuroplasticity: pre × post × dopamine.
+
+        Models the hippocampal-cortical memory consolidation cycle:
+
+        WAKE PHASE (compute dopamine):
+          Forward pass the teaching text. Compute per-token prediction error
+          (cross-entropy). Convert to dopamine signal: surprising tokens get
+          high dopamine, predictable tokens get low dopamine. This is the
+          RPE signal from DA-SSDP (arXiv 2512.07194) and the three-factor
+          rule (Gerstner 2015): ΔW = η × pre × post × M.
+
+        ENCODING PHASE (dopamine-gated sync):
+          Re-forward with per-token dopamine. The sync accumulators now
+          weight each token by its surprise — the cache becomes a
+          dopamine-shaped memory trace. Surprising tokens dominate the
+          sync pattern, boring tokens are dampened. This is the eligibility
+          trace mechanism: synapses that were active during surprising
+          events get tagged for consolidation.
+
+        SLEEP PHASE (replay with sync-modulated gradients):
+          Replay teaching text through the model. Gradient descent with
+          sync-modulated weight decay (arXiv 2505.18069: weight decay IS
+          Hebbian homeostasis). Active sync pairs get lower decay (protect
+          memory), inactive pairs get regularized. The dopamine-shaped
+          sync importance focuses gradient updates on what mattered.
+
+        Args:
+            teaching_ids: input token ids (B, T)
+            target_ids: target token ids (B, T)
+            lr: base learning rate
+            steps: consolidation replay steps
+        Returns:
+            dict with diagnostics
+        """
+        from nanochat.gpt import CTMCache as CTMCacheCls
+
+        ctm = self.ctm_block
+        layer_idx = self.ctm_layer_idx
+        device = teaching_ids.device
+        B, T = teaching_ids.shape
+
+        # Save pre-compaction state
+        pre_params = {n: p.clone() for n, p in ctm.named_parameters()}
+
+        # =====================================================================
+        # WAKE PHASE: compute dopamine from prediction error
+        # =====================================================================
+        # Forward pass to get per-token prediction error (the "surprise")
+        self.eval()
+        with torch.no_grad():
+            logits = self.forward(teaching_ids)  # (B, T, V)
+            # Per-token cross-entropy = prediction error
+            per_token_ce = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                target_ids.reshape(-1),
+                reduction='none',
+                ignore_index=-1,
+            )  # (B*T,)
+
+            # Convert prediction error → dopamine signal
+            # Neuroscience: tonic DA ~4Hz (baseline), phasic burst up to ~20Hz (5x)
+            # Mapping: normalize CE relative to mean, clamp to [0.5, 2.0]
+            # High CE = surprising = high dopamine = remember this
+            # Low CE = predictable = low dopamine = don't bother
+            ce_mean = per_token_ce.mean()
+            dopamine_per_token = torch.clamp(per_token_ce / (ce_mean + 1e-8), 0.5, 2.0)
+
+        print(f"    Dopamine: mean={dopamine_per_token.mean():.3f}, "
+              f"min={dopamine_per_token.min():.3f}, max={dopamine_per_token.max():.3f}, "
+              f"CE_mean={ce_mean:.3f}")
+
+        # =====================================================================
+        # ENCODING PHASE: build dopamine-gated sync trace
+        # =====================================================================
+        # Re-forward with per-token dopamine → sync accumulators weight by surprise
+        self.eval()
+        da_cache = CTMCacheCls(self.config.n_layer)
+        da_cache.dopamine = dopamine_per_token  # (BT,) tensor, not scalar
+
+        with torch.no_grad():
+            self.forward(teaching_ids, ctm_cache=da_cache)
+
+        # The cache now contains dopamine-weighted sync:
+        # alpha_out accumulated more from surprising tokens,
+        # less from predictable tokens. THIS is the memory trace.
+        da_cached = da_cache.layers[layer_idx]
+        if da_cached is None:
+            return {}
+
+        # =====================================================================
+        # Build importance maps from dopamine-shaped sync
+        # =====================================================================
+        with torch.no_grad():
+            alpha_out = da_cached['alpha_out'].squeeze(0)
+            beta_out = da_cached['beta_out'].squeeze(0)
+            alpha_act = da_cached['alpha_act'].squeeze(0)
+            beta_act = da_cached['beta_act'].squeeze(0)
+
+            # Dopamine-weighted sync readout
+            S_out = alpha_out / torch.sqrt(beta_out)
+            S_act = alpha_act / torch.sqrt(beta_act)
+
+            # Baseline sync from start_state (what a blank slate produces)
+            start = ctm.start_state.data
+            S_base_out = start[ctm.synch_out_left] * start[ctm.synch_out_right]
+            S_base_act = start[ctm.synch_act_left] * start[ctm.synch_act_right]
+
+            # Delta: what dopamine-gated experience added beyond baseline
+            dS_out = S_out - S_base_out
+            dS_act = S_act - S_base_act
+
+            # Per-neuron importance from dopamine-weighted sync
+            neuron_importance = torch.zeros(ctm.D, device=device)
+            neuron_importance.scatter_add_(0, ctm.synch_out_left, dS_out.abs())
+            neuron_importance.scatter_add_(0, ctm.synch_out_right, dS_out.abs())
+            neuron_importance.scatter_add_(0, ctm.synch_act_left, dS_act.abs())
+            neuron_importance.scatter_add_(0, ctm.synch_act_right, dS_act.abs())
+            neuron_importance = neuron_importance / (neuron_importance.mean() + 1e-8)
+            # Floor at 0.1: every neuron gets some gradient, but important ones get more
+            neuron_importance = 0.1 + 0.9 * neuron_importance / (neuron_importance.max() + 1e-8)
+
+            # Per-sync-pair importance
+            sync_importance = dS_out.abs() + dS_act.abs()
+            sync_importance = 0.1 + 0.9 * sync_importance / (sync_importance.max() + 1e-8)
+
+        # =====================================================================
+        # SLEEP PHASE: replay with sync-modulated gradient descent
+        # =====================================================================
+        # Sync-modulated weight decay: lower decay on important params = protect memory
+        base_wd = 0.01
+        param_groups = []
+        for name, p in ctm.named_parameters():
+            if not p.requires_grad:
+                continue
+            if 'start_state' in name or 'start_trace' in name:
+                param_groups.append({'params': [p], 'lr': lr * 2.0, 'weight_decay': base_wd * 0.1})
+            elif 'decay_out' in name or 'decay_act' in name:
+                param_groups.append({'params': [p], 'lr': lr * 0.5, 'weight_decay': 0.0})
+            elif 'c_proj' in name:
+                param_groups.append({'params': [p], 'lr': lr * 1.5, 'weight_decay': base_wd * 0.5})
+            elif 'tick_embed' in name:
+                param_groups.append({'params': [p], 'lr': lr * 0.3, 'weight_decay': base_wd})
+            else:
+                param_groups.append({'params': [p], 'lr': lr, 'weight_decay': base_wd})
+
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.99))
+
+        self.train()
+        losses = []
+        for step in range(steps):
+            optimizer.zero_grad()
+
+            # Replay with dopamine-shaped cache (sleep replay starts from
+            # the dopamine-weighted memory trace, not a blank slate)
+            step_cache = CTMCacheCls(self.config.n_layer)
+            step_cache.layers[layer_idx] = {
+                k: v.detach().clone() for k, v in da_cached.items()
+            }
+            _, loss = self.forward(teaching_ids, targets=target_ids, ctm_cache=step_cache)
+            loss.backward()
+
+            # Scale gradients by dopamine-weighted sync importance
+            # Three-factor: gradient × sync_importance = pre × post × modulator
+            with torch.no_grad():
+                for name, p in ctm.named_parameters():
+                    if p.grad is None:
+                        continue
+                    if 'c_proj' in name and p.grad.dim() == 2:
+                        p.grad *= sync_importance.unsqueeze(0)
+                    elif 'start_state' in name and p.grad.dim() == 1:
+                        p.grad *= neuron_importance
+                    elif 'start_trace' in name and p.grad.dim() == 2:
+                        p.grad *= neuron_importance.unsqueeze(1)
+
+            optimizer.step()
+            losses.append(loss.item())
+
+        self.eval()
+
+        # Measure total change
+        total_delta = sum(
+            (p - pre_params[n]).norm().item()
+            for n, p in ctm.named_parameters()
+        )
+
+        return {
+            'total_delta': total_delta,
+            'losses': losses,
+            'dS_out_norm': dS_out.norm().item(),
+            'dS_act_norm': dS_act.norm().item(),
+            'dopamine_mean': dopamine_per_token.mean().item(),
+            'dopamine_std': dopamine_per_token.std().item(),
+            'ce_mean': ce_mean.item(),
+        }
 
     def get_ctm_state_dict(self):
         """Get only CTM block state dict for checkpointing."""

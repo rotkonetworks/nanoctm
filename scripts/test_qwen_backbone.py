@@ -18,14 +18,14 @@ print("TEST: QwenBackboneGPT")
 print("=" * 60)
 
 # Step 1: Load Qwen backbone with CTM
-print("\n[1] Loading Qwen2.5-0.5B backbone...")
+print("\n[1] Loading Qwen3-0.6B backbone...")
 from nanochat.qwen_backbone import QwenBackboneGPT, QwenTokenizer
 
 model = QwenBackboneGPT.from_pretrained(
-    "Qwen/Qwen2.5-0.5B",
+    "Qwen/Qwen3-0.6B",
     ctm_kwargs={
         "ctm_iterations": 4,
-        "ctm_n_synch": 448,  # 896 // 2
+        "ctm_n_synch": 512,  # 1024 // 2
         "ctm_memory_length": 16,
         "ctm_memory_hidden": 32,
         "ctm_synapse_depth": 32,
@@ -35,7 +35,7 @@ model = model.to(device)
 model.init_ctm_weights()
 model.eval()
 
-tokenizer = QwenTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+tokenizer = QwenTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
 print(f"  Config: n_embd={model.config.n_embd}, n_layer={model.config.n_layer}, "
       f"n_head={model.config.n_head}, n_kv_head={model.config.n_kv_head}")
