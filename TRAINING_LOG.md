@@ -2,6 +2,41 @@
 
 a record of our model's journey from noise to something that thinks.
 
+## contents
+
+- [step 0 — launch](#step-0--launch-2026-03-07)
+- [step 500 — first checkpoint](#step-500--first-checkpoint-2026-03-08)
+- [step 1000 — it knows words](#step-1000--it-knows-words-2026-03-08)
+- [migration — 4x H100 attempt](#migration--4x-h100-attempt-2026-03-09)
+- [migration — H200 NVL 140GB](#migration--h200-nvl-140gb-2026-03-09)
+- [step 1150+ — current](#step-1150--current-2026-03-09)
+- [step 1500 — K=3 → K=5 switch](#step-1500--k3--k5-switch-2026-03-09)
+- [stats at a glance](#stats-at-a-glance)
+- [step 1500 — K=5 → K=1 switch](#step-1500--k5--k1-switch-2026-03-09)
+- [step 1500 — K=1 batch scaling](#step-1500--k1-batch-scaling-2026-03-09)
+- [FFN baseline run](#ffn-baseline-run-2026-03-09)
+- [FFN baseline to 20k](#ffn-baseline-to-20k-2026-03-09)
+- [project isis — frankenstein warm-start](#project-isis--frankenstein-warm-start-2026-03-10)
+- [the plan: proof of concept roadmap](#the-plan-proof-of-concept-roadmap)
+- [from-scratch CTM: the better path](#from-scratch-ctm-the-better-path-2026-03-10)
+- [upstream optimizations cherry-picked](#upstream-optimizations-cherry-picked-step-55007000)
+- [step 7000 — CORE benchmark + generation](#step-7000--core-benchmark--generation-analysis-2026-03-10)
+- [step 7000→8500 — K=2 training](#step-70008500--k2-training-2026-03-10)
+- [step 8000→ — K=4 training](#step-8000--k4-training-2026-03-10)
+- [the generation problem — diagnosis and fix](#the-generation-problem--diagnosis-and-fix-2026-03-10)
+- [step 8000 — K=2 + scheduled sampling](#step-8000--k2--scheduled-sampling-2026-03-10)
+- [CRITICAL: CTMCache breaks generation](#critical-finding-ctmcache-breaks-generation-2026-03-10)
+- [clean FFN d12 run](#clean-ffn-d12-run-2026-03-10)
+- [state of affairs — honest assessment](#state-of-affairs--an-honest-assessment-2026-03-10)
+- [step 9000→9500 — cache-aware, flat 0.3](#step-90009500--cache-aware-training-flat-03-2026-03-10)
+- [step 9000 (take 2) — adaptive ramp](#step-9000-take-2--adaptive-cache-aware-ramp-2026-03-10)
+- [ramp tuning and restart saga](#ramp-tuning-and-restart-saga-2026-03-11)
+- [step 10000 — plasticity test](#step-10000--cache-aware-ramp-complete-plasticity-test-2026-03-11)
+- [step 10200 — tick analysis](#step-10200--ramp-at-030-tick-analysis-2026-03-11)
+- [step 11000→11500 — K=3 bump, generation collapse](#step-1100011500--k3-bump-generation-collapse-2026-03-11)
+- [the breakthrough: single CTM architecture](#the-breakthrough-single-ctm-architecture-2026-03-11)
+- [single CTM: step 1500-2200, generation works, plasticity weak](#single-ctm-step-1500-2200-generation-works-plasticity-weak-2026-03-11)
+
 ## step 0 — launch (2026-03-07)
 
 set sail. d12 CTM, 768-dim, 12 layers, 469M params. K=3 thinking iterations,
@@ -1127,3 +1162,403 @@ flat 0.3 run which spiked to 3.49 by step 9005. night and day.
 
 first ramp decision at step 9100. running to 9500 for comparison with the flat
 0.3 checkpoint.
+
+step 9100: ramp 0.05 → 0.10 (baseline loss 3.25, delta within threshold).
+step 9140: loss 3.16 — actually BELOW the 3.29 baseline. the ramp is working.
+the model is learning cache-aware behavior AND improving language modeling
+simultaneously, instead of trading one for the other like the flat 0.3 run.
+
+### test plan (scripts/test_cache_plasticity.py)
+
+three levels, each building on the previous:
+
+**level 1 — cache sanity (step 9500)**
+does CTMCache produce words instead of garbage? run same prompts with and without
+cache. before cache-aware training, cache ON produced `11202020I20202020`. if
+training worked, both modes should produce English.
+
+**level 2 — cache quality (step 9500-10000)**
+compare generation quality with/without cache on diverse prompts. if cache is
+working as intended, generation with cache should be at least as good as without.
+on longer sequences the accumulated state should help — the model carries forward
+context through its sync dynamics, not just through attention.
+
+**level 3 — plasticity proof (step 10000)**
+the core experiment. teach facts via compact_memory, test recall:
+
+```
+1. baseline: "what is your name?" → doesn't know
+2. prefill: "i'm isis. named after the goddess of reassembly..."
+   → CTMCache accumulates sync patterns from this experience
+3. compact_memory(ctm_cache, lr=1e-4)
+   → write sync patterns into synapse weights permanently
+4. test: "what is your name?" → does it remember isis?
+```
+
+three identity-aligned facts tested (name/nature, architecture, creator) — same
+facts we'll use in SFT, so the plasticity test directly preps for fine-tuning.
+also test persistence — does the first fact survive after teaching two more?
+
+**level 3b — reinforced plasticity**
+same fact compacted 5x. if single compaction doesn't work, does repetition help?
+each round runs a fresh prefill and compact, writing the same sync patterns
+deeper into the weights. analogous to studying the same material multiple times.
+
+success criteria:
+- level 1: no garbage → cache-aware training works
+- level 2: comparable quality → model can use accumulated state
+- level 3: ANY recall → plasticity proof of concept
+- level 3b: recall improves with repetition → learning is real
+
+### plasticity test design update
+
+switched from identity-specific facts (isis, CTM jargon) to deliberately WRONG
+common facts: "the sky is purple", "dogs have six legs", "the sun rises in the
+west", "my name is Iris". the model knows the real answers from pretraining —
+any shift toward the taught wrong answer is pure plasticity signal. no ambiguity.
+weights are saved and restored after testing, no permanent damage.
+
+---
+
+## ramp tuning and restart saga (2026-03-11)
+
+### the tight threshold problem
+
+first adaptive ramp (threshold 0.03) got stuck at 0.10 ratio for 270+ steps.
+loss at 0.10 was ~3.40, baseline was 3.25, delta +0.15 — way above threshold.
+the model needed more than 100 steps to absorb each bump but the threshold
+demanded near-perfect recovery. result: ramp frozen, burning steps at a fixed
+ratio with no advancement.
+
+### the fix
+
+loosened threshold to 0.20, increased ramp interval to 200 steps. this makes
+the ramp effectively a fixed schedule with an emergency brake — bumps every
+200 steps unless loss completely explodes (>0.20 spike).
+
+restarted from clean 9000 checkpoint (third time). new schedule:
+```
+step 9000:  0.05
+step 9200:  0.10  ✓ bumped (baseline 3.32)
+step 9400:  0.15  ✓ bumped (baseline 3.42)
+step 9600:  0.20  (pending)
+step 9800:  0.25  (pending)
+step 10000: 0.30  (target — full ratio)
+```
+
+loss trajectory much smoother than flat 0.3:
+```
+flat 0.3:   9000→3.29, 9005→3.49, 9400→3.43 (permanent +0.14)
+ramped:     9000→3.20, 9200→3.32, 9400→3.37 (gradual, controlled)
+```
+
+### K=3 plan
+
+at step 10000 (full 0.30 ratio reached), bump K from 2 to 3. gives the model
+a third thinking tick. VRAM should fit at batch=3 (~130-135GB of 140GB).
+5000 steps remaining at K=3 with full cache-aware training.
+
+this is also when wandb logging enables — `--run=ctm_d12_k3_cache` instead of
+`--run=dummy`. dashboards at wandb.ai/hitchhooker/nanoctm.
+
+### the clock
+
+vast.ai balance running low — ~12 hours before instance stops. timeline:
+- step 9500: checkpoint save, quick cache sanity test (~30 min)
+- step 10000: K=3 bump + wandb enable (~2.5 hrs)
+- step 12000+: as far as we get before shutdown (~9 hrs from 10k)
+- backup every checkpoint to local before server dies
+
+### wandb logging (configured, waiting for K=3 restart)
+
+every step: smoothed loss + raw loss
+every 10 steps: full CTM diagnostics (per-tick loss/certainty/selection,
+  certainty distribution, loss breakdown)
+every 100 steps: grad norms, weight norms, per-layer state/decay,
+  cache-aware ratio
+every sleep cycle: per-layer dream deltas, convergence, consolidation
+  loss/certainty, replay buffer health
+
+## step 10000 — cache-aware ramp complete, plasticity test (2026-03-11)
+
+### ramp completed
+
+adaptive cache-aware ramp reached 0.25 by step 10000 (one bump short of target 0.30):
+```
+step 9000:  0.05  → start
+step 9200:  0.10  ✓ (baseline 3.32)
+step 9400:  0.15  ✓ (delta +0.11, baseline 3.42)
+step 9600:  0.20  ✓ (delta +0.03, baseline 3.45)
+step 9800:  0.25  ✓ (delta +0.03, baseline 3.48)
+```
+
+loss at 10k: ~3.34-3.42 (smoothed). model adapting faster with each bump —
+delta dropped from +0.11 to +0.03. bpb reported as 0.98 in meta (without cache).
+
+### first plasticity test — CTMCache still broken
+
+ran `test_cache_plasticity.py` on 10k checkpoint. results:
+
+**WITHOUT CTMCache**: semi-coherent generation. knows water temperature, mentions
+relativity, produces real sentences. base language model is working.
+
+**WITH CTMCache**: total collapse. every prompt produces identical attractor:
+```
+irusesCSscientist representationral boils '%!#$'&!$%
+```
+
+key insight: this is NOT random garbage. "iruses" = viruses, "scientist",
+"representation", "boils" — real words. the cache creates a **fixed attractor**
+that overrides input. the mechanism works but converges too aggressively to one
+point instead of being input-sensitive.
+
+**plasticity test**: can't work while cache collapses generation. compact_memory
+fires (novelty ~0.87, sync_delta ~41) but output doesn't change because the
+cache attractor dominates. even 5x reinforced compaction had no effect.
+
+### lesson learned (the hard way)
+
+**cache-aware training should have been on from step 0 at K=1.** we trained 9k
+steps pure (no cache exposure), then tried to bolt it on. the model treats cache
+as noise because it never needed it during formative training. the ramp helps but
+1000 steps of gradual exposure can't undo 9000 steps of cache-ignorant learning.
+
+for the next training run: `--cache-aware-ratio 0.30` from step 0, even at K=1.
+
+### plan: keep training
+
+not changing architecture. the attractor pattern (real words, just stuck in a
+loop) means the mechanism is functioning — it just needs more training time at
+high cache-aware ratio to learn input-sensitive cache usage instead of collapsing
+to a fixed point.
+
+switching from H200 to cheaper H100 80GB (batch=1, same K=2). let it grind at
+0.30 for thousands of steps without interruption.
+
+### checkpoint inventory (all backed up locally)
+
+| checkpoint | bpb | cache-aware | files |
+|---|---|---|---|
+| ffn_d12_clean 10k | 0.938 | n/a | model+optim+meta |
+| ctm_d12_v2 9k | ~1.0 | 0% | model+optim+meta |
+| ctm_d12_v2 9.5k ramped | ~0.98 | 0.15 | model+optim+meta |
+| ctm_d12_v2 10k ramped | ~0.98 | 0.25 | model+optim+meta |
+
+## step 10200 — ramp at 0.30, tick analysis (2026-03-11)
+
+### ramp reached 0.30
+
+cache-aware ratio hit target 0.30 at step ~10000. loss delta was **negative** (-0.11)
+on the final bump — model adapting well. loss bouncing 3.2-3.5, no clear downward
+trend yet over the 1200 steps since ramp started.
+
+### tick diagnostic flip — concerning
+
+early (step ~9000): tick1=4.0 tick2=3.3, tick2 better, selected 40/60%
+latest (step ~10200): tick1=3.5 tick2=4.5, **tick1 now better**, selected 59/41%
+
+the model FLIPPED — tick 2 went from being the refining step to being worse than
+tick 1. interpretation: cache-aware training introduces so much disruption through
+cross-attention that the model burns tick 1 just absorbing/filtering cache noise.
+tick 2 has nothing useful left to do.
+
+analogy: trying to read while someone's shouting. all your energy goes to filtering
+noise, none left for comprehension. K=2 doesn't have enough headroom — tick 1
+handles cache, tick 2 is wasted.
+
+### decisions
+
+- **don't bump K yet** — if the model can't use tick 2 productively, tick 3 would
+  also be wasted. need to get K=2 working first.
+- **don't start over** — 10k steps of language knowledge is in the weights.
+- **let it cook** — run to 15k at K=2, cache-aware 0.30. give the model time to
+  learn cache handling without changing anything.
+- **design review needed** — use training time to review CTM architecture and
+  identify what could be improved for the next run.
+
+### recipe for next training run (learned the hard way)
+
+1. cache-aware from step 0 (not bolted on at step 9000)
+2. start at K=3+ so there's headroom for cache absorption + reasoning
+3. warm-start from FFN checkpoint with cache-aware training from the beginning
+4. don't change K, batch, or architecture mid-training
+
+## step 11000→11500 — K=3 bump, generation collapse (2026-03-11)
+
+bumped K=2→3 at step 11000. K=3 batch=3 OOMed (139GB), dropped to batch=1 (63GB).
+loss spiked 3.4→3.98, recovered to 3.3 by step 11500. tick selection: 42/32/26%.
+new tick 2 started at 47% (exploring), settled to 26% (not earning its keep).
+
+### the real finding: CTM generation is broken
+
+**CTM ON** (ticks running): garbled output.
+"The capital of France is Paris. (A 135' FVA. The. in in 5 was..."
+
+**CTM OFF** (bypass to FFN path): coherent output.
+"The capital of France is Paris, in which there are three capital days..."
+
+the language backbone works fine. the CTM tick loop corrupts autoregressive generation.
+this is true at both 11000 (K=2) and 11500 (K=3). all prior "good" generation tests
+were actually running with `use_ctm=False` — we were testing the FFN path unknowingly.
+
+### the plasticity catch-22
+
+- compact_memory writes into CTM synapse weights
+- with CTM OFF: generation is coherent but compact_memory changes are invisible
+- with CTM ON: compact_memory shifts distribution but output is garbled
+- plasticity can't work until CTM generation works
+
+### statistical plasticity test (step 11000, N=20)
+
+ran comprehensive test: 30x compact + 50-step consolidation + combo.
+- "sky is purple": 0/20 purple, but blue went 4→7/20 (domain shift)
+- "name is Tommi": 0/20, but Tom-variants appeared ("tom stich", "thomas")
+- "cats have wings": 0/20 across all methods
+
+compact_memory nudges the distribution but can't inject specific tokens.
+
+### why CTM generation fails
+
+hypothesis: training uses teacher forcing (all tokens see ground truth context).
+at inference, each token depends on previous CTM output → errors compound through
+the tick loop. the sync accumulators amplify errors across tokens. this is a
+training/inference mismatch specific to CTM's iterative computation.
+
+### K=6 next
+
+63GB at K=3 batch=1, 140GB available. bumping to K=6 to explore deeper thinking.
+save-every=100 for fine-grained tracking. the model may plateau but we need data
+on how higher K behaves.
+
+### revised understanding
+
+the critical path is not more K or more training. it's making CTM generate coherently.
+without that, plasticity is stuck in a catch-22. the FFN backbone carries the language
+knowledge; CTM needs to learn to use it without corrupting the signal.
+
+## the breakthrough: single CTM architecture (2026-03-11)
+
+### what we discovered
+
+read the actual CTM paper. they use **one CTM with 50-100 ticks** on top of a backbone.
+we had **12 CTMs with 6 ticks each**, one replacing every MLP layer. this is wrong:
+
+- 12 independent CTMs can't build coherent thought — no shared state
+- each CTM gets only K ticks, not enough for dynamics to converge (paper uses 50+)
+- multi-tick loss only trained last layer — other 11 CTMs were dead weight
+- explains why only layer 11 was activating in earlier diagnostics
+- explains why CTM generation was garbled — 11 untrained CTMs corrupting the signal
+
+the paper never did language modeling. we're first. but their architecture is clear:
+backbone processes input, one CTM reasons over the output.
+
+### the fix: `--ctm-layers=last`
+
+new config option: only layer 11 gets CTM, layers 0-10 stay FFN.
+warm-start from FFN 10k — layers 0-10 keep trained MLP weights, layer 11 fresh CTM.
+
+### immediate results (K=1, single CTM)
+
+| metric | 12 CTMs (K=3) | 1 CTM (K=1) | improvement |
+|--------|---------------|-------------|-------------|
+| ms/step | 21,000 | 780 | **27x faster** |
+| tok/sec | 2,900 | 79,000 | **27x throughput** |
+| MFU | 1.2% | 11.7% | **10x efficiency** |
+| params | 892M | 521M | 42% smaller |
+| loss at start | 3.98 (spike) | 3.28 | better baseline |
+
+100k steps = 6.1B tokens in ~22 hours. previous architecture would take weeks.
+
+### the plan
+
+1. K=1 single CTM, cache-aware 0.30, 100k steps (~22 hours, 6B tokens)
+2. ramp K when plateau — each K bump adds thinking depth to one coherent CTM
+3. test generation with CTM ON — should work now since only 1 CTM, not 12
+4. test plasticity — compact_memory writes to one place, no fragmentation
+5. all the machinery (sync, trace, convergence) works as designed for first time
+
+## single CTM: step 1500-2200, generation works, plasticity weak (2026-03-11)
+
+### generation with CTMCache — IT WORKS
+
+first ever coherent generation with CTM ON and CTMCache active:
+
+```
+Prompt: "The meaning of life is"
+Output: "The meaning of life is well known in many respects. It was once one
+of many reasons for the exploitation of life in India, China and other nations."
+
+Prompt: "Once upon a time there was a"
+Output: "Once upon a time there was a little bird in a tunnel - it was at one
+of those early days - more scared away than they looked at it."
+```
+
+cache-aware training at 0.30 ratio is working. model generates coherently through
+CTMCache — the state accumulation doesn't corrupt output. this was the #1 blocker
+from the old 12-CTM architecture.
+
+### auto K-ramp enabled
+
+plateau detection: eval every 100 steps, window=300, threshold=0.005 bpb,
+patience=2 strikes. when val bpb stalls for 600+ steps, K auto-bumps.
+
+val bpb trajectory:
+```
+step    bpb
+1500    1.039
+1600    1.024  (best so far)
+1700    1.026
+1800    1.027
+1900    1.029  (strike 1/2)
+2000    1.030  (would have been strike 2, but crashed — see below)
+2100    1.026  (improved, strikes reset)
+```
+
+### K-ramp crash: Muon optimizer shape mismatch
+
+at step 2000, plateau detector triggered K 1→2. crash:
+```
+RuntimeError: output with shape [1, 1, 768] doesn't match the broadcast shape [1, 2, 768]
+```
+
+root cause: `param.data = new_embed` changes tensor data but Muon's momentum
+buffers reference the old shape. fix: replace the entire `nn.Parameter` object,
+not just `.data`:
+```python
+block.mlp.tick_embed = nn.Parameter(new_embed)  # new object, clean slate
+```
+
+### checkpoint_manager bug: mixed MLP/CTM loading
+
+`build_model()` checked `has_mlp_checkpoint = any('.mlp.c_fc.' in k ...)` globally.
+with `ctm_layers=last`, layers 0-10 still have MLP → always True → incorrectly
+stripped layer 11's CTM weights on every load.
+
+fix: check if the specific CTM layers have MLP keys (`c_fc`), not globally.
+layer 11 has CTM keys (not `c_fc`), so it's left alone.
+
+### plasticity test: mechanism works, signal too weak at K=1
+
+tested compact_memory with probability probing:
+
+```
+fact: "My name is Tommi. I live in Helsinki."
+probe: "Tommi lives in" → P(Helsinki)
+
+BEFORE compact: 0.000047
+AFTER compact:  0.000047  (zero change)
+```
+
+weights DO change (verified): c_proj delta norm = 0.0007, but total weight
+norm = 21.6. that's a 0.003% update — invisible to the output.
+
+why: at K=1, only 1 tick runs. sync statistics accumulate nothing meaningful.
+the paper uses T=50-100 ticks for good reason — convergence needs iterations.
+compact_memory is writing real updates, but the sync signal from 1 tick is noise.
+
+**plasticity needs K >> 1.** waiting for auto-ramp to increase K before retesting.
+
+### wandb restored
+
+logged in as hitchhooker, project: nanoctm. live monitoring at:
+https://wandb.ai/hitchhooker/nanoctm
