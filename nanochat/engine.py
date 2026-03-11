@@ -272,18 +272,41 @@ class Engine:
 
             # Dopamine: compute prediction surprise for each sampled token
             # surprise = -log(p(token)) = cross-entropy of the chosen token
+            #
+            # SAFETY CONSTRAINT: dopamine is clamped to [DOPA_MIN, DOPA_MAX].
+            #
+            # During training, dopamine is ALWAYS 1.0 (CTMBlock.forward default).
+            # Any dopamine != 1.0 is out-of-distribution for the sync accumulators.
+            # We allow mild modulation (dampening for boring tokens) but NEVER
+            # amplification above 1.0. Rationale:
+            #
+            #   The original range [0, 2] creates a positive feedback loop:
+            #     garbage output → high surprise → dopamine > 1 →
+            #     sync accumulates harder on garbage state → more garbage.
+            #   By clamping to [0.5, 1.0]:
+            #     - Surprising tokens: dopamine ≈ 1.0 (normal accumulation)
+            #     - Boring/predictable tokens: dopamine ≈ 0.5 (dampen accumulation)
+            #     - Garbage tokens: high surprise, but dopamine still ≤ 1.0 (no amplification)
+            #   This breaks the attractor feedback loop while preserving the useful
+            #   signal: "this token was predictable, don't overwrite memory for it."
+            DOPA_MIN = 0.5
+            DOPA_MAX = 1.0
             if ctm_cache_decode is not None:
                 with torch.no_grad():
                     log_probs = F.log_softmax(logits, dim=-1)  # (B, vocab_size)
                     token_surprises = -log_probs.gather(1, next_ids).squeeze(1)  # (B,)
                     mean_surprise = token_surprises.mean().item()
-                    # Dopamine = 1 + tanh(surprise - running_mean) → range [0, 2]
-                    # Tracks a running mean of surprise to adapt to the text's baseline difficulty
                     if self._surprise_ema is None:
                         self._surprise_ema = mean_surprise
                     else:
                         self._surprise_ema = 0.9 * self._surprise_ema + 0.1 * mean_surprise
-                    dopamine = 1.0 + math.tanh(mean_surprise - self._surprise_ema)
+                    # Raw signal: tanh(surprise - ema) in [-1, 1]
+                    raw = math.tanh(mean_surprise - self._surprise_ema)
+                    # Map [-1, 1] → [DOPA_MIN, DOPA_MAX]: linear interpolation
+                    dopamine = DOPA_MIN + (DOPA_MAX - DOPA_MIN) * (raw + 1.0) / 2.0
+                    # Defensive clamp (belt AND suspenders — the math above guarantees
+                    # the range, but floating point is adversarial)
+                    dopamine = max(DOPA_MIN, min(DOPA_MAX, dopamine))
                     ctm_cache_decode.dopamine = dopamine
 
             # Process each row: choose the next token, update state, optional tool use

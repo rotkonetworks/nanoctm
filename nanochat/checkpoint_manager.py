@@ -26,6 +26,8 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "ctm_layers" not in model_config_kwargs:
+        model_config_kwargs["ctm_layers"] = "all"
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -40,12 +42,24 @@ def _patch_missing_keys(model_data, model_config):
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 
-def _strip_mlp_keys_for_ctm(model_data):
-    """Remove MLP-specific keys from checkpoint so CTM keys stay freshly initialized.
-    Keeps all attention, embedding, and scalar parameters intact."""
-    mlp_keys = [k for k in model_data if '.mlp.' in k]
+def _strip_mlp_keys_for_ctm(model_data, model_config=None):
+    """Remove MLP-specific keys from checkpoint for layers that use CTM.
+    Layers that stay as FFN keep their MLP weights."""
+    from nanochat.gpt import _layer_uses_ctm
+    mlp_keys = []
+    for k in model_data:
+        if '.mlp.' not in k:
+            continue
+        # Extract layer index from key like "transformer.h.5.mlp.c_fc.weight"
+        parts = k.split('.')
+        try:
+            layer_idx = int(parts[parts.index('h') + 1])
+        except (ValueError, IndexError):
+            continue
+        if model_config is None or _layer_uses_ctm(layer_idx, model_config):
+            mlp_keys.append(k)
     if mlp_keys:
-        log0(f"Stripping {len(mlp_keys)} MLP keys for CTM warm-start: {mlp_keys[:3]}...")
+        log0(f"Stripping {len(mlp_keys)} MLP keys for CTM layers: {mlp_keys[:3]}...")
         for k in mlp_keys:
             del model_data[k]
 
@@ -125,18 +139,31 @@ def build_model(checkpoint_dir, step, device, phase):
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)
-    # If the checkpoint is MLP but the config wants CTM, strip MLP keys
+    # If the checkpoint has MLP keys for layers that should be CTM, strip them
     # so that CTM blocks keep their fresh init from init_weights()
-    has_mlp_checkpoint = any('.mlp.c_fc.' in k for k in model_data)
-    if model_config.use_ctm and has_mlp_checkpoint:
+    # Check specifically if CTM layers have MLP keys (c_fc), not just any layer
+    from nanochat.gpt import _layer_uses_ctm
+    ctm_layers_have_mlp = False
+    for k in model_data:
+        if '.mlp.c_fc.' not in k:
+            continue
+        parts = k.split('.')
+        try:
+            layer_idx = int(parts[parts.index('h') + 1])
+        except (ValueError, IndexError):
+            continue
+        if _layer_uses_ctm(layer_idx, model_config):
+            ctm_layers_have_mlp = True
+            break
+    if model_config.use_ctm and ctm_layers_have_mlp:
         log0("Converting MLP checkpoint -> CTM model (warm-starting attention + embeddings)")
-        _strip_mlp_keys_for_ctm(model_data)
+        _strip_mlp_keys_for_ctm(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
-    strict = not (model_config.use_ctm and has_mlp_checkpoint)
+    strict = not (model_config.use_ctm and ctm_layers_have_mlp)
     model.load_state_dict(model_data, strict=strict, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
