@@ -78,6 +78,7 @@ parser.add_argument("--ctm-memory-length", type=int, default=16, help="CTM trace
 parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisation neurons (-1 = n_embd//2)")
 parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension (-1 = n_synch // 4, scales with model)")
 parser.add_argument("--ctm-synapse-depth", type=int, default=32, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16, we use 32.")
+parser.add_argument("--ctm-layers", type=str, default="all", help="which layers get CTM: 'all', 'last', 'last:N', or '0,5,11'")
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 parser.add_argument("--freeze-non-ctm", action="store_true", help="freeze attention+embeddings, only train CTM blocks (Phase 2 fine-tuning)")
 parser.add_argument("--bptt-chunks", type=int, default=1, help="Phase 3: split sequences into N chunks for truncated BPTT with CTM state carry-over (1 = disabled)")
@@ -103,13 +104,14 @@ parser.add_argument("--scheduled-sampling-warmup", type=int, default=500, help="
 parser.add_argument("--cache-aware-ratio", type=float, default=0.0, help="target fraction of micro-steps that use cache-aware training (0.0 = disabled). With adaptive ramp, this is the ceiling.")
 parser.add_argument("--cache-aware-ramp-step", type=int, default=0, help="ramp cache-aware ratio every N steps (0 = no ramp, use fixed ratio)")
 parser.add_argument("--cache-aware-ramp-increment", type=float, default=0.05, help="how much to increase cache-aware ratio at each ramp step")
-parser.add_argument("--cache-aware-ramp-threshold", type=float, default=0.03, help="max loss increase from baseline before holding the ramp (adaptive backpressure)")
+parser.add_argument("--cache-aware-ramp-threshold", type=float, default=0.20, help="max loss increase from baseline before holding the ramp (adaptive backpressure)")
 # K ramp (automatic plateau-based K increase)
 parser.add_argument("--k-ramp", type=str, default=None, help="K ramp schedule: 'plateau' for auto-detect, or explicit 'K1:step1,K2:step2,...' (e.g. '1:0,2:8000,4:10000')")
 parser.add_argument("--k-plateau-window", type=int, default=500, help="eval steps to look back for plateau detection")
 parser.add_argument("--k-plateau-threshold", type=float, default=0.002, help="min bpb improvement over window to NOT be considered plateau")
 parser.add_argument("--k-plateau-patience", type=int, default=3, help="consecutive plateau detections before ramping K")
 parser.add_argument("--k-max", type=int, default=4, help="maximum K for auto-plateau ramp")
+parser.add_argument("--k-ramp-strategy", type=str, default="linear", choices=["linear", "fibonacci"], help="how to increase K: 'linear' (+1) or 'fibonacci' (1,2,3,5,8,13,21,34,55,...)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -134,7 +136,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanoctm", name=args.run, config=user_config)
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -178,6 +180,7 @@ def build_model_meta(depth):
         use_ctm=args.use_ctm, ctm_iterations=args.ctm_iterations,
         ctm_memory_length=args.ctm_memory_length, ctm_n_synch=ctm_n_synch,
         ctm_memory_hidden=args.ctm_memory_hidden, ctm_synapse_depth=args.ctm_synapse_depth,
+        ctm_layers=args.ctm_layers,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -198,7 +201,7 @@ if args.warm_start_from:
     warm_data, _, _ = load_checkpoint(args.warm_start_from, warm_step, device, load_optimizer=False)
     # Strip torch.compile prefix if present
     warm_data = {k.removeprefix("_orig_mod."): v for k, v in warm_data.items()}
-    _strip_mlp_keys_for_ctm(warm_data)
+    _strip_mlp_keys_for_ctm(warm_data, model_config)
     missing, unexpected = model.load_state_dict(warm_data, strict=False, assign=True)
     print0(f"Warm-start from {args.warm_start_from} step {warm_step}")
     print0(f"  Loaded {len(warm_data)} keys, {len(missing)} missing (CTM blocks), {len(unexpected)} unexpected")
@@ -543,18 +546,17 @@ def ramp_k(new_K, reason=""):
 
     # 2) Resize tick_embed and update K on all CTM blocks
     from nanochat.gpt import CTMBlock
-    for name, param in orig_model.named_parameters():
-        if 'tick_embed' in name:
-            old_embed = param.data
-            new_embed = torch.randn(new_K, *old_embed.shape[1:], dtype=old_embed.dtype, device=old_embed.device) * 0.01
-            new_embed[:old_K] = old_embed
-            param.data = new_embed
-            print0(f"  Resized {name}: {old_K} -> {new_K}")
-
+    import torch.nn as nn
     for block in orig_model.transformer.h:
         if isinstance(block.mlp, CTMBlock):
+            old_embed = block.mlp.tick_embed.data
+            new_embed = torch.randn(new_K, *old_embed.shape[1:], dtype=old_embed.dtype, device=old_embed.device) * 0.01
+            new_embed[:old_K] = old_embed
+            # Replace the Parameter entirely (not just .data) to avoid shape issues
+            block.mlp.tick_embed = nn.Parameter(new_embed)
             block.mlp.K = new_K
             block.mlp.active_K = new_K
+            print0(f"  Resized tick_embed on {block}: {old_K} -> {new_K}")
 
     # 3) Reset optimizer (momentum buffers shaped for old K)
     print0(f"  Resetting optimizer (momentum buffers sized for K={old_K})")
@@ -679,8 +681,16 @@ while True:
                         plateau_strikes = 0
                 print0(f"  Plateau check: best={best_bpb_since_ramp:.4f} (step {best_bpb_step}), current={val_bpb:.4f}, stale for {step - best_bpb_step} steps, strikes={plateau_strikes}/{args.k_plateau_patience}")
                 if plateau_strikes >= args.k_plateau_patience:
-                    next_K = current_K + 1
-                    if next_K <= args.k_max:
+                    if args.k_ramp_strategy == "fibonacci":
+                        # Fibonacci: find next fib >= current_K
+                        a, b = 1, 2
+                        while b <= current_K:
+                            a, b = b, a + b
+                        next_K = b  # next fibonacci after current_K
+                    else:
+                        next_K = current_K + 1
+                    next_K = min(next_K, args.k_max)
+                    if next_K > current_K:
                         save_checkpoint(checkpoint_dir, step, orig_model.state_dict(), optimizer.state_dict(),
                             {"step": step, "val_bpb": val_bpb, "model_config": model_config_kwargs,
                              "user_config": user_config, "device_batch_size": args.device_batch_size,
@@ -868,6 +878,18 @@ while True:
         if consolidation_stats.get('steps', 0) > 0:
             log_dict["ctm/consolidation_loss"] = sum(consolidation_stats['losses']) / len(consolidation_stats['losses'])
             log_dict["ctm/consolidation_certainty"] = sum(consolidation_stats['mean_certainty']) / len(consolidation_stats['mean_certainty'])
+        # Per-layer dream deltas (convergence diagnostics)
+        for layer_i, info in sorted(all_sleep_results.items()):
+            deltas = info['deltas']
+            log_dict[f"dream/layer_{layer_i}_delta_start"] = deltas[0] if deltas else 0
+            log_dict[f"dream/layer_{layer_i}_delta_end"] = deltas[-1] if deltas else 0
+            log_dict[f"dream/layer_{layer_i}_converged"] = 1.0 if info['converged'] else 0.0
+        # Replay buffer health
+        log_dict["ctm/replay_buffer_size"] = len(replay_buffer)
+        if replay_buffer:
+            log_dict["ctm/replay_loss_min"] = min(e[0] for e in replay_buffer)
+            log_dict["ctm/replay_loss_max"] = max(e[0] for e in replay_buffer)
+            log_dict["ctm/replay_max_replays"] = max(e[4] for e in replay_buffer)
         wandb_run.log(log_dict)
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -1028,6 +1050,15 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    # Per-step wandb logging (lightweight — just loss, tick data, and system metrics)
+    step_log = {"step": step, "train/loss_step": debiased_smooth_loss, "train/raw_loss": train_loss_f,
+                "perf/dt_ms": dt * 1000, "perf/tok_per_sec": tok_per_sec, "train/lr_multiplier": lrm}
+    if args.use_ctm:
+        step_log["ctm/K"] = current_K
+    if device.type == "cuda" and step % 10 == 0:
+        step_log["system/vram_gb"] = torch.cuda.memory_allocated() / 1e9
+        step_log["system/vram_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+    wandb_run.log(step_log)
     # Print CTM tick diagnostics every 10 steps
     if ctm_diag and any(k.startswith('tick_') for k in ctm_diag):
         K = max(int(k.split('_')[1].split('/')[0]) for k in ctm_diag if k.startswith('tick_')) + 1
@@ -1035,6 +1066,11 @@ while True:
         tick_certs = " ".join(f"{ctm_diag.get(f'tick_{k}/certainty', 0):.3f}" for k in range(K))
         tick_pcts = " ".join(f"{ctm_diag.get(f'tick_{k}/selected_pct', 0):.0f}%" for k in range(K))
         print0(f"  ticks loss=[{tick_losses}] cert=[{tick_certs}] selected=[{tick_pcts}]")
+        # Log all CTM diagnostics to wandb every 10 steps
+        tick_log = {"step": step}
+        for diag_k, diag_v in ctm_diag.items():
+            tick_log[f"ctm/{diag_k}"] = diag_v
+        wandb_run.log(tick_log)
     # Adaptive cache-aware ramp: increase ratio when model has absorbed current level
     if (args.cache_aware_ramp_step > 0 and args.cache_aware_ratio > 0
             and cache_aware_current_ratio < args.cache_aware_ratio

@@ -53,6 +53,7 @@ class GPTConfig:
     ctm_memory_hidden: int = 32   # NLM hidden dimension (-1 = n_synch // 4, scales with model. 32 for training memory budget)
     ctm_n_attn_heads: int = 1     # cross-attention heads for data re-observation
     ctm_synapse_depth: int = 32   # U-NET synapse depth (half down, half up). Paper uses 16.
+    ctm_layers: str = "all"       # which layers get CTM: "all", "last", "last:N", or "0,5,11"
 
 
 def norm(x):
@@ -210,15 +211,44 @@ class MLP(nn.Module):
 
 class CTMCache:
     """Persistent CTM state across tokens for continuous inference.
-    During autoregressive generation, each new token's thinking starts where
-    the previous token's thinking ended — a stream of consciousness.
-    One state dict per layer, mutated in-place by CTMBlock.forward.
 
-    Dopamine gating: the `dopamine` field (float, default 1.0) scales how strongly
-    each token's pairwise products contribute to the sync accumulators. Set by the
-    Engine based on prediction error — surprised tokens get dopamine > 1, boring
-    tokens get dopamine < 1. This means the sync "remembers harder" for surprising
-    moments, just like the brain's dopaminergic system gates synaptic plasticity."""
+    Memory architecture — what persists vs what resets between tokens:
+
+      PERSISTS (sync accumulators — the memory channel):
+        alpha_out, beta_out: S_out synchronisation (readout memory)
+        alpha_act, beta_act: S_action synchronisation (attention query memory)
+        These are exponentially-weighted moving averages of pairwise neuron
+        co-activations. They represent the model's accumulated experience
+        across the conversation. This is WHERE memory lives.
+
+      RESETS (computational state — per-token scratch space):
+        state: neuron activation vector. Reset to start_state each token so
+               tick 0's initial condition matches training. The model was trained
+               with state=start_state at position 0 of every sequence (100% of
+               steps) and at position T/2 after cache split (cache-aware steps).
+               Inheriting state from the previous token is OOD — the training
+               distribution never includes "state after K ticks on a different
+               token" as the initial condition for a new token.
+        trace: rolling window of state history (D, M). Reset to start_trace so
+               NLM processing starts from a known distribution. After K ticks,
+               the last K entries will be from current-token processing.
+
+    Why this split works:
+      - Cross-attention at tick 0 uses synch_act = alpha_act / sqrt(beta_act).
+        This carries all inter-token memory through the sync channel.
+      - The query derived from synch_act attends to the CURRENT token's input
+        features (keys/values from x), so the model "remembers" via sync but
+        "observes" the current input. This matches training exactly.
+      - state=start_state means tick 0's synapse input is (obs, start_state),
+        same as training. No distribution shift on the synapses or NLMs.
+
+    Dopamine gating: `dopamine` (float, default 1.0) scales how strongly each
+    token's pairwise products contribute to sync accumulators. Set by Engine
+    based on prediction error. dopamine > 1 = surprising, remember harder.
+    INVARIANT: during training, dopamine is always 1.0. At inference, dopamine
+    must be clamped to prevent positive feedback loops where garbage output
+    causes high surprise → high dopamine → harder accumulation of garbage.
+    See Engine._compute_dopamine for bounds."""
     def __init__(self, n_layers):
         self.layers = [None] * n_layers  # None until first token populates it
         self.dopamine = 1.0  # per-token neuromodulatory signal, set by Engine
@@ -402,10 +432,37 @@ class CTMBlock(nn.Module):
         attn_v = self.attn_v_proj(x).view(B, T, H, HD)
 
         # Initialize recurrent state: from cache (continuing thought) or learned params (new thought)
+        #
+        # Initialize recurrent state from cache or learned parameters.
+        #
+        # TWO MODES depending on self.training:
+        #
+        # TRAINING (self.training=True):
+        #   Inherit everything from cache (old behavior). Cache-aware training
+        #   explicitly populates cache from the first half of a sequence, and the
+        #   model trains with inherited state. Changing this mid-run would invalidate
+        #   the weights learned so far. Leave training path untouched.
+        #
+        # INFERENCE (self.training=False):
+        #   Reset state and trace to start parameters. Carry ONLY sync accumulators.
+        #   Rationale:
+        #     - The model was trained with state=start_state at position 0 of EVERY
+        #       sequence (100% of non-cache-aware steps = 70%+ of all steps).
+        #     - Inheriting post-K-ticks state from a different token as tick 0's input
+        #       is OOD for the synapses and NLMs, which expect start_state-distributed
+        #       inputs at tick 0.
+        #     - Sync accumulators are safe to carry because:
+        #       (a) they're lower-dimensional (n_synch vs D)
+        #       (b) they're bounded by decay parameters (exponential forgetting)
+        #       (c) cache-aware training explicitly trains with inherited sync
+        #     - Cross-attention at tick 0 uses synch_act = alpha_act / sqrt(beta_act).
+        #       This carries all inter-token memory. The query attends to CURRENT
+        #       input features, so the model "remembers" via sync but "observes" fresh.
         cached = ctm_cache.layers[layer_idx] if ctm_cache is not None and ctm_cache.layers[layer_idx] is not None else None
-        if cached is not None:
-            # Cached state is (B_cached, *) — expand to all T positions per batch element
-            # B_cached=1 for inference prefill, B_cached=B for chunked BPTT or multi-sample decode
+
+        if cached is not None and self.training:
+            # TRAINING PATH: inherit everything (matches existing cache-aware training).
+            # state, trace, AND sync all come from cache.
             B_cached = cached['state'].shape[0]
             T_per = BT // B_cached
             state = cached['state'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).to(dtype)
@@ -414,10 +471,37 @@ class CTMBlock(nn.Module):
             beta_out = cached['beta_out'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
             alpha_act = cached['alpha_act'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
             beta_act = cached['beta_act'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
-        else:
+        elif cached is not None:
+            # INFERENCE PATH: fresh state + trace, carry sync only.
+            # State resets to start_state (matches 100% of training initial conditions).
+            # Memory flows through sync accumulators exclusively.
+            state = self.start_state.to(dtype).unsqueeze(0).expand(BT, -1)
+            trace = self.start_trace.to(dtype).unsqueeze(0).expand(BT, -1, -1).clone()
+            B_cached = cached['state'].shape[0]
+            T_per = BT // B_cached
+            alpha_out = cached['alpha_out'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
+            beta_out = cached['beta_out'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
+            alpha_act = cached['alpha_act'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
+            beta_act = cached['beta_act'].unsqueeze(1).expand(B_cached, T_per, -1).reshape(BT, -1).clone().to(dtype)
+            # SAFETY: if sync accumulators are non-finite, fall back to fresh seed.
+            # NaN/Inf in alpha/beta would propagate through cross-attention queries
+            # and corrupt all downstream computation irreversibly.
+            if not (alpha_out.isfinite().all() and beta_out.isfinite().all() and
+                    alpha_act.isfinite().all() and beta_act.isfinite().all()):
+                cached = None  # fall through to fresh seed below
+            else:
+                # INVARIANT: beta > 0 everywhere (normalizer in alpha/sqrt(beta)).
+                # beta is a sum of positive terms (dopamine in [0.5,1.0], decay in [0,1]).
+                # beta < eps indicates corruption — not a recoverable state.
+                eps = 1e-6
+                if not ((beta_out > eps).all() and (beta_act > eps).all()):
+                    cached = None  # fall through to fresh seed
+
+        if cached is None:
+            # No cache, or cache was poisoned — fresh start from learned parameters.
             state = self.start_state.to(dtype).unsqueeze(0).expand(BT, -1)
             trace = self.start_trace.to(dtype).unsqueeze(0).expand(BT, -1, -1).clone()  # (BT, D, M)
-            # Seed sync accumulators from start_state (paper: first tick uses raw pairwise product)
+            # Seed sync from start_state (paper: first tick uses raw pairwise product)
             left_out_init = state[:, self.synch_out_left]
             right_out_init = state[:, self.synch_out_right]
             pp_out = left_out_init * right_out_init
@@ -543,12 +627,30 @@ class CTMBlock(nn.Module):
         return out
 
 
+def _layer_uses_ctm(layer_idx, config):
+    """Determine if a layer should use CTM based on ctm_layers config.
+    "all" = every layer, "last" = last layer only, "last:N" = last N layers,
+    "0,5,11" = explicit layer indices."""
+    spec = config.ctm_layers
+    if spec == "all":
+        return True
+    if spec == "last":
+        return layer_idx == config.n_layer - 1
+    if spec.startswith("last:"):
+        n = int(spec.split(":")[1])
+        return layer_idx >= config.n_layer - n
+    # Explicit comma-separated indices
+    indices = [int(x.strip()) for x in spec.split(",")]
+    return layer_idx in indices
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = CTMBlock(config) if config.use_ctm else MLP(config)
+        use_ctm_here = config.use_ctm and _layer_uses_ctm(layer_idx, config)
+        self.mlp = CTMBlock(config) if use_ctm_here else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, dream=False, multi_tick=False, adaptive=False, ctm_cache=None):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
