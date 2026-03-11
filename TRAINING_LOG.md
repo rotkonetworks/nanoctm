@@ -28,6 +28,9 @@ a record of our model's journey from noise to something that thinks.
 - [CRITICAL: CTMCache breaks generation](#critical-finding-ctmcache-breaks-generation-2026-03-10)
 - [clean FFN d12 run](#clean-ffn-d12-run-2026-03-10)
 - [state of affairs — honest assessment](#state-of-affairs--an-honest-assessment-2026-03-10)
+- [migration to RTX 5090 BKK](#migration-to-rtx-5090-bkk--2026-03-11)
+- [K-ramp 1→2 breaks generation](#k-ramp-12-breaks-generation-critical-finding)
+- [the plan: how to succeed](#the-plan-how-to-succeed)
 - [step 9000→9500 — cache-aware, flat 0.3](#step-90009500--cache-aware-training-flat-03-2026-03-10)
 - [step 9000 (take 2) — adaptive ramp](#step-9000-take-2--adaptive-cache-aware-ramp-2026-03-10)
 - [ramp tuning and restart saga](#ramp-tuning-and-restart-saga-2026-03-11)
@@ -36,6 +39,9 @@ a record of our model's journey from noise to something that thinks.
 - [step 11000→11500 — K=3 bump, generation collapse](#step-1100011500--k3-bump-generation-collapse-2026-03-11)
 - [the breakthrough: single CTM architecture](#the-breakthrough-single-ctm-architecture-2026-03-11)
 - [single CTM: step 1500-2200, generation works, plasticity weak](#single-ctm-step-1500-2200-generation-works-plasticity-weak-2026-03-11)
+- [K=18 warm tick experiment](#k18-warm-tick-experiment--step-3400-3412-2026-03-11)
+- [why K-ramp is fundamentally broken](#why-k-ramp-is-fundamentally-broken--code-level-analysis-2026-03-11)
+- [pivot to Qwen backbone](#pivot-to-qwen-backbone--cutting-the-corner-2026-03-11)
 
 ## step 0 — launch (2026-03-07)
 
@@ -1562,3 +1568,344 @@ compact_memory is writing real updates, but the sync signal from 1 tick is noise
 
 logged in as hitchhooker, project: nanoctm. live monitoring at:
 https://wandb.ai/hitchhooker/nanoctm
+
+---
+
+## migration to RTX 5090 BKK — 2026-03-11
+
+H200 nuked before full checkpoint transfer. saved CTM step 2500 model weights (1.3GB,
+no optimizer) to local machine. uploaded to new RTX 5090 in Bangkok (10ms ping, 12MB/s
+upload — domestic Thai network vs 8KB/s to the old US server).
+
+resumed CTM training from step 2500 without optimizer state. optimizer momentum rebuilds
+in ~200 steps. torch.compile works on this machine (CUDA 12.8, SM 120). ~2.7s/step at
+K=1 with compile, ~3.8s/step at K=2.
+
+### K-ramp 1→2 breaks generation (critical finding)
+
+**this is the most important finding of the session.**
+
+plateau detection triggered K-ramp from 1→2 around step 3400. val bpb continued
+improving after the ramp (1.009 → 0.980). training looked healthy. but generation
+is completely broken:
+
+```
+step 3000 K=1: "life is so simple and fast that it can be completed without..."  ← coherent
+step 3400 K=1: "life in life Earth or space. It is also called life..."          ← coherent
+step 3500 K=2: ",, can can be viewed as a difficult one. The is of the..."       ← garbage
+step 4000 K=2: "well known. Can the one and is is the the more..."               ← garbage
+```
+
+val bpb at step 4000 is 0.980 — the best we've ever seen. but the model can't generate
+a single coherent sentence. **bpb improvement does not equal generation quality.**
+
+### diagnosis: why K-ramp breaks generation
+
+the K-ramp introduces a brand new tick (tick 1) with random 0.01-scale embeddings.
+during training, the model learns to use both ticks — tick selection at step 4000 is
+roughly 46%/54%, so both ticks matter. but:
+
+1. **tick 1 starts random.** its contribution through cross-attention, synapse, and
+   NLM is essentially noise. the model is learning to route through this noise.
+
+2. **val bpb measures teacher-forced next-token prediction.** the model sees the correct
+   previous tokens and predicts the next one. it can get good bpb by learning to use
+   tick 0 (the pretrained one) for most tokens and tick 1 for easy completions. but in
+   autoregressive generation, errors compound — tick 1's noisy contributions cascade.
+
+3. **scheduled sampling should fix this** — we have it at 10%. but 10% may not be enough.
+   the model needs to practice generating with its own mistakes at K=2, not just see
+   teacher-forced sequences.
+
+4. **optimizer cold-start may contribute.** we resumed without optimizer state, so
+   momentum for all parameters was zero. the first ~200 steps after resume were
+   effectively random walk. K-ramp happened at step 3400 (900 steps after resume),
+   so optimizer should have been warm by then. but the combination of cold optimizer
+   + K-ramp within the same run is suspect.
+
+### also found: checkpoint meta doesn't save current K
+
+`model_config_kwargs` was set once at init and never updated after K-ramp. every
+checkpoint after K-ramp saved `ctm_iterations=1` in meta even though the model was
+running K=2. the checkpoint loader detects the mismatch from tick_embed shape and
+fixes it, but this is fragile. fixed: `ramp_k()` now updates `model_config_kwargs`.
+
+### plasticity at K=2: mechanism works, output still garbage
+
+compact_memory() runs correctly — 91.9% of params changed, novelty gating at 50%,
+c_proj weight change 0.62% at lr=1e-4. but since the model can't generate coherent
+text at K=2, recall tests are meaningless. **plasticity can't be tested until
+generation works.**
+
+aggressive compaction (lr=1e-3, 5 rounds) destroyed the model further — c_proj
+changed 75.6%, outputs became dots and commas. clearly too aggressive for a model
+that's already struggling.
+
+## the plan: how to succeed
+
+### option A: fix K-ramp (best path)
+
+the K=1 model generates well. the problem is specifically the K-ramp transition.
+
+1. **increase scheduled sampling.** at K-ramp time, temporarily boost scheduled
+   sampling from 10% to 50%. the model needs heavy exposure to its own K=2 outputs
+   during training. after generation stabilizes (test every 100 steps), reduce back
+   to 10-20%.
+
+2. **gradual tick mixing.** instead of adding tick 1 at full strength, scale its
+   contribution from 0→1 over 500 steps. the model slowly learns to incorporate
+   the new tick without disruption. this requires modifying CTMBlock to support
+   a tick_weight schedule.
+
+3. **warm-start tick 1.** instead of random init for the new tick_embed, initialize
+   it as a perturbation of tick 0: `tick_1 = tick_0 + 0.01 * randn`. the new tick
+   starts as a near-copy of the working tick, then differentiates through training.
+
+4. **eval with generation, not just bpb.** add a generation quality check every N
+   steps (generate a few sentences, compute perplexity of the generated text using
+   the model itself, or just log samples). bpb alone is misleading.
+
+### option B: stay at K=1, test plasticity differently
+
+if K-ramp keeps breaking generation, stay at K=1 and try:
+
+- **online learning** (Session with online_lr > 0): gradient-based learning from
+  conversation, doesn't need sync statistics at all. this is phase 4 in our roadmap.
+- **chunked BPTT** first (phase 2): teach the model what persistent state means
+  before trying to accumulate sync patterns.
+
+### option C: skip K-ramp entirely, train at target K from start
+
+train a fresh model at K=5 or K=8 from the beginning (with warm-start from FFN).
+no ramp, no transition — the model learns all ticks together. slower training but
+avoids the ramp problem entirely.
+
+### recommended path
+
+**option A, approach 3 (warm-start tick)** — resume from step 3400 (K=1, good
+generation), ramp to K=2 with tick_1 initialized from tick_0 + noise, high
+scheduled sampling. test generation after 100 steps. if coherent, continue.
+if not, fall back to option C.
+
+## K=18 warm tick experiment — step 3400-3412 (2026-03-11)
+
+tried plan A3 aggressively: jumped straight from K=1 to K=18 with warm tick init
+(all ticks initialized as tick_0 + 0.01*randn). 50% scheduled sampling. BKK 5090.
+
+### results after 12 steps
+
+- **loss dropping**: 3.63 → 3.33 (good sign, model is learning)
+- **tick differentiation happening**: ticks 0-11 loss ~3.58, ticks 16-17 loss 5.2/7.15
+- **certainty diverging**: ticks 0-11 cert ~0.72, tick 17 cert 0.24
+- **dream converged**: K 18→2 (only 2 ticks useful for convergence)
+- **generation at step 3400: GARBAGE** — "capital of France is the Vriavhever"
+
+### diagnosis
+
+the warm tick init prevents immediate training collapse (loss does drop), but
+generation is still broken. the backbone has only 3400 steps of FFN training —
+it doesn't know language well enough to support 18 thinking iterations. the CTM
+layer is trying to learn language modeling AND tick differentiation simultaneously.
+
+the later ticks (16-17) are actively diverging — their loss is INCREASING while
+early ticks improve. this suggests the model is learning to ignore later ticks
+(certainty 0.24) but they still contribute noise during autoregressive generation.
+
+### revised plan: strong FFN backbone first
+
+the right approach is probably:
+
+1. **train FFN for 50-100k steps** — solid backbone that knows language (bpb ~0.85)
+2. **replace layer 11 FFN with CTM at high K** — warm-start from FFN weights
+3. the CTM only needs to learn "how to think" not "what words are"
+
+economics on 5090 (pure FFN, no CTM overhead):
+- ~500-800ms/step, 100k steps ≈ 14-22 hours
+- FFN bpb 0.938 at 5k steps, probably ~0.85 at 100k
+
+economics on H100 80GB (when we get one):
+- K=32+ easily fits in memory
+- ~200ms/step FFN, 100k = 5.5 hours
+- then CTM at K=32 with strong backbone
+
+**key insight**: the foundation must be solid before you build the thinking layer.
+we were trying to teach a toddler calculus — need to teach it language first.
+
+## why K-ramp is fundamentally broken — code-level analysis (2026-03-11)
+
+after three separate attempts at K-ramp (K=1→2, K=1→5, K=1→18), all producing
+garbage generation despite improving bpb, we traced the root cause to the sync
+accumulator math in `CTMBlock.forward()`.
+
+### the mechanism
+
+the CTM output is NOT selected from one tick. it's an exponentially-weighted
+accumulation across ALL ticks:
+
+```python
+# each tick k updates the sync accumulators (lines 572-584):
+alpha_out = r_out * alpha_out + pp_out   # exponential moving average
+beta_out  = r_out * beta_out  + dopamine
+
+# final output after all K ticks (line 597):
+synch = alpha_out / sqrt(beta_out)
+out = c_proj(synch)
+```
+
+`alpha_out` after K=1 tick is a COMPLETELY DIFFERENT VALUE than after K=18 ticks,
+even with identical tick embeddings. the decay `r_out` down-weights earlier ticks,
+later ticks dominate. `c_proj` was trained to map K=1's sync distribution to good
+logits. K=18's sync distribution is a different animal.
+
+this is why:
+- **bpb improves**: the multi-tick loss (argmin over ticks) cherry-picks the best
+  tick per token during teacher-forced training. more ticks = more chances to get
+  lucky. but the ACTUAL output uses the accumulated sync, not the best tick.
+- **generation collapses**: during autoregressive generation, the model uses its
+  own outputs. the shifted sync distribution produces slightly wrong logits →
+  slightly wrong tokens → next step's sync is even more wrong → cascade.
+
+### it's not a bug, it's the math
+
+the sync accumulator is a sum, not a mean. adding more terms changes the output.
+there's no code fix that would make K-ramp "just work" without one of:
+
+1. **K-normalization**: divide sync by K so output is mean, not sum. untested,
+   might kill the model's ability to use different amounts of thinking per token.
+2. **train at target K from step 0**: no transition, no distribution shift. this
+   is the correct path.
+3. **freeze-and-thaw**: after K-ramp, freeze everything except tick_embed and
+   c_proj for N steps so the output projection relearns the new sync distribution.
+   untested but theoretically sound.
+
+### mistakes we made (honest accounting)
+
+1. **tried K-ramp 3 times** before understanding why it fails. should have read
+   the sync accumulator math after the first failure instead of blaming tick init.
+
+2. **trusted bpb as quality signal**. bpb improved with higher K because multi-tick
+   loss is an optimistic metric (argmin over ticks). generation quality is the real
+   test, and we didn't check it early enough.
+
+3. **warm tick init was a red herring**. it helps training stability (loss drops
+   faster) but doesn't solve the fundamental sync distribution shift. we spent time
+   implementing and debugging it when the real issue was architectural.
+
+4. **tried to ramp from weak backbone**. with only 3400 FFN steps, the backbone
+   barely knows language. mounting CTM on it means the CTM has to learn language
+   AND thinking simultaneously — too much for one module.
+
+5. **didn't study the paper's training protocol carefully enough**. the CTM paper
+   trains at fixed K throughout. K-ramp was our invention, and it doesn't work
+   because the sync accumulator isn't K-invariant.
+
+### the real path forward
+
+- train FFN backbone for 50-100k steps (bpb ~0.85)
+- mount CTM at target K from the first CTM step (K=18 on 5090, K=32 on H100)
+- never change K during training
+- always validate with generation quality, not just bpb
+
+## pivot to Qwen backbone — cutting the corner (2026-03-11)
+
+### the problem we're trying to solve
+
+training our own FFN backbone to bpb ~0.85 takes 100k steps (~13 hours on 5090).
+that's 13 hours before we can even *start* working on plasticity — the actual goal.
+and our d12 backbone (768-dim, 12 layers, 469M params) trained on climbmix is
+a toy compared to what's out there. we'd be mounting CTM on a mediocre language model.
+
+### the insight
+
+Qwen2.5-0.5B exists. 24 layers, 896-dim, 14 attention heads, 151k vocab. trained on
+18 trillion tokens by a professional lab. it already knows language better than our
+d12 FFN ever will at 100k steps. why train a backbone when someone already made a
+great one?
+
+the CTM paper mounts one CTM on top of a backbone anyway. our single-CTM architecture
+(the breakthrough from earlier today) already proved that only the last layer needs
+to be CTM. so: freeze Qwen, replace its last MLP with our CTMBlock, train only the
+CTM parameters.
+
+### what we built
+
+`nanochat/qwen_backbone.py` — QwenBackboneGPT wrapper:
+
+- loads Qwen2.5-0.5B via HuggingFace, freezes all 481M backbone params
+- replaces layer 23's MLP with our CTMBlock (52M trainable params)
+- manages its own HF DynamicCache for KV (our KVCache is Flash Attention style)
+- forward pass iterates all 24 layers, intercepting layer 23 for CTM
+- compatible with Engine for generation, dream() for diagnostics
+- multi-tick loss, CTM-only checkpointing
+
+QwenTokenizer wraps HF's tokenizer with our nanochat interface.
+
+### test results on RTX 5090
+
+```
+Total params: 533,080,944
+Trainable (CTM): 52,122,608 (9.8%)
+Frozen (backbone): 480,958,336 (90.2%)
+
+Forward pass: OK (loss 5.22 — untrained CTM, expected)
+Generation: coherent Qwen output (CTM is no-op with zero-init c_proj)
+CTM convergence: layer 23 converges in 4 ticks (delta=0.002)
+Gradient flow: c_proj gets grads, backbone frozen
+```
+
+generation samples with untrained CTM (backbone doing all the work):
+- "The capital of France is" → "A. Paris B. Lyon C. Bordeaux D. Marseille"
+- "Once upon a time" → "there was a old... but now there is a new..."
+- "The meaning of life is" → "the question that humanity has been pondering..."
+
+### what led us here — the K-ramp saga
+
+the road to Qwen was paved with hard lessons. we spent days believing K (thinking
+iterations) was adaptable — that we could start at K=1 and ramp up as the model
+learned. every K change broke generation. every time. the sync accumulator normalizes
+by sqrt(beta), so output distribution shifts when K changes. we tried K=1→2, K=2→3,
+K=1→3→5, K=1→18 with warm ticks. all failed the same way: bpb looked fine (argmin
+over ticks is optimistic) but generation collapsed.
+
+the remarkable thing: the model kept recovering. given enough compute after each
+K-change, it would claw back to coherent generation. but this was on the 12-layer
+all-CTM architecture — our other big mistake. 12 CTM layers meant 11 untrained CTMs
+corrupting signal before layer 11 could think. 27x slower (21s vs 780ms/step).
+we were burning compute recovering from self-inflicted wounds on an architecture
+that was fundamentally wrong.
+
+once we discovered single-CTM (one CTMBlock on the last layer, matching the paper),
+everything got faster but K-ramp still broke. that's when we finally read the math
+and understood: K must be fixed from the start of CTM training, period. which means
+you need a strong backbone first. which means either train FFN for 13 hours... or
+just use Qwen.
+
+### why this is the right move
+
+1. **skip 13 hours of FFN training** — backbone is already world-class
+2. **10x more data behind the backbone** — 18T tokens vs our ~2B token budget
+3. **focus on what matters** — plasticity is the goal, not language modeling
+4. **still our architecture** — CTMBlock is unchanged, same sync, same synapses
+5. **can always go back** — FFN d12 checkpoint at step 10k saved locally
+
+### what we're giving up
+
+- full control over the backbone (can't unfreeze without OOM)
+- our custom tokenizer (switched to Qwen's 151k BPE)
+- reproducibility on tiny GPUs (need ~3GB VRAM minimum)
+- the satisfaction of training from scratch
+
+### risks
+
+- CTMBlock was designed for 768-dim, now running at 896-dim. should be fine
+  (it's parameterized) but untested at scale
+- HF DynamicCache vs our KVCache — different code paths for generation
+- Qwen's attention uses GQA (14 Q heads, 2 KV heads) — our CTM doesn't
+  touch attention so this shouldn't matter
+
+### FFN d12 backup
+
+FFN 100k training ran to step ~10.9k before we stopped it. checkpoint at step 10k
+saved locally. can resume anytime if Qwen approach doesn't pan out.
+
+next: write training script integration and start CTM training on the 5090.

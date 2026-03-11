@@ -79,6 +79,7 @@ parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisa
 parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension (-1 = n_synch // 4, scales with model)")
 parser.add_argument("--ctm-synapse-depth", type=int, default=32, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16, we use 32.")
 parser.add_argument("--ctm-layers", type=str, default="all", help="which layers get CTM: 'all', 'last', 'last:N', or '0,5,11'")
+parser.add_argument("--ctm-adaptive-k", action="store_true", help="use mean sync normalization (alpha/beta) instead of sqrt (alpha/sqrt(beta)). K-invariant but loses amplification. NOT RECOMMENDED unless you need K-ramp.")
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 parser.add_argument("--freeze-non-ctm", action="store_true", help="freeze attention+embeddings, only train CTM blocks (Phase 2 fine-tuning)")
 parser.add_argument("--bptt-chunks", type=int, default=1, help="Phase 3: split sequences into N chunks for truncated BPTT with CTM state carry-over (1 = disabled)")
@@ -181,6 +182,7 @@ def build_model_meta(depth):
         ctm_memory_length=args.ctm_memory_length, ctm_n_synch=ctm_n_synch,
         ctm_memory_hidden=args.ctm_memory_hidden, ctm_synapse_depth=args.ctm_synapse_depth,
         ctm_layers=args.ctm_layers,
+        ctm_adaptive_k=args.ctm_adaptive_k,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -264,9 +266,14 @@ if resuming:
                 print0(f"Resizing {key} from K={old_K} to K={new_K}")
                 old_embed = model_data[key]
                 if new_K > old_K:
-                    # Growing: preserve old ticks, init new ones with noise
+                    # Growing: preserve old ticks, warm-start new ones from tick 0 + noise
+                    # (random init causes generation collapse — new ticks inject noise
+                    # that cascades during autoregressive generation)
                     new_embed = torch.randn(new_K, *old_embed.shape[1:], dtype=old_embed.dtype, device=old_embed.device) * 0.01
                     new_embed[:old_K] = old_embed
+                    for t in range(old_K, new_K):
+                        new_embed[t] = old_embed[0] + new_embed[t]  # tick_0 + small noise
+                    print0(f"  Warm-started ticks {old_K}-{new_K-1} from tick 0 + noise")
                 else:
                     # Shrinking: keep first new_K ticks
                     new_embed = old_embed[:new_K].clone()
@@ -552,6 +559,12 @@ def ramp_k(new_K, reason=""):
             old_embed = block.mlp.tick_embed.data
             new_embed = torch.randn(new_K, *old_embed.shape[1:], dtype=old_embed.dtype, device=old_embed.device) * 0.01
             new_embed[:old_K] = old_embed
+            # Warm-start new ticks from tick 0 + noise (prevents generation collapse)
+            # Random init causes new ticks to inject noise → autoregressive error cascade
+            if old_K >= 1:
+                for t in range(old_K, new_K):
+                    new_embed[t] = old_embed[0] + new_embed[t]  # tick_0 + 0.01*randn
+                print0(f"  Warm-started ticks {old_K}-{new_K-1} from tick 0 + noise")
             # Replace the Parameter entirely (not just .data) to avoid shape issues
             block.mlp.tick_embed = nn.Parameter(new_embed)
             block.mlp.K = new_K
@@ -576,6 +589,8 @@ def ramp_k(new_K, reason=""):
         model = orig_model
 
     current_K = new_K
+    # Update model_config_kwargs so checkpoints save the correct K
+    model_config_kwargs["ctm_iterations"] = new_K
     print0(f"K ramp complete. Training continues with K={new_K}")
     print0(f"  WARNING: higher K uses more VRAM. If OOM occurs, restart with lower --device-batch-size")
     return True

@@ -54,6 +54,10 @@ class GPTConfig:
     ctm_n_attn_heads: int = 1     # cross-attention heads for data re-observation
     ctm_synapse_depth: int = 32   # U-NET synapse depth (half down, half up). Paper uses 16.
     ctm_layers: str = "all"       # which layers get CTM: "all", "last", "last:N", or "0,5,11"
+    ctm_adaptive_k: bool = False   # use mean normalization (alpha/beta) instead of sqrt (alpha/sqrt(beta)).
+                                   # makes output K-invariant so K can change mid-training or per-token.
+                                   # tradeoff: loses sqrt amplification (more ticks = louder signal).
+                                   # NOT RECOMMENDED unless you need K-ramp or adaptive stopping.
 
 
 def norm(x):
@@ -388,8 +392,17 @@ class CTMBlock(nn.Module):
         # Per-tick embedding: gives each iteration a unique signature so ticks diverge
         self.tick_embed = nn.Parameter(torch.empty(K, D))
 
+        # Sync normalization mode: sqrt (paper default) vs mean (K-invariant)
+        self.adaptive_k = config.ctm_adaptive_k
+
         # Output projection: S_out synchronisation -> residual stream
         self.c_proj = Linear(n_synch, D, bias=False)
+
+    def _sync_readout(self, alpha, beta):
+        """Normalize sync accumulator. sqrt (paper) or mean (K-invariant)."""
+        if self.adaptive_k:
+            return alpha / beta
+        return alpha / torch.sqrt(beta)
 
     def _tick_core(self, alpha_act, beta_act, x, attn_k, attn_v, state, trace, tick_emb):
         """One iteration of CTM thinking — factored out for gradient checkpointing."""
@@ -397,7 +410,7 @@ class CTMBlock(nn.Module):
         BT = B * T
         H, HD = self.n_attn_heads, self.attn_head_dim
 
-        synch_act = (alpha_act / torch.sqrt(beta_act)).to(x.dtype)
+        synch_act = self._sync_readout(alpha_act, beta_act).to(x.dtype)
         attn_q = norm(self.attn_q_proj(synch_act).view(B, T, H, HD))
         obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
         obs = obs.reshape(BT, D)
@@ -542,7 +555,7 @@ class CTMBlock(nn.Module):
                 )
             else:
                 # Cross-attention: use S_action to generate query, re-observe input
-                synch_act = (alpha_act / torch.sqrt(beta_act)).to(x.dtype)
+                synch_act = self._sync_readout(alpha_act, beta_act).to(x.dtype)
                 attn_q = norm(self.attn_q_proj(synch_act).view(B, T, H, HD))  # QK norm
                 obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
                 obs = obs.reshape(BT, D)
@@ -585,7 +598,7 @@ class CTMBlock(nn.Module):
 
             # Multi-tick: save readout at each k for auxiliary loss
             if multi_tick:
-                synch_k = alpha_out / torch.sqrt(beta_out)
+                synch_k = self._sync_readout(alpha_out, beta_out)
                 tick_outputs.append(self.c_proj(synch_k).reshape(B, T, D))
 
             # Adaptive: stop at confidence peak
@@ -594,7 +607,7 @@ class CTMBlock(nn.Module):
                     break
 
         # Readout: S_out synchronisation -> output projection
-        synch = alpha_out / torch.sqrt(beta_out)
+        synch = self._sync_readout(alpha_out, beta_out)
         out = self.c_proj(synch).reshape(B, T, D)
 
         # ROADMAP (phase 5 - metacognitive tokens):
