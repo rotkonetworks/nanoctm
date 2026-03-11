@@ -44,8 +44,8 @@ def parse_args():
                         help="Path to CTM checkpoint (.pt)")
     parser.add_argument("--ctm-iterations", type=int, default=32)
     parser.add_argument("--log-dir", type=str, default="data/teaching_logs")
-    parser.add_argument("--compact-lr", type=float, default=3e-4)
-    parser.add_argument("--compact-steps", type=int, default=30)
+    parser.add_argument("--compact-lr", type=float, default=2e-4)
+    parser.add_argument("--compact-steps", type=int, default=25)
     parser.add_argument("--gen-tokens", type=int, default=60)
     parser.add_argument("--temperature", type=float, default=0.7)
     return parser.parse_args()
@@ -55,6 +55,7 @@ class TeachingSession:
     def __init__(self, args):
         self.args = args
         self.teaching_buffer = []
+        self.memory_replay = []  # previously compacted texts — replayed to prevent forgetting
         self.session_log = []
         self.compact_count = 0
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -138,9 +139,18 @@ class TeachingSession:
             print("  Teaching buffer empty. Use /teach first.")
             return
 
-        teaching_text = " ".join(self.teaching_buffer)
+        # Combine new teaching with replay of old memories (prevents forgetting)
+        new_text = " ".join(self.teaching_buffer)
+        if self.memory_replay:
+            replay_text = " ".join(self.memory_replay)
+            teaching_text = new_text + " " + replay_text
+            print(f"  Replaying {len(self.memory_replay)} old memories alongside new teaching")
+        else:
+            teaching_text = new_text
+
         tokens = self.tokenizer.encode(teaching_text)
-        print(f"  Compacting {len(tokens)} tokens ({len(self.teaching_buffer)} items)...")
+        print(f"  Compacting {len(tokens)} tokens ({len(self.teaching_buffer)} new + "
+              f"{len(self.memory_replay)} replay)...")
 
         teaching_ids = torch.tensor([tokens], dtype=torch.long, device=self.device)
         target_ids = teaching_ids.clone()
@@ -156,14 +166,21 @@ class TeachingSession:
         self.compact_count += 1
         self.model.eval()
 
+        # Add new teaching to replay buffer for future compactions
+        self.memory_replay.extend(self.teaching_buffer)
+
         print(f"  Loss: {result['losses'][0]:.3f} -> {result['losses'][-1]:.3f}")
         print(f"  Delta: {result.get('total_delta', 0):.4f}")
         print(f"  Dopamine: mean={result.get('dopamine_mean', 0):.3f}")
         print(f"  Compactions so far: {self.compact_count}")
+        print(f"  Replay buffer: {len(self.memory_replay)} items")
 
         self.log_event("compact", {
-            "teaching_text": teaching_text,
+            "teaching_text": new_text,
+            "replay_text": " ".join(self.memory_replay),
             "n_tokens": len(tokens),
+            "n_new": len(self.teaching_buffer),
+            "n_replay": len(self.memory_replay) - len(self.teaching_buffer),
             "loss_start": result["losses"][0],
             "loss_end": result["losses"][-1],
             "total_delta": result.get("total_delta", 0),
