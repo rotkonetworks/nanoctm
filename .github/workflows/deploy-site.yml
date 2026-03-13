@@ -1,0 +1,49 @@
+name: Deploy ctm.rotko.net
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'ctm-site/**'
+      - '.github/workflows/deploy-site.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          cd ctm-site
+          docker build -t ctm-site .
+          docker save ctm-site | gzip > /tmp/ctm-site.tar.gz
+
+      - name: Deploy to server
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          JMAP_PASS: ${{ secrets.JMAP_PASS }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H www.rotko.net >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Upload image
+          rsync -avz -e "ssh -i ~/.ssh/id_deploy" /tmp/ctm-site.tar.gz deploy@www.rotko.net:~/ctm-site.tar.gz
+
+          # Load and restart
+          ssh -i ~/.ssh/id_deploy deploy@www.rotko.net "
+            sudo -H podman load < ~/ctm-site.tar.gz
+            sudo -H podman stop ctm-site 2>/dev/null || true
+            sudo -H podman rm ctm-site 2>/dev/null || true
+            sudo -H podman run -d --name ctm-site \
+              -p 127.0.0.1:8097:80 \
+              -e JMAP_USER=hq@rotko.net \
+              -e JMAP_PASS=$JMAP_PASS \
+              -e BIND=127.0.0.1 \
+              --restart unless-stopped \
+              localhost/ctm-site:latest
+            rm ~/ctm-site.tar.gz
+          "
