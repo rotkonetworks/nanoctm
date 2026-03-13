@@ -8,6 +8,8 @@ a record of our model's journey from noise to something that thinks.
 - [step 500 — first checkpoint](#step-500--first-checkpoint-2026-03-08)
 - [step 1000 — it knows words](#step-1000--it-knows-words-2026-03-08)
 - [migration — 4x H100 attempt](#migration--4x-h100-attempt-2026-03-09)
+- [step 11000 — plasticity fails on qwen3, c_proj rank bottleneck](#step-11000--plasticity-fails-on-qwen3-c_proj-rank-bottleneck-2026-03-13)
+- [step 12000 — plasticity still fails, two-CTM architecture](#step-12000--plasticity-still-fails-two-ctm-architecture-2026-03-13)
 - [migration — H200 NVL 140GB](#migration--h200-nvl-140gb-2026-03-09)
 - [step 1150+ — current](#step-1150--current-2026-03-09)
 - [step 1500 — K=3 → K=5 switch](#step-1500--k3--k5-switch-2026-03-09)
@@ -43,6 +45,8 @@ a record of our model's journey from noise to something that thinks.
 - [why K-ramp is fundamentally broken](#why-k-ramp-is-fundamentally-broken--code-level-analysis-2026-03-11)
 - [pivot to Qwen backbone](#pivot-to-qwen-backbone--cutting-the-corner-2026-03-11)
 - [three-factor neuroplasticity — compact_memory()](#three-factor-neuroplasticity--compact_memory-2026-03-12)
+- [Qwen3-0.6B + CTM K=32 full-featured training](#qwen3-06b--ctm-k32-full-featured-training-2026-03-12)
+- [ctm.rotko.net — live site and debugger](#ctmrotkonet--live-site-and-debugger-2026-03-12)
 
 ## step 0 — launch (2026-03-07)
 
@@ -2068,3 +2072,329 @@ weight changes. with only 1000 base training steps, this is promising.
 - multi-fact teaching (can it learn multiple facts without interference?)
 - forgetting curves (does recall degrade over continued training?)
 - conversational teaching (dialog format, not raw text repetition)
+
+## Qwen3-0.6B + CTM K=32 full-featured training (2026-03-12)
+
+### why the restart
+
+the previous Qwen2.5-0.5B run (5k steps, `qwen25_ctm_k32_cont`) was wasted:
+`--cache-aware-ratio` defaulted to 0.0. five thousand steps of training and the
+model never once saw its own CTMCache. every feature we built for memory —
+episodic recall, cache warm-starting, sleep consolidation — was dead code.
+
+also discovered that multi-tick certainty loss OOMed on Qwen's 151k vocab.
+the CTM paper (arXiv 2505.05522) computes loss at ALL K ticks with full grad —
+fine for CIFAR (V=10), catastrophic for language (V=151,936). each tick's logits
+are [4096, 151936] = 2.4GB. with K=32 in the computation graph: ~77GB.
+
+### architecture
+
+- **backbone**: Qwen3-0.6B (28 layers, D=1024, 742M frozen params)
+- **CTM**: single block at layer 27 (67.8M trainable params)
+- **total**: 810M params, 8.4% trainable
+- **K=32** thinking iterations per token
+
+### what's enabled (all from step 0)
+
+1. **cache-aware training** (`--cache-aware-ratio 0.30`): 30% of steps split
+   sequence in half, forward first half to build CTMCache (no grad), train on
+   second half WITH cache. the model learns to use its own memory.
+
+2. **multi-tick certainty loss** (VRAM-efficient): per-token tick selection,
+   loss = best-tick-loss. early ticks (0 to K-5) detached to limit VRAM —
+   truncated BPTT through last 4 ticks only. diagnostics computed for all 32.
+   loss proxy for certainty (avoids V-sized softmax per tick).
+
+3. **sleep consolidation** (every 50 steps): gradient-free Hebbian update on
+   replay buffer. certainty × accuracy → weight scaling. no backward pass,
+   zero VRAM overhead.
+
+4. **SFT data mixing** (`--sft-ratio 0.05`): 5% of steps use custom SFT data
+   (820 texts: identity, memory conversations, values, blog posts, neuroscience).
+
+5. **per-tick wandb diagnostics** (every step): loss and selection percentage
+   for all 32 ticks logged to wandb. certainty computed for final tick only.
+
+6. **replay buffer** (16 batches on CPU): stores recent (x, y) pairs for
+   consolidation sampling.
+
+### the multi-tick OOM saga
+
+three crashes before it ran:
+
+1. **OOM in `_multi_tick_loss`**: softmax over V=151k at each of 32 ticks.
+   fix: two-pass approach — pass 1 (no_grad) finds best ticks, pass 2 (with
+   grad) only recomputes selected ticks.
+
+2. **OOM in CTM forward**: even with two-pass loss, storing 32 `tick_outputs`
+   in the computation graph retained activation memory for all ticks.
+   fix: detach early tick outputs (`tick_out.detach()` for k < K-4). only
+   last 4 ticks retain gradient — truncated BPTT.
+
+3. **"element 0 does not require grad"**: when ALL tokens selected detached
+   ticks, the loss had no grad_fn. fix: always blend in last-tick loss as
+   anchor. if tokens prefer early ticks, last-tick loss provides gradient;
+   the blend weight tracks what fraction of tokens chose grad-enabled ticks.
+
+### early results (step 0-296)
+
+```
+step    loss    note
+0       2.94    fresh CTM on frozen Qwen3 backbone
+50      3.26    first consolidation (loss=3.54, cert=85%)
+100     3.23    dream: L27 converged, delta=0.023
+                ticks: t0:17.7%, t18:8.8%, t17:8.3% — bimodal
+150     3.03    consolidation #3 (loss=2.91, cert=79%)
+200     2.96    dream: L27 NOT converged, delta=0.112
+                ticks: t0:13.9%, t3:9.4%, t2:7.2% — shifting early
+296     2.91    loss steadily dropping, lr reaching 1e-3
+```
+
+speed: ~2.2s/step average (1.7s normal, 2.6s cache-aware). ~1,550 tok/sec.
+VRAM: 24.6GB / 32.6GB (75%). ETA: ~33 hours to 50k steps.
+
+### tick distribution — early observations
+
+bimodal pattern emerging:
+- **tick 0** dominates (14-18%): immediate/reflexive responses. the backbone
+  already knows the answer, CTM just passes it through.
+- **ticks 16-19** cluster (5-9%): deep thinking tokens. these are the ones
+  where iterative refinement helps.
+- **middle ticks** (5-15): low selection (~2-4%). model either knows immediately
+  or needs many iterations — rarely benefits from moderate thinking.
+
+this matches intuition: easy tokens → tick 0, hard tokens → late ticks.
+as training progresses, expect the late-tick cluster to strengthen and possibly
+shift later as the model learns to use more iterations productively.
+
+### wandb
+
+run: `qwen3_ctm_k32_full`
+link: https://wandb.ai/hitchhooker/nanoctm
+
+per-tick graphs should show:
+- `ctm/tick_{k}/loss` for k=0..31
+- `ctm/tick_{k}/selected_pct` for k=0..31
+- `ctm/certainty/mean` and `ctm/certainty/std`
+- `ctm/loss/argmin` and `ctm/loss/last_tick`
+- `ctm/loss/grad_tick_frac` — how often tokens pick grad-enabled ticks
+
+### the thesis
+
+CTM + neuroplasticity may be the path to recursive self-improvement at small
+scale. the architecture has three properties no frozen LLM has:
+
+1. **iterative refinement**: K=32 ticks = 32x effective depth with shared
+   weights. the model allocates compute adaptively per token.
+2. **self-observation**: sync readout lets the model see its own processing
+   state. tick selection = metacognition (knowing when you know).
+3. **weight self-modification**: compact_memory() writes experience into
+   weights. consolidation reinforces what works. the model rewires itself.
+
+a 0.5B model that thinks for 32 steps and rewires from experience may
+outperform a 16B model that does one pass and forgets everything.
+
+next milestones:
+- step 500: first checkpoint, test compact_memory() on Qwen3
+- step 2000: test memory pipeline (teach → compact → restart → recall)
+- step 5000: Claude-guided evaluation pass (generate → evaluate → compact)
+- step 10000: compare to base Qwen3-0.6B on reasoning tasks
+
+---
+
+## ctm.rotko.net — live site and debugger (2026-03-12)
+
+the project now has a public face: **https://ctm.rotko.net**
+
+### what's live
+
+three pages:
+
+1. **index** — hero, architecture overview, and a live 3D CTM debugger built in
+   Rust/egui/WASM. the debugger replays real training data from wandb — 2,250
+   snapshots from the `qwen3_ctm_k32_full` run. you can watch tick weight
+   distributions, loss curves, learning rate, and grad-tick fraction evolve in
+   real time. **[see the debugger →](https://ctm.rotko.net/#debugger)**
+
+2. **research** — technical writeup of the CTM architecture. covers:
+   - why context window hacks (RAG, summarization, MemGPT) are not memory
+   - backbone-agnostic CTM integration (any open-source transformer)
+   - three-factor neuroplasticity (wake/encode/sleep)
+   - recursive self-improvement: agents editing their own training code vs
+     actual neuroplastic weight modification (with an honest AI safety warning)
+   - CTM internals: SynapseUNET, SuperLinear NLMs, dual sync, CTMCache
+
+3. **invest** — if people want to contribute or back the work, there's a way
+   to reach out. not a pitch deck, just a door.
+
+### infrastructure
+
+- **stack**: nginx (static) + python stdlib (JMAP contact API), single container
+- **mail**: contact form → Stalwart JMAP
+- **deploy**: GitHub Actions → docker build → podman
+- **routing**: HAProxy + Let's Encrypt SSL
+
+### debugger data
+
+the WASM debugger at [ctm.rotko.net/#debugger](https://ctm.rotko.net/#debugger)
+loads `ticks.json` — 2,250 real training snapshots pulled from wandb. each
+snapshot contains per-tick weight distributions across all 32 ticks: how the
+model distributes its "thinking budget" across iterations.
+
+overlays show:
+- **bpb** (bits per byte) — the core loss metric
+- **lr** (learning rate) — in scientific notation
+- **grad%** — fraction of tokens selecting gradient-enabled ticks
+
+this is live training data, not synthetic. as training progresses, we'll pull
+fresh snapshots to show how the tick distribution evolves — early ticks for
+reflexive answers, late ticks for deep thinking.
+
+### step 1000 status
+
+at the time of launch, Qwen3 + CTM K=32 is at step 1000:
+- loss: 3.09, still early
+- generation: not coherent yet ("uby Template:Usa The water boiling point...")
+- convergence: delta=0.16, CTM hasn't found stable tick patterns
+- GPU: 98% utilization, 25.8GB/32.6GB VRAM, 64°C on RTX 5090
+- speed: 3.6s/step, 2,253 tok/sec
+- ETA to 10k: ~9.3 hours
+
+the site will evolve with the model. when plasticity works on Qwen3, the
+research page gets updated. when we have a model worth talking to, we add
+live inference. the site is the lab notebook made public.
+
+---
+
+## step 11000 — plasticity fails on qwen3, c_proj rank bottleneck (2026-03-13)
+
+### the test
+
+stopped training at step 11,000 (loss ~2.1, val bpb 4.31) to run a full test suite:
+
+1. **generation quality**: good. backbone knowledge intact — fibonacci correct, security/crypto
+   answers coherent. still textbook-ish (backbone talking, CTM barely steering).
+2. **SFT absorption**: zero. "sync accumulators" returns SQL nonsense. "how does your CTM
+   contribute" → collapse loops. at 5% ratio and 11k steps, model has barely seen SFT.
+3. **session/multi-turn**: broken. hallucinations ("Ginny"), collapse. KVCache works but
+   generation quality in conversation mode is rough.
+4. **plasticity**: **0/4 recall.** compact_memory ran, loss dropped 8.82→5.23, but nothing
+   stuck. "Rotko Networks is based in 2013" — hallucinating, not recalling.
+
+even remapping KNOWN facts (France→Bangkok) fails — produces repetition collapse, not recall.
+aggressive lr (1e-3) → "Networks Networks Networks Networks". the mechanism is broken.
+
+### the diagnosis: c_proj is rank 3
+
+deep analysis of CTM state revealed the smoking gun:
+
+| metric | qwen3 @ 11k | qwen2.5 (where it worked) |
+|--------|------------|---------------------------|
+| c_proj rank at 90% energy | **3** | 61 |
+| condition number | 55,351 | — |
+| top singular value | 54.84 | — |
+| 2nd singular value | 12.23 (4.5x smaller) | — |
+| CTM contribution ratio | 0.89 | 0.76 |
+
+the sync-to-residual projection collapsed into 3 effective dimensions. the CTM is active
+(0.89 contribution ratio) but routes everything through 3 "superhighway" dimensions. when
+compact_memory tries to write new facts, gradients flow along σ₁ (the dominant direction)
+and overwrite existing signal → repetition collapse.
+
+c_proj was zero-initialized and grew to rank 3 in 11k steps. training loss has no incentive
+to use more dimensions — the model can minimize next-token loss with just 3 directions.
+weight decay actively shrinks unused dimensions.
+
+### why qwen2.5 worked and qwen3 doesn't
+
+qwen2.5-0.5B: 24 layers, weaker backbone → CTM had to do more work across more dimensions.
+qwen3-0.6B: 28 layers, stronger backbone → CTM can be lazy, squeezes into rank-3 corridor.
+stronger backbone = narrower CTM contribution = worse plasticity.
+
+the 3D tick debugger visualization confirms this — a few dominant spikes in an otherwise
+flat sync landscape. the energy concentrates in a handful of neuron pairs.
+
+### the fix: spectral regularization
+
+added `--spectral-reg 0.1` to training. penalizes concentration of c_proj singular values:
+
+```
+concentration = σ_max² / ||W||_F²   (1.0 = rank-1, 1/min(m,n) = uniform)
+loss += spectral_reg * concentration
+```
+
+uses power iteration (3 mat-vec products) to approximate σ_max — cheap, differentiable,
+no full SVD needed. spectral metrics (rank90, rank99, concentration, condition number)
+logged to wandb every 50 steps.
+
+training restarted from step 11,000 with spectral reg. if rank90 doesn't expand past 5-6
+after a few thousand steps, next option is unfreezing last 2 backbone layers.
+
+### parallel: building our own observability
+
+added POST /api/ingest to ctm.rotko.net server.py. training script POSTs snapshots
+(tick data + spectral metrics) alongside wandb — our own telemetry pipeline feeding
+the 3D debugger in real-time. replaced Python API with Rust (axum + tokio) — 1.5MB
+static binary with WebSocket multicast for real-time streaming to frontend.
+
+## step 12000 — plasticity still fails, two-CTM architecture (2026-03-13)
+
+### the problem: single CTM can't penetrate frozen attention
+
+spectral reg successfully expanded c_proj rank from 3 → 150 in ~1k steps. rank is no
+longer the bottleneck. but plasticity STILL fails: 5 compact_memory configs tested at
+step 12k, all returned 0/4 recall. CTM contribution ratio = 0.37-0.43 (vs 0.76 on
+qwen2.5 where plasticity worked).
+
+the core issue: one CTM at layer 27 can change the output (proved by mode collapse at
+high lr) but can't TARGET specific tokens. it's like having a steering wheel that only
+turns hard left or hard right — you can crash, but you can't navigate. the signal from
+a single CTM block doesn't have enough leverage over 28 frozen attention layers.
+
+### aggressive compact results (all configs, step 12000)
+
+| config | lr | steps | recall | notes |
+|--------|------|-------|--------|-------|
+| standard | 3e-4 | 30 | 0/4 | loss drops, outputs garbage |
+| gentle | 1e-4 | 50 | 0/4 | too weak to imprint |
+| aggressive | 5e-4 | 40 | 0/4 | mode collapse |
+| very aggressive | 1e-3 | 20 | 0/4 | catastrophic forgetting |
+| c_proj only | 5e-4 | 60 | 0/4 | not enough params |
+
+### the hypothesis: two-CTM like split brain
+
+human cortex has two processing layers — the idea is CTM at layer 14 (mid-network)
+injects signal that 13 frozen attention layers then amplify and route before the second
+CTM at layer 27 makes the final adjustment. mid-layer CTM shapes the representation
+space; top-layer CTM fine-tunes the output.
+
+c_proj inits to zeros, so bolting a fresh CTM onto layer 14 is safe — zero output at
+init means no signal corruption to the trained layer-27 CTM.
+
+### implementation: multi-CTM QwenBackboneGPT
+
+generalized the architecture to support N CTM layers via `--ctm-layers "14,27"`:
+- `ctm_blocks` (ModuleDict) replaces single `ctm_block`
+- forward loop intercepts all CTM layers; multi-tick loss on last CTM only
+- checkpoint format: single-CTM saves flat dict (backward compat), multi-CTM saves keyed
+- resume handles mixed: loads existing layer-27 weights, fresh-inits new layer-14
+- all methods (dream, compact_memory, consolidate) operate across all blocks
+
+### VRAM reality check
+
+| config | batch | VRAM | speed |
+|--------|-------|------|-------|
+| 1-CTM K=32 | 2 | 16.1 GB | ~2.5s/step |
+| 2-CTM K=32 | 2 | OOM (>31 GB) | — |
+| 2-CTM K=32 | 1 (accum=2) | fits | ~5.5s/step |
+
+two CTMs at batch=2 OOM on 5090 32GB — multi-tick loss pass (K × vocab recomputation)
+is the bottleneck. batch=1 with grad_accum=2 fits. effective batch size same (4096 tokens),
+but 2x slower per step.
+
+training resumed from step 12000 with `--ctm-layers "14,27"` --device-batch-size 1.
+135M trainable params (2 × ~52M CTM blocks + overhead). wandb: qwen3_ctm_2layer_k32.
+
+key question: will the mid-layer CTM develop meaningful representations that the frozen
+attention layers can amplify? if contribution ratio rises above 0.5 within a few thousand
+steps, the two-CTM hypothesis is confirmed.
