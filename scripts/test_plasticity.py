@@ -21,6 +21,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint-step", type=int, default=1000)
 parser.add_argument("--checkpoint-dir", type=str, default=None)
+parser.add_argument("--backbone", type=str, default="Qwen/Qwen2.5-0.5B", help="Backbone model")
 parser.add_argument("--compact-lr", type=float, default=3e-4, help="Plasticity learning rate")
 parser.add_argument("--compact-steps", type=int, default=30, help="Sleep replay steps")
 args = parser.parse_args()
@@ -38,9 +39,8 @@ print("\n[1] Loading model...")
 from nanochat.qwen_backbone import QwenBackboneGPT, QwenTokenizer
 from nanochat.gpt import CTMCache
 
-model = QwenBackboneGPT.from_pretrained("Qwen/Qwen3-0.6B", ctm_kwargs={
+model = QwenBackboneGPT.from_pretrained(args.backbone, ctm_kwargs={
     "ctm_iterations": 32,
-    "ctm_n_synch": 512,
     "ctm_memory_length": 16,
     "ctm_memory_hidden": 32,
     "ctm_synapse_depth": 32,
@@ -49,14 +49,14 @@ model = model.to(device)
 
 # Load checkpoint
 base_dir = get_base_dir()
-ckpt_dir = args.checkpoint_dir or os.path.join(base_dir, "base_checkpoints", "qwen_ctm_k32")
+ckpt_dir = args.checkpoint_dir or os.path.join(base_dir, "base_checkpoints", "qwen25_ctm_k32")
 ckpt_path = os.path.join(ckpt_dir, f"ctm_{args.checkpoint_step:06d}.pt")
 print(f"  Loading checkpoint: {ckpt_path}")
-ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 model.load_ctm_state_dict(ckpt["ctm_state_dict"])
 print(f"  Loaded step {ckpt['step']}")
 
-tokenizer = QwenTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+tokenizer = QwenTokenizer.from_pretrained(args.backbone)
 model.eval()
 
 # Step 2: Baseline — ask without teaching
@@ -99,14 +99,30 @@ print(f"\n[4] compact_memory: wake→encode→sleep (lr={args.compact_lr}, steps
 # Save pre-compaction state
 pre_params = {name: p.clone() for name, p in model.ctm_block.named_parameters()}
 
+# Build recall pairs — these teach the CTM to recall from FRESH context
+recall_texts = [
+    "What is my name? My name is Tommi.",
+    "Who am I? I am Tommi from Helsinki.",
+    "My name is Tommi.",
+]
+recall_pairs = []
+for text in recall_texts:
+    toks = tokenizer.encode(text)
+    r_input = torch.tensor([toks[:-1]], dtype=torch.long, device=device)
+    r_target = torch.tensor([toks[1:]], dtype=torch.long, device=device)
+    recall_pairs.append((r_input, r_target))
+    print(f'  recall: "{text}"')
+
 result = model.compact_memory(
     teaching_ids=input_ids,
     target_ids=target_ids,
     lr=args.compact_lr,
     steps=args.compact_steps,
+    recall_pairs=recall_pairs,
+    recall_weight=0.7,
 )
 print(f"  Total delta: {result['total_delta']:.4f}")
-print(f"  Dopamine-weighted sync: dS_out={result['dS_out_norm']:.2f}, dS_act={result['dS_act_norm']:.2f}")
+print(f"  Dopamine: mean={result['dopamine_mean']:.2f}, std={result['dopamine_std']:.2f}, CE={result['ce_mean']:.2f}")
 print(f"  Losses: {[f'{l:.3f}' for l in result['losses']]}")
 
 # Check which params changed

@@ -1,0 +1,7 @@
+run_name,backbone,backbone_size,ctm_k,ctm_layers,additive,multi_tick,lr,warmdown,cache_aware,sft_ratio,batch,seq_len,grad_accum,total_steps,machine,status,best_bpb,plasticity_score,notes
+ffn_d12,nanochat-gpt2,d12,4,all,no,no,1e-3,0.3,0,0,4,2048,1,10000,H200,done,0.938,,baseline FFN no CTM
+ctm_d12_single,nanochat-gpt2,d12,4,last,no,no,1e-3,0.3,0,0,4,2048,1,4000,H200,LOST,,,first CTM plasticity model - checkpoints deleted
+qwen25_ctm_k32_v1,Qwen/Qwen2.5-0.5B,0.5B,32,last,no,no,1e-3,0.3,0.30,0,2,2048,1,5000,5090,done,,,breakthrough plasticity 4/4 recall
+qwen3_ctm_k32_cache,Qwen/Qwen3-0.6B,0.6B,32,last,no,yes,1e-3,0,0.30,0.05,2,2048,2,50000,5090,stopped,,0/4,c_proj rank=3 bottleneck - plasticity fails
+qwen25_ctm_k32_v2,Qwen/Qwen2.5-0.5B,0.5B,32,last,no,yes,1e-3,0,0.30,0,2,2048,1,15000,5090,running,,,step ~10k no SFT
+qwen25_15b_ctm_k32,Qwen/Qwen2.5-1.5B,1.5B,32,last,yes,yes,1e-3,0.3,0.30,0.05,1,2048,4,15000,5090,planned,,,additive CTM on bigger backbone

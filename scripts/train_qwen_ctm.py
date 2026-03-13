@@ -39,6 +39,7 @@ parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="NLM hidde
 parser.add_argument("--ctm-synapse-depth", type=int, default=32, help="U-NET synapse depth")
 parser.add_argument("--ctm-adaptive-k", action="store_true", help="use mean sync normalization (K-invariant)")
 parser.add_argument("--ctm-layers", type=str, default="last", help="which layers get CTM: 'last', '14,27', etc.")
+parser.add_argument("--additive", action="store_true", help="keep MLP on CTM layers (CTM adds on top, paper-style)")
 # Training
 parser.add_argument("--num-iterations", type=int, default=10000, help="total training steps")
 parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size")
@@ -146,13 +147,19 @@ if resuming:
         print0(f"  Fresh-initializing NEW CTM layers: {new_layers}")
         model.init_ctm_weights(only_layers=new_layers)
 
-    # Trained CTM layers → replacement (MLP removed)
+    # Trained CTM layers → replacement (MLP removed) unless --additive
     # New CTM layers → additive (frozen MLP kept alongside CTM)
-    model.set_replacement_layers(loaded_layers)
+    if not args.additive:
+        model.set_replacement_layers(loaded_layers)
+    else:
+        print0("  Additive mode: keeping MLP on all CTM layers")
 else:
     model.init_ctm_weights()
-    # Fresh start: all CTM layers replace MLP
-    model.set_replacement_layers(model.ctm_layer_indices)
+    # Fresh start: all CTM layers replace MLP (unless --additive)
+    if not args.additive:
+        model.set_replacement_layers(model.ctm_layer_indices)
+    else:
+        print0("  Additive mode: keeping MLP on all CTM layers")
 
 # Count params
 total_params = sum(p.numel() for p in model.parameters())
