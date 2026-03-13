@@ -38,6 +38,7 @@ parser.add_argument("--ctm-memory-length", type=int, default=16, help="trace his
 parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="NLM hidden dim")
 parser.add_argument("--ctm-synapse-depth", type=int, default=32, help="U-NET synapse depth")
 parser.add_argument("--ctm-adaptive-k", action="store_true", help="use mean sync normalization (K-invariant)")
+parser.add_argument("--ctm-layers", type=str, default="last", help="which layers get CTM: 'last', '14,27', etc.")
 # Training
 parser.add_argument("--num-iterations", type=int, default=10000, help="total training steps")
 parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size")
@@ -48,9 +49,17 @@ parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weig
 parser.add_argument("--warmup-steps", type=int, default=100, help="LR warmup steps")
 parser.add_argument("--warmdown-ratio", type=float, default=0.3, help="fraction of training for LR warmdown")
 # Multi-tick loss
-parser.add_argument("--multi-tick", action="store_true", help="use multi-tick certainty loss")
+parser.add_argument("--no-multi-tick", action="store_true", help="disable multi-tick certainty loss (on by default)")
 # Cache-aware training
 parser.add_argument("--cache-aware-ratio", type=float, default=0.0, help="fraction of steps using cache-aware training")
+# SFT data mixing
+parser.add_argument("--sft-data", type=str, default=None, help="path to SFT JSONL file for mixing")
+parser.add_argument("--sft-ratio", type=float, default=0.0, help="fraction of steps using SFT data (0.0-1.0)")
+# Sleep consolidation
+parser.add_argument("--consolidate-every", type=int, default=0, help="run sleep consolidation every N steps (0=disable)")
+parser.add_argument("--consolidate-lr", type=float, default=1e-4, help="learning rate for consolidation")
+parser.add_argument("--consolidate-steps", type=int, default=4, help="gradient steps per replay batch during consolidation")
+parser.add_argument("--replay-buffer-size", type=int, default=16, help="max replay batches to keep")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="eval val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=2097152, help="tokens for val eval")
@@ -97,7 +106,14 @@ ctm_kwargs = {
 # Remove None values so defaults in QwenBackboneGPT apply
 ctm_kwargs = {k: v for k, v in ctm_kwargs.items() if v is not None}
 
-model = QwenBackboneGPT.from_pretrained(args.backbone, ctm_kwargs=ctm_kwargs)
+# Parse CTM layer spec into indices
+ctm_layer_indices = None  # None = last layer only
+if args.ctm_layers != "last":
+    ctm_layer_indices = [int(x.strip()) for x in args.ctm_layers.split(",")]
+    print0(f"Multi-CTM: layers {ctm_layer_indices}")
+
+model = QwenBackboneGPT.from_pretrained(args.backbone, ctm_kwargs=ctm_kwargs,
+                                         ctm_layer_indices=ctm_layer_indices)
 model = model.to(device)
 
 tokenizer = QwenTokenizer.from_pretrained(args.backbone)
@@ -115,8 +131,28 @@ if resuming:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     model.load_ctm_state_dict(ckpt["ctm_state_dict"])
     print0(f"  Loaded CTM weights from step {args.resume_from_step}")
+
+    # Fresh-init any NEW CTM layers not in checkpoint
+    ckpt_sd = ckpt["ctm_state_dict"]
+    sample_key = next(iter(ckpt_sd))
+    if sample_key in model.ctm_blocks and isinstance(ckpt_sd[sample_key], dict):
+        loaded_layers = set(int(k) for k in ckpt_sd.keys())
+    else:
+        # Single-CTM checkpoint → loaded into last layer
+        loaded_layers = {model.ctm_layer_indices[-1]}
+
+    new_layers = [idx for idx in model.ctm_layer_indices if idx not in loaded_layers]
+    if new_layers:
+        print0(f"  Fresh-initializing NEW CTM layers: {new_layers}")
+        model.init_ctm_weights(only_layers=new_layers)
+
+    # Trained CTM layers → replacement (MLP removed)
+    # New CTM layers → additive (frozen MLP kept alongside CTM)
+    model.set_replacement_layers(loaded_layers)
 else:
     model.init_ctm_weights()
+    # Fresh start: all CTM layers replace MLP
+    model.set_replacement_layers(model.ctm_layer_indices)
 
 # Count params
 total_params = sum(p.numel() for p in model.parameters())
@@ -126,15 +162,18 @@ print0(f"Total params: {total_params:,}")
 print0(f"Trainable (CTM): {trainable_params:,}")
 print0(f"Frozen (backbone): {frozen_params:,}")
 print0(f"Config: K={model.config.ctm_iterations}, n_synch={model.config.ctm_n_synch}, "
-       f"n_embd={model.config.n_embd}, CTM layer={model.ctm_layer_idx}")
+       f"n_embd={model.config.n_embd}, CTM layers={model.ctm_layer_indices}")
 
 # -----------------------------------------------------------------------------
 # Optimizer
 
 optimizer = model.setup_optimizer(lr=args.lr, weight_decay=args.weight_decay)
 if resuming and "optimizer_state_dict" in ckpt:
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    print0("  Loaded optimizer state")
+    try:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        print0("  Loaded optimizer state")
+    except (ValueError, RuntimeError) as e:
+        print0(f"  Skipping optimizer state (arch changed): {e}")
     del ckpt
 
 # -----------------------------------------------------------------------------
@@ -148,6 +187,43 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
     tokenizer, args.device_batch_size, args.max_seq_len,
     split="val", device=device,
 )
+
+# SFT data mixing
+sft_loader = None
+if args.sft_data and args.sft_ratio > 0:
+    import random as _rng
+    class SFTLoader:
+        """Infinite loader that samples from JSONL and tokenizes into (x, y) batches."""
+        def __init__(self, path, tokenizer, B, T, device):
+            self.texts = []
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        obj = json.loads(line)
+                        self.texts.append(obj["text"])
+            self.tokenizer = tokenizer
+            self.B, self.T, self.device = B, T, device
+            self.bos = tokenizer.get_bos_token_id()
+            print0(f"SFT data: {len(self.texts)} texts from {path}")
+
+        def sample_batch(self):
+            """Build a batch by sampling and packing SFT texts."""
+            rows = []
+            for _ in range(self.B):
+                # Sample and concatenate texts until we fill T tokens
+                tokens = [self.bos]
+                while len(tokens) < self.T + 1:
+                    text = _rng.choice(self.texts)
+                    toks = self.tokenizer.encode(text)
+                    tokens.extend(toks)
+                tokens = tokens[:self.T + 1]  # trim to exactly T+1
+                rows.append(tokens)
+            data = torch.tensor(rows, dtype=torch.long, device=self.device)
+            return data[:, :self.T], data[:, 1:self.T + 1]
+
+    sft_loader = SFTLoader(args.sft_data, tokenizer, args.device_batch_size,
+                           args.max_seq_len, device)
 
 # Batch size and grad accumulation
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
@@ -177,9 +253,13 @@ def get_lr(step):
 # Training loop
 
 step = args.resume_from_step + 1 if resuming else 0
+start_step = step  # for correct ETA calculation on resume
 smooth_loss = 0
 total_time = 0
 min_val_bpb = float("inf")
+
+# Replay buffer for sleep consolidation
+replay_buffer = []  # list of (x, y) tensors
 
 print0(f"\nStarting training: steps {step}-{num_iterations}, K={args.ctm_iterations}")
 print0(f"{'='*60}")
@@ -216,6 +296,8 @@ while step <= num_iterations:
             "Once upon a time",
             "Water boils at",
             "The meaning of life is",
+            "I am a continuous thought machine",
+            "My memory works by",
         ]
         for prompt in prompts:
             tokens = tokenizer.encode(prompt)
@@ -229,18 +311,37 @@ while step <= num_iterations:
                 print0(f'  "{prompt}" -> ERROR: {e}')
         model.train()
 
-    # Dream diagnostics
+    # Dream diagnostics + per-tick K activation analysis
     if args.sleep_every > 0 and step > 0 and step % args.sleep_every == 0:
         model.eval()
         dream_results = model.dream(device=device)
         for layer_idx, d in dream_results.items():
             print0(f"  Dream L{layer_idx}: converged={d['converged']}, "
                    f"K={d['K_start']}, delta={d['final_distance']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "ctm/dream_converged": int(dream_results[model.ctm_layer_idx]['converged']),
-            "ctm/dream_delta": dream_results[model.ctm_layer_idx]['final_distance'],
-        })
+        log_data = {"step": step}
+        for layer_idx, d in dream_results.items():
+            log_data[f"ctm/L{layer_idx}_dream_converged"] = int(d['converged'])
+            log_data[f"ctm/L{layer_idx}_dream_delta"] = d['final_distance']
+
+        # Per-tick diagnostics: run multi_tick forward on current batch
+        with torch.no_grad():
+            model._tick_diagnostics = None
+            model(x, targets=y, multi_tick=True)
+            if hasattr(model, '_tick_diagnostics') and model._tick_diagnostics:
+                td = model._tick_diagnostics
+                K = args.ctm_iterations
+                for key, val in td.items():
+                    log_data[f'ctm/{key}'] = val
+                # Print summary: which ticks are most selected
+                top_ticks = sorted(
+                    [(k, td.get(f'tick_{k}/selected_pct', 0)) for k in range(K)],
+                    key=lambda x: -x[1]
+                )[:5]
+                top_str = ", ".join(f"t{k}:{pct:.1f}%" for k, pct in top_ticks)
+                cert_str = f"cert={td.get('certainty/mean', 0):.3f}"
+                print0(f"  Ticks: {top_str} | {cert_str}")
+
+        wandb_run.log(log_data)
         model.train()
 
     # Save
@@ -270,6 +371,12 @@ while step <= num_iterations:
     t0 = time.time()
 
     for micro_step in range(grad_accum_steps):
+        # SFT mixing: replace batch with SFT data with given probability
+        use_sft = (sft_loader is not None
+                   and torch.rand(1).item() < args.sft_ratio)
+        if use_sft:
+            x, y = sft_loader.sample_batch()
+
         # Cache-aware: forward first half to populate CTMCache, train on second half
         use_cache_aware = (args.cache_aware_ratio > 0
                           and torch.rand(1).item() < args.cache_aware_ratio)
@@ -286,9 +393,9 @@ while step <= num_iterations:
                 if layer_state is not None:
                     for k in layer_state:
                         layer_state[k] = layer_state[k].detach()
-            _, loss = model(x2, targets=y2, ctm_cache=ctm_cache, multi_tick=args.multi_tick)
+            _, loss = model(x2, targets=y2, ctm_cache=ctm_cache, multi_tick=not args.no_multi_tick)
         else:
-            _, loss = model(x, targets=y, multi_tick=args.multi_tick)
+            _, loss = model(x, targets=y, multi_tick=not args.no_multi_tick)
 
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
@@ -301,6 +408,34 @@ while step <= num_iterations:
         group["lr"] = lr
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
+
+    # Add to replay buffer for consolidation (store on CPU to save VRAM)
+    if args.consolidate_every > 0:
+        replay_buffer.append((x.detach().cpu(), y.detach().cpu()))
+        if len(replay_buffer) > args.replay_buffer_size:
+            replay_buffer.pop(0)
+
+    # Sleep consolidation (gradient-free Hebbian — no VRAM overhead)
+    if args.consolidate_every > 0 and step > 0 and step % args.consolidate_every == 0 and len(replay_buffer) >= 2:
+        import random as _consolidate_rng
+        n_replay = min(4, len(replay_buffer))
+        replay_sample_cpu = _consolidate_rng.sample(replay_buffer, n_replay)
+        replay_sample = [(rx[:1].to(device), ry[:1].to(device)) for rx, ry in replay_sample_cpu]
+        consol_stats = model.consolidate(
+            replay_sample, lr=args.consolidate_lr, steps=args.consolidate_steps
+        )
+        del replay_sample
+        if consol_stats.get('losses'):
+            consol_loss = sum(consol_stats['losses']) / len(consol_stats['losses'])
+            consol_cert = sum(consol_stats['mean_certainty']) / len(consol_stats['mean_certainty'])
+            print0(f"  Consolidation: loss={consol_loss:.3f}, certainty={consol_cert:.3f}, "
+                   f"replay={len(replay_buffer)}")
+            wandb_run.log({
+                "step": step,
+                "sleep/consolidation_loss": consol_loss,
+                "sleep/certainty": consol_cert,
+                "sleep/replay_buffer": len(replay_buffer),
+            })
 
     synchronize()
     t1 = time.time()
@@ -317,8 +452,9 @@ while step <= num_iterations:
     pct = 100 * step / num_iterations
     tok_sec = int(total_batch_size / dt)
 
-    if step > 10:
-        avg_dt = total_time / (step - 10)
+    steps_done = step - max(start_step, 10)
+    if steps_done > 0:
+        avg_dt = total_time / steps_done
         eta = avg_dt * (num_iterations - step) / 60
         eta_str = f" | eta: {eta:.1f}m"
     else:
@@ -327,14 +463,37 @@ while step <= num_iterations:
     print0(f"step {step:05d}/{num_iterations} ({pct:.1f}%) | loss: {debiased_loss:.4f} | lr: {lr:.2e} | "
            f"dt: {dt*1000:.0f}ms | tok/sec: {tok_sec:,} | time: {total_time/60:.1f}m{eta_str}")
 
-    wandb_run.log({
+    step_log = {
         "step": step,
         "train/loss": debiased_loss,
         "train/raw_loss": loss_f,
         "train/lr": lr,
         "perf/dt_ms": dt * 1000,
         "perf/tok_per_sec": tok_sec,
-    })
+    }
+    # Log per-tick diagnostics from training forward pass (computed in _multi_tick_loss)
+    if hasattr(model, '_tick_diagnostics') and model._tick_diagnostics:
+        td = model._tick_diagnostics
+        for key, val in td.items():
+            step_log[f'ctm/{key}'] = val
+        # Write tick snapshot to JSONL for real-time 3D visualizer
+        tick_snapshot = {
+            'step': step,
+            'loss': loss_f,
+            'ticks': [
+                {
+                    'k': k,
+                    'loss': td.get(f'tick_{k}/loss', 0),
+                    'selected_pct': td.get(f'tick_{k}/selected_pct', 0),
+                }
+                for k in range(args.ctm_iterations)
+            ],
+            'certainty_mean': td.get('certainty/mean', 0),
+            'grad_tick_frac': td.get('loss/grad_tick_frac', 0),
+        }
+        with open('/tmp/ctm_ticks.jsonl', 'a') as tf:
+            tf.write(json.dumps(tick_snapshot) + '\n')
+    wandb_run.log(step_log)
 
     step += 1
 

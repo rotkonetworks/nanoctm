@@ -603,9 +603,15 @@ class CTMBlock(nn.Module):
             beta_act = r_act * beta_act + dopamine  # scale normalizer too so sync magnitude stays stable
 
             # Multi-tick: save readout at each k for auxiliary loss
+            # Detach early ticks to limit VRAM — only last multi_tick_grad ticks
+            # retain gradients (truncated BPTT). All ticks still used for diagnostics.
             if multi_tick:
                 synch_k = self._sync_readout(alpha_out, beta_out)
-                tick_outputs.append(self.c_proj(synch_k).reshape(B, T, D))
+                tick_out = self.c_proj(synch_k).reshape(B, T, D)
+                grad_ticks = getattr(self, 'multi_tick_grad', 4)
+                if k < K - grad_ticks:
+                    tick_out = tick_out.detach()
+                tick_outputs.append(tick_out)
 
             # Adaptive: stop at confidence peak
             if adaptive and k >= 2 and track_deltas:
