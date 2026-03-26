@@ -392,23 +392,36 @@ while step <= num_iterations:
     last_step = step == num_iterations
 
     # Eval (cross-entropy loss on val set)
+    # Two metrics: final-tick loss (inference behavior) and multi-tick argmin loss
+    # (matches training objective). Divergence = tick specialization, not overfitting.
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = max(1, args.eval_tokens // tokens_per_fwdbwd)
-        total_loss = 0.0
+        total_loss_final = 0.0
+        total_loss_argmin = 0.0
         with torch.no_grad():
             for eval_i, (vx, vy) in enumerate(val_loader):
                 if eval_i >= eval_steps:
                     break
-                _, loss = model(vx, targets=vy)
-                total_loss += loss.item()
-        val_loss = total_loss / max(eval_i + 1, 1)
-        val_bpb = val_loss / math.log(2)  # nats to bits, approximate bpb
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-        print0(f"Step {step:05d} | val loss: {val_loss:.4f} (~bpb: {val_bpb:.4f}, best: {min_val_bpb:.4f})")
-        val_log = {"step": step, "val/loss": val_loss, "val/bpb_approx": val_bpb}
+                # Final-tick loss (what inference actually produces)
+                _, loss_final = model(vx, targets=vy)
+                total_loss_final += loss_final.item()
+                # Argmin-tick loss (matches training objective)
+                _, loss_argmin = model(vx, targets=vy, multi_tick=True)
+                total_loss_argmin += loss_argmin.item()
+        n_eval = max(eval_i + 1, 1)
+        val_loss_final = total_loss_final / n_eval
+        val_loss_argmin = total_loss_argmin / n_eval
+        val_bpb_final = val_loss_final / math.log(2)
+        val_bpb_argmin = val_loss_argmin / math.log(2)
+        if val_bpb_argmin < min_val_bpb:
+            min_val_bpb = val_bpb_argmin
+        print0(f"Step {step:05d} | val loss: final={val_loss_final:.4f} argmin={val_loss_argmin:.4f} "
+               f"(~bpb: {val_bpb_final:.4f}/{val_bpb_argmin:.4f}, best: {min_val_bpb:.4f})")
+        val_log = {"step": step,
+                   "val/loss_final_tick": val_loss_final, "val/bpb_final": val_bpb_final,
+                   "val/loss_argmin": val_loss_argmin, "val/bpb_argmin": val_bpb_argmin}
         wandb_run.log(val_log)
         ingest_post(val_log)
         model.train()
