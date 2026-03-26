@@ -157,11 +157,24 @@ _ingest_url = args.ingest_url
 _ingest_key = args.ingest_key
 _ingest_run = args.run  # tag snapshots with run name
 
+_snapshot_log = None
+
 def ingest_post(snapshot: dict):
-    """POST snapshot to ingest endpoint. Non-blocking, best-effort."""
-    if not _ingest_url or not master_process:
+    """POST snapshot to ingest endpoint + cache locally. Non-blocking, best-effort."""
+    if not master_process:
         return
     snapshot = {**snapshot, "run": _ingest_run, "backbone": args.backbone}
+    # always cache locally — can replay to ingest API later
+    global _snapshot_log
+    if _snapshot_log is None:
+        log_dir = os.path.join(args.output_dir if hasattr(args, 'output_dir') else 'runs', 'snapshots')
+        os.makedirs(log_dir, exist_ok=True)
+        _snapshot_log = open(os.path.join(log_dir, f'{_ingest_run}.jsonl'), 'a')
+    _snapshot_log.write(json.dumps(snapshot) + '\n')
+    _snapshot_log.flush()
+    # POST to remote if configured
+    if not _ingest_url:
+        return
     def _send():
         try:
             data = json.dumps(snapshot).encode()
