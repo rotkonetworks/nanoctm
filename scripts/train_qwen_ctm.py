@@ -40,6 +40,8 @@ parser.add_argument("--ctm-synapse-depth", type=int, default=32, help="U-NET syn
 parser.add_argument("--ctm-adaptive-k", action="store_true", help="use mean sync normalization (K-invariant)")
 parser.add_argument("--ctm-layers", type=str, default="last", help="which layers get CTM: 'last', '14,27', etc.")
 parser.add_argument("--additive", action="store_true", help="keep MLP on CTM layers (CTM adds on top, paper-style)")
+parser.add_argument("--unfreeze-ctm-layer-ffn", action="store_true", help="unfreeze MLP on CTM layers for co-training")
+parser.add_argument("--backbone-lr-scale", type=float, default=0.1, help="backbone LR = main LR * this (default 0.1)")
 # Training
 parser.add_argument("--num-iterations", type=int, default=10000, help="total training steps")
 parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size")
@@ -69,10 +71,65 @@ parser.add_argument("--sample-tokens", type=int, default=40, help="max tokens pe
 parser.add_argument("--save-every", type=int, default=500, help="save checkpoint every N steps")
 parser.add_argument("--keep-checkpoints", type=int, default=3, help="max checkpoints to keep")
 parser.add_argument("--sleep-every", type=int, default=50, help="CTM dream diagnostics every N steps")
+# Regularization
+parser.add_argument("--spectral-reg", type=float, default=0.0, help="spectral reg weight: penalize c_proj σ₁ dominance (0=disable, try 0.1)")
+parser.add_argument("--ctm-aux-weight", type=float, default=0.1, help="auxiliary per-tick supervision weight (0=off, 0.1=default). Forces monotonic tick improvement.")
+parser.add_argument("--plasticity-every", type=int, default=0, help="run plasticity rehearsal every N steps (0=disable, try 25)")
+parser.add_argument("--plasticity-lr", type=float, default=1e-4, help="LR for plasticity rehearsal compact step")
+parser.add_argument("--plasticity-steps", type=int, default=10, help="compact_memory steps during rehearsal")
+# K ramping (start small K for speed, ramp up during training)
+parser.add_argument("--k-ramp-schedule", type=str, default=None,
+                    help="K ramp schedule: 'step:K,step:K,...' e.g. '0:8,2000:16,4000:32'. "
+                         "Overrides --ctm-iterations for initial K. Final K must match --ctm-iterations.")
 # Resume
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume from step")
 parser.add_argument("--model-tag", type=str, default=None, help="checkpoint dir name")
+# Telemetry
+parser.add_argument("--ingest-url", type=str, default=None, help="POST training snapshots to this URL (e.g. https://ctm.rotko.net/api/ingest)")
+parser.add_argument("--ingest-key", type=str, default=None, help="Bearer token for ingest API")
 args = parser.parse_args()
+
+# Parse K ramp schedule
+k_ramp_schedule = None
+if args.k_ramp_schedule:
+    k_ramp_schedule = []
+    for entry in args.k_ramp_schedule.split(","):
+        s, k = entry.strip().split(":")
+        k_ramp_schedule.append((int(s), int(k)))
+    k_ramp_schedule.sort(key=lambda x: x[0])
+    # Validate: final K must match --ctm-iterations (tick_embed is allocated at max K)
+    final_k = k_ramp_schedule[-1][1]
+    if final_k != args.ctm_iterations:
+        raise ValueError(f"K ramp final K={final_k} must match --ctm-iterations={args.ctm_iterations}")
+    # All K values must be <= max K
+    for s, k in k_ramp_schedule:
+        if k > args.ctm_iterations:
+            raise ValueError(f"K ramp K={k} at step {s} exceeds --ctm-iterations={args.ctm_iterations}")
+
+def get_k_for_step(step):
+    """Return the active K for a given training step based on ramp schedule."""
+    if not k_ramp_schedule:
+        return args.ctm_iterations
+    active_k = k_ramp_schedule[0][1]
+    for s, k in k_ramp_schedule:
+        if step >= s:
+            active_k = k
+    return active_k
+
+def apply_k_ramp(model, step, current_k):
+    """Check if K should change at this step. Returns new K (or current if unchanged).
+
+    Since tick_embed is allocated at max K and active_K just controls the loop range,
+    we only need to update active_K on each CTMBlock. No resize needed — unused
+    tick embeddings at indices >= active_K simply aren't accessed.
+    """
+    new_k = get_k_for_step(step)
+    if new_k == current_k:
+        return current_k
+    for ctm in model.ctm_blocks.values():
+        ctm.active_K = new_k
+    print0(f"  K RAMP: {current_k} → {new_k} at step {step}")
+    return new_k
 
 # -----------------------------------------------------------------------------
 # Init
@@ -90,6 +147,35 @@ if device_type == "cuda":
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanoctm", name=args.run, config=vars(args))
 
+# --- Ingest telemetry (fire-and-forget, non-blocking) ---
+import threading
+import urllib.request
+import urllib.error
+
+_ingest_url = args.ingest_url
+_ingest_key = args.ingest_key
+_ingest_run = args.run  # tag snapshots with run name
+
+def ingest_post(snapshot: dict):
+    """POST snapshot to ingest endpoint. Non-blocking, best-effort."""
+    if not _ingest_url or not master_process:
+        return
+    snapshot = {**snapshot, "run": _ingest_run, "backbone": args.backbone}
+    def _send():
+        try:
+            data = json.dumps(snapshot).encode()
+            req = urllib.request.Request(_ingest_url, data=data,
+                                         headers={"Content-Type": "application/json"})
+            if _ingest_key:
+                req.add_header("Authorization", f"Bearer {_ingest_key}")
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # best-effort, never block training
+    threading.Thread(target=_send, daemon=True).start()
+
+if _ingest_url and master_process:
+    print0(f"Ingest telemetry: {_ingest_url} (run={_ingest_run})")
+
 # -----------------------------------------------------------------------------
 # Load model
 
@@ -103,6 +189,7 @@ ctm_kwargs = {
     "ctm_memory_hidden": args.ctm_memory_hidden,
     "ctm_synapse_depth": args.ctm_synapse_depth,
     "ctm_adaptive_k": args.ctm_adaptive_k,
+    "ctm_aux_weight": args.ctm_aux_weight,
 }
 # Remove None values so defaults in QwenBackboneGPT apply
 ctm_kwargs = {k: v for k, v in ctm_kwargs.items() if v is not None}
@@ -161,12 +248,25 @@ else:
     else:
         print0("  Additive mode: keeping MLP on all CTM layers")
 
+# Apply initial K from ramp schedule
+current_active_k = args.ctm_iterations
+if k_ramp_schedule:
+    initial_k = get_k_for_step(args.resume_from_step + 1 if resuming else 0)
+    for ctm in model.ctm_blocks.values():
+        ctm.active_K = initial_k
+    current_active_k = initial_k
+    print0(f"K ramp: starting at K={initial_k}, schedule={k_ramp_schedule}")
+
+# Unfreeze CTM layer FFN for co-training
+if args.unfreeze_ctm_layer_ffn:
+    model.unfreeze_layers(model.ctm_layer_indices)
+
 # Count params
 total_params = sum(p.numel() for p in model.parameters())
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 frozen_params = total_params - trainable_params
 print0(f"Total params: {total_params:,}")
-print0(f"Trainable (CTM): {trainable_params:,}")
+print0(f"Trainable: {trainable_params:,}")
 print0(f"Frozen (backbone): {frozen_params:,}")
 print0(f"Config: K={model.config.ctm_iterations}, n_synch={model.config.ctm_n_synch}, "
        f"n_embd={model.config.n_embd}, CTM layers={model.ctm_layer_indices}")
@@ -174,7 +274,8 @@ print0(f"Config: K={model.config.ctm_iterations}, n_synch={model.config.ctm_n_sy
 # -----------------------------------------------------------------------------
 # Optimizer
 
-optimizer = model.setup_optimizer(lr=args.lr, weight_decay=args.weight_decay)
+optimizer = model.setup_optimizer(lr=args.lr, weight_decay=args.weight_decay,
+                                  backbone_lr_scale=args.backbone_lr_scale)
 if resuming and "optimizer_state_dict" in ckpt:
     try:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -268,7 +369,8 @@ min_val_bpb = float("inf")
 # Replay buffer for sleep consolidation
 replay_buffer = []  # list of (x, y) tensors
 
-print0(f"\nStarting training: steps {step}-{num_iterations}, K={args.ctm_iterations}")
+k_info = f"K={current_active_k}" + (f" (ramp to {args.ctm_iterations})" if k_ramp_schedule else "")
+print0(f"\nStarting training: steps {step}-{num_iterations}, {k_info}")
 print0(f"{'='*60}")
 
 while step <= num_iterations:
@@ -291,7 +393,9 @@ while step <= num_iterations:
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         print0(f"Step {step:05d} | val loss: {val_loss:.4f} (~bpb: {val_bpb:.4f}, best: {min_val_bpb:.4f})")
-        wandb_run.log({"step": step, "val/loss": val_loss, "val/bpb_approx": val_bpb})
+        val_log = {"step": step, "val/loss": val_loss, "val/bpb_approx": val_bpb}
+        wandb_run.log(val_log)
+        ingest_post(val_log)
         model.train()
 
     # Sample
@@ -336,7 +440,7 @@ while step <= num_iterations:
             model(x, targets=y, multi_tick=True)
             if hasattr(model, '_tick_diagnostics') and model._tick_diagnostics:
                 td = model._tick_diagnostics
-                K = args.ctm_iterations
+                K = current_active_k
                 for key, val in td.items():
                     log_data[f'ctm/{key}'] = val
                 # Print summary: which ticks are most selected
@@ -355,15 +459,22 @@ while step <= num_iterations:
     if step > 0 and args.save_every > 0 and (last_step or step % args.save_every == 0):
         os.makedirs(checkpoint_dir, exist_ok=True)
         ckpt_path = os.path.join(checkpoint_dir, f"ctm_{step:06d}.pt")
-        torch.save({
+        # Save optimizer state only every 2000 steps (large) or on last step
+        include_optimizer = (step % 2000 == 0) or last_step
+        ckpt_data = {
             "step": step,
             "ctm_state_dict": model.get_ctm_state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
             "config": vars(args),
             "val_bpb": min_val_bpb,
-        }, ckpt_path)
-        print0(f"  Saved checkpoint: {ckpt_path}")
-        # Prune old checkpoints
+            "active_k": current_active_k,
+        }
+        if include_optimizer:
+            ckpt_data["optimizer_state_dict"] = optimizer.state_dict()
+            print0(f"  Saving checkpoint (with optimizer): {ckpt_path}")
+        else:
+            print0(f"  Saving checkpoint (weights only): {ckpt_path}")
+        torch.save(ckpt_data, ckpt_path)
+        # Prune old checkpoints (keep more weight-only, fewer full)
         ckpts = sorted([f for f in os.listdir(checkpoint_dir) if f.startswith("ctm_") and f.endswith(".pt")])
         while len(ckpts) > args.keep_checkpoints:
             old = ckpts.pop(0)
@@ -372,6 +483,10 @@ while step <= num_iterations:
 
     if last_step:
         break
+
+    # K ramp: check if we should increase active_K at this step
+    if k_ramp_schedule:
+        current_active_k = apply_k_ramp(model, step, current_active_k)
 
     # --- Training step ---
     synchronize()
@@ -406,13 +521,37 @@ while step <= num_iterations:
 
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
+
+        # Spectral regularization: penalize σ₁ dominance on c_proj
+        # Keeps rank broad so compact_memory has room for new facts
+        if args.spectral_reg > 0:
+            for ctm in model.ctm_blocks.values():
+                W = ctm.c_proj.weight  # (out, in)
+                # Power iteration to estimate σ₁ (cheap, no SVD needed)
+                if not hasattr(ctm, '_spec_v'):
+                    ctm._spec_v = torch.randn(W.shape[1], device=W.device, dtype=W.dtype)
+                v = ctm._spec_v.detach()
+                u = W @ v
+                u = u / (u.norm() + 1e-8)
+                v = W.t() @ u
+                v = v / (v.norm() + 1e-8)
+                ctm._spec_v = v.detach()
+                sigma1_sq = (u * (W @ v)).sum()
+                frob_sq = (W * W).sum()
+                # Penalize σ₁²/||W||² — pushes energy into other singular values
+                spec_loss = args.spectral_reg * (sigma1_sq / (frob_sq + 1e-8))
+                loss = loss + spec_loss / grad_accum_steps
+
         loss.backward()
         x, y, dataloader_state = next(train_loader)
 
-    # Optimizer step
+    # Optimizer step — scale LR per param group (backbone gets lower LR)
     lr = get_lr(step)
-    for group in optimizer.param_groups:
-        group["lr"] = lr
+    for i, group in enumerate(optimizer.param_groups):
+        if i == 0:
+            group["lr"] = lr  # CTM params
+        else:
+            group["lr"] = lr * args.backbone_lr_scale  # backbone params
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
@@ -443,6 +582,73 @@ while step <= num_iterations:
                 "sleep/certainty": consol_cert,
                 "sleep/replay_buffer": len(replay_buffer),
             })
+
+    # Plasticity rehearsal: MAML-style "learn to learn"
+    # Every N steps: save weights → mini compact → test recall → restore weights
+    # The recall loss teaches the CTM that compact_memory updates should be recallable
+    if (args.plasticity_every > 0 and step > 0 and step % args.plasticity_every == 0
+            and master_process):
+        import random as _plast_rng
+        model.eval()
+
+        # Use current batch as "teaching data" (the model just trained on it)
+        T_teach = min(256, x.shape[1] - 1)
+        teach_x = x[:1, :T_teach]
+        teach_y = y[:1, :T_teach]
+
+        # Build recall pairs from the teaching data
+        # Split into chunks: teach on first half, recall on second half
+        mid = T_teach // 2
+        recall_input = teach_x[:, mid:]
+        recall_target = teach_y[:, mid:]
+        recall_pairs = [(recall_input, recall_target)]
+
+        # Save CTM state
+        plast_state = {}
+        for idx_str, ctm in model.ctm_blocks.items():
+            plast_state[idx_str] = {n: p.data.clone() for n, p in ctm.named_parameters()}
+
+        # Mini compact_memory
+        try:
+            plast_result = model.compact_memory(
+                teaching_ids=teach_x,
+                target_ids=teach_y,
+                lr=args.plasticity_lr,
+                steps=args.plasticity_steps,
+                recall_pairs=recall_pairs,
+                recall_weight=0.7,
+                max_delta=0.05,  # tight budget — we're just rehearsing
+                kl_weight=0.0,
+            )
+
+            plast_delta = plast_result.get('rel_delta', 0)
+            plast_loss = plast_result['losses'][-1] if plast_result.get('losses') else 0
+
+            if step % (args.plasticity_every * 4) == 0:
+                print0(f"  Plasticity rehearsal: delta={plast_delta*100:.2f}%, "
+                       f"loss={plast_loss:.3f}")
+            wandb_run.log({
+                "step": step,
+                "plasticity/delta_pct": plast_delta * 100,
+                "plasticity/loss": plast_loss,
+            })
+        except Exception as e:
+            print0(f"  Plasticity rehearsal failed: {e}")
+
+        # Reptile meta-learning: keep a tiny fraction of compact changes
+        # θ_new = θ_old + ε*(θ_compact - θ_old)
+        # This teaches the CTM to be receptive to compact_memory updates
+        # without second-order gradients (first-order MAML approximation)
+        reptile_eps = 0.01  # keep 1% of compact direction
+        for idx_str, ctm in model.ctm_blocks.items():
+            if idx_str in plast_state:
+                for n, p in ctm.named_parameters():
+                    if n in plast_state[idx_str]:
+                        compact_dir = p.data - plast_state[idx_str][n]
+                        p.data.copy_(plast_state[idx_str][n] + reptile_eps * compact_dir)
+        del plast_state
+
+        model.train()
 
     synchronize()
     t1 = time.time()
@@ -478,6 +684,25 @@ while step <= num_iterations:
         "perf/dt_ms": dt * 1000,
         "perf/tok_per_sec": tok_sec,
     }
+    if k_ramp_schedule:
+        step_log["ctm/active_K"] = current_active_k
+    # Log spectral stats every 50 steps
+    if args.spectral_reg > 0 and step % 50 == 0:
+        with torch.no_grad():
+            for idx_str, ctm in model.ctm_blocks.items():
+                W = ctm.c_proj.weight
+                S = torch.linalg.svdvals(W.float())
+                frob = S.norm()
+                cumulative = torch.cumsum(S**2, 0) / (frob**2 + 1e-8)
+                rank90 = (cumulative < 0.9).sum().item() + 1
+                rank99 = (cumulative < 0.99).sum().item() + 1
+                step_log[f'spectral/L{idx_str}_sigma1'] = S[0].item()
+                step_log[f'spectral/L{idx_str}_rank90'] = rank90
+                step_log[f'spectral/L{idx_str}_rank99'] = rank99
+                step_log[f'spectral/L{idx_str}_cond'] = (S[0] / (S[-1] + 1e-8)).item()
+                if step % 500 == 0:
+                    print0(f"  c_proj L{idx_str}: σ₁={S[0]:.1f} rank90={rank90} rank99={rank99} cond={S[0]/(S[-1]+1e-8):.0f}")
+
     # Log per-tick diagnostics from training forward pass (computed in _multi_tick_loss)
     if hasattr(model, '_tick_diagnostics') and model._tick_diagnostics:
         td = model._tick_diagnostics
@@ -493,14 +718,16 @@ while step <= num_iterations:
                     'loss': td.get(f'tick_{k}/loss', 0),
                     'selected_pct': td.get(f'tick_{k}/selected_pct', 0),
                 }
-                for k in range(args.ctm_iterations)
+                for k in range(current_active_k)
             ],
             'certainty_mean': td.get('certainty/mean', 0),
             'grad_tick_frac': td.get('loss/grad_tick_frac', 0),
         }
         with open('/tmp/ctm_ticks.jsonl', 'a') as tf:
             tf.write(json.dumps(tick_snapshot) + '\n')
+        ingest_post(tick_snapshot)
     wandb_run.log(step_log)
+    ingest_post(step_log)
 
     step += 1
 
