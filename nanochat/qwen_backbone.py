@@ -1081,9 +1081,13 @@ class QwenBackboneGPT(nn.Module):
             optimizer.zero_grad()
 
             # Teaching loss (with dopamine-shaped cache)
+            # Rebuild cache each step — forward writes into cache tensors which
+            # become part of the computation graph. After backward frees them,
+            # copy_() into those tensors would fail. Fresh clone avoids this.
             for idx, cached in da_cached_layers.items():
-                for k, v in cached.items():
-                    _step_cache.layers[idx][k].copy_(v)
+                _step_cache.layers[idx] = {
+                    k: v.detach().clone() for k, v in cached.items()
+                }
             _, loss_teach = self.forward(teaching_ids, targets=target_ids,
                                          ctm_cache=_step_cache)
 

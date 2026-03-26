@@ -740,7 +740,7 @@ class CTMBlock(nn.Module):
                 # Plastic LoRA for multi-tick path
                 _gate = torch.sigmoid(self.plastic_gate)
                 if _gate > 1e-4:
-                    tick_out = tick_out + _gate * (synch_k @ self.plastic_A @ self.plastic_B).reshape(B, T, D)
+                    tick_out = tick_out + _gate * (synch_k @ self.plastic_A.to(synch_k.dtype) @ self.plastic_B.to(synch_k.dtype)).reshape(B, T, D)
                 grad_ticks = getattr(self, 'multi_tick_grad', 4)
                 if k < K - grad_ticks:
                     tick_out = tick_out.detach()
@@ -768,7 +768,7 @@ class CTMBlock(nn.Module):
         # Plastic LoRA: additive pathway for compact_memory-learned knowledge
         gate = torch.sigmoid(self.plastic_gate)
         if gate > 1e-4:  # skip when gate is ~0 (untrained)
-            plastic_out = (synch @ self.plastic_A @ self.plastic_B).reshape(B, T, D)
+            plastic_out = (synch @ self.plastic_A.to(synch.dtype) @ self.plastic_B.to(synch.dtype)).reshape(B, T, D)
             out = out + gate * plastic_out
 
         # ROADMAP (phase 5 - metacognitive tokens):
