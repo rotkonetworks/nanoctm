@@ -10,6 +10,8 @@ a record of our model's journey from noise to something that thinks.
 - [migration — 4x H100 attempt](#migration--4x-h100-attempt-2026-03-09)
 - [step 11000 — plasticity fails on qwen3, c_proj rank bottleneck](#step-11000--plasticity-fails-on-qwen3-c_proj-rank-bottleneck-2026-03-13)
 - [step 12000 — plasticity still fails, two-CTM architecture](#step-12000--plasticity-still-fails-two-ctm-architecture-2026-03-13)
+- [Qwen3.5-4B — failed experiment, VRAM killed multi-tick](#qwen35-4b--failed-experiment-vram-killed-multi-tick-2026-03-15)
+- [conclusions — what we know and the path forward](#conclusions--what-we-know-and-the-path-forward-2026-03-15)
 - [migration — H200 NVL 140GB](#migration--h200-nvl-140gb-2026-03-09)
 - [step 1150+ — current](#step-1150--current-2026-03-09)
 - [step 1500 — K=3 → K=5 switch](#step-1500--k3--k5-switch-2026-03-09)
@@ -2398,3 +2400,130 @@ training resumed from step 12000 with `--ctm-layers "14,27"` --device-batch-size
 key question: will the mid-layer CTM develop meaningful representations that the frozen
 attention layers can amplify? if contribution ratio rises above 0.5 within a few thousand
 steps, the two-CTM hypothesis is confirmed.
+
+## Qwen3.5-4B — failed experiment, VRAM killed multi-tick (2026-03-15)
+
+tried scaling up backbone from 0.6B to 4B. the idea: bigger backbone = better features for
+CTM to work with. reality: 32GB VRAM on 5090 forced `--no-multi-tick`, which defeats the
+entire purpose of CTM.
+
+### what we ran
+
+```
+Qwen/Qwen3.5-4B, K=32, --no-multi-tick, --ctm-layers last
+seq_len=1024 (halved from 2048), batch=1, grad_accum=4
+resumed from step 6000, ran to ~8850/15000
+VRAM: 29.4/32.6 GB (no room for multi-tick)
+speed: ~9s/step, ~450 tok/sec
+```
+
+### why it failed
+
+**no multi-tick = no continuous thought.** without multi-tick, the CTM gets one iteration per
+token — it's just a weird MLP replacement, not a thinking machine. the results confirm this:
+
+- **loss oscillating**: bounced between 2.4-3.0 from step 7000-8850, never converging
+- **plasticity dead**: delta flat at 0.42-0.44% across all rehearsals (steps 8000-8800)
+- **generation broken**: "The capital of France is **__________**" — outputting fill-in-the-blank
+- **tick t0 dominates at 30-42%**: CTM barely iterating, just passing through initial state
+- **dream never converges**: delta 2-5, layer 31
+
+### plasticity rehearsal history
+
+| step | delta | loss |
+|------|-------|------|
+| 8000 | 0.42% | 2.19 |
+| 8100 | 0.43% | 2.27 |
+| 8200 | 0.43% | 2.69 |
+| 8300 | 0.42% | 3.45 |
+| 8400 | 0.44% | 2.45 |
+| 8500 | 0.44% | 2.51 |
+| 8600 | 0.43% | 2.81 |
+| 8700 | 0.44% | 2.41 |
+| 8800 | 0.44% | 2.95 |
+
+### lesson learned
+
+**bigger backbone ≠ better CTM if you can't afford multi-tick.** CTM's value IS the iterative
+thinking. without it, the model has no mechanism for continuous thought — it's just an
+expensive linear layer. should have run K=16 with multi-tick instead of K=32 without it.
+
+on 32GB VRAM with a 4B backbone:
+- K=32 no-multi-tick: fits but useless (what we did)
+- K=16 multi-tick: might have fit, would have been meaningful
+- K=32 multi-tick: OOM
+
+the 0.6B backbone remains the right scale for 32GB consumer GPUs with full CTM features.
+or: get a bigger GPU.
+
+## conclusions — what we know and the path forward (2026-03-15)
+
+after weeks of experiments across 8 training runs, 4 backbones (GPT-2 d12, Qwen2.5-0.5B,
+Qwen3-0.6B, Qwen3.5-4B), and countless dead ends, here's what we actually know.
+
+### proven facts
+
+1. **plasticity works.** Qwen2.5-0.5B + CTM K=32 + multi-tick achieved 4/4 fact recall after
+   compact_memory(). this is not a fluke — recall-aware compact with lr=3e-4, steps=30,
+   recall_weight=0.7 reliably teaches and retrieves facts across conversation restarts.
+
+2. **multi-tick is non-negotiable.** without it, CTM is just a linear layer. the 4B run with
+   `--no-multi-tick` proved this definitively: loss oscillates, plasticity delta flatlines at
+   0.42%, generation outputs fill-in-the-blank blanks. one iteration ≠ continuous thought.
+
+3. **CTM must replace FFN, not sit alongside it.** additive mode (MLP + CTM) lets the frozen
+   FFN dominate. the CTM gets squeezed to rank 3 because training has no incentive to route
+   signal through it. replacement mode forces all signal through CTM — that's what worked.
+
+4. **frozen backbone is necessary.** unfreezing backbone layers lets the FFN absorb all
+   gradient — it has more parameters, better initialization, and pretrained momentum. the CTM
+   starves. keep the backbone frozen, force learning into the CTM.
+
+5. **stronger backbone = harder for CTM.** Qwen2.5-0.5B worked because the backbone was weak
+   enough that CTM had room to contribute. Qwen3-0.6B's c_proj collapsed to rank 3 — the
+   backbone explained the data too well. this is the fundamental tension.
+
+### the VRAM wall
+
+CTM's compute cost scales with K (iterations) × sequence length × batch size. multi-tick
+training multiplies this further (K forward passes for loss). on 32GB:
+
+| backbone | K | multi-tick | VRAM | works? |
+|----------|---|-----------|------|--------|
+| 0.5B | 32 | yes | ~16 GB | **YES — plasticity proven** |
+| 0.6B | 32 | yes | ~16 GB | trains but c_proj bottleneck |
+| 2B | 32 | no | ~20 GB | FFN dominates, no plasticity |
+| 4B | 32 | no | ~29 GB | dead — no multi-tick, no thought |
+| 4B | 16 | yes | ~25 GB? | **untested — might work** |
+| 4B | 32 | yes | OOM | needs H100/H200 |
+
+### the path forward
+
+**immediate (5090 32GB):**
+- reproduce Qwen2.5-0.5B plasticity cleanly as the reference checkpoint
+- try 4B + K=8 or K=16 with multi-tick — might fit, and lower K means faster search
+- try multi-CTM layers on 0.5B (2-3 layers fit at batch=1)
+- build autosweep script: backbone × K × num_ctm_layers, auto-kill on plateau
+
+**with funding (H100 80GB / H200 140GB):**
+- 4B backbone + K=32 + multi-tick + multi-layer CTM — the real experiment
+- systematic hyperparameter sweep in parallel (dozens of runs, not one-at-a-time)
+- the actual product needs a backbone strong enough to be useful (≥2B)
+
+**open questions:**
+- does lower K (8-16) preserve plasticity? the 0.5B success was at K=32 but nobody tested less
+- how many CTM layers are needed on bigger backbones? one might not be enough to override
+  30+ frozen FFN layers
+- can spectral regularization actually fix the c_proj rank bottleneck given enough steps?
+- is there a backbone sweet spot between "too weak to be useful" and "too strong for CTM"?
+
+### the bottom line
+
+we have proof of concept. plasticity — teaching an LLM new facts at inference time through
+iterative internal thought — is real and works. what we don't have is the scale. the 0.5B
+model that works is too small to be useful. the bigger models that would be useful can't fit
+the full CTM pipeline on consumer hardware.
+
+this is now a resource problem, not a research problem. the algorithm works. we need GPUs
+to find the right configuration at useful scale, and that means either bigger hardware or
+a systematic sweep that's smarter about exploring the space.

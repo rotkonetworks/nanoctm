@@ -3,5 +3,6 @@ ffn_d12,db3747d,2026-03-08,nanochat-gpt2,d12,4,all,no,no,1e-3,0.3,0,0,4,2048,1,1
 ctm_d12_single,db3747d,2026-03-09,nanochat-gpt2,d12,4,last,no,no,1e-3,0.3,0,0,4,2048,1,4000,H200,LOST,,,first CTM plasticity model - checkpoints deleted
 qwen25_ctm_k32_v1,3b959c9,2026-03-11,Qwen/Qwen2.5-0.5B,0.5B,32,last,no,no,1e-3,0.3,0.30,0,2,2048,1,5000,5090,done,,,breakthrough plasticity 4/4 recall
 qwen3_ctm_k32_cache,ce60ccf,2026-03-11,Qwen/Qwen3-0.6B,0.6B,32,last,no,yes,1e-3,0,0.30,0.05,2,2048,2,50000,5090,stopped,,0/4,c_proj rank=3 bottleneck - plasticity fails
-qwen25_ctm_k32_v2,ce60ccf,2026-03-13,Qwen/Qwen2.5-0.5B,0.5B,32,last,no,yes,1e-3,0,0.30,0,2,2048,1,15000,5090,running,,,step ~10k no SFT
-qwen25_15b_ctm_k32,24b0a04,2026-03-13,Qwen/Qwen2.5-1.5B,1.5B,32,last,yes,yes,1e-3,0.3,0.30,0.05,1,2048,4,15000,5090,planned,,,additive CTM on bigger backbone
+qwen25_ctm_k32_v2,ce60ccf,2026-03-13,Qwen/Qwen2.5-0.5B,0.5B,32,last,no,yes,1e-3,0,0.30,0,2,2048,1,15000,5090,killed@12k,,,killed for qwen3.5 - no plasticity improvement
+qwen35_2b_ctm_k32,708b048,2026-03-13,Qwen/Qwen3.5-2B-Base,2B,32,last,yes,no,1e-3,0.3,0.30,0.05,1,2048,2,15000,5090,stopped@5.5k,,0/5,sweep: 3/3 aggressive recall but repetition collapse. base model priors too strong
+qwen35_4b_ctm_k32,708b048,2026-03-14,Qwen/Qwen3.5-4B,4B,32,last,no,no,1e-3,0.3,0.30,0.05,1,1024,4,15000,5090,failed@8850,,0%,no-multi-tick killed CTM — loss oscillating 2.4-3.0 — plasticity delta flat 0.42-0.44% — should have used K=16 with multi-tick
