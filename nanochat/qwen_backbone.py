@@ -424,24 +424,25 @@ class QwenBackboneGPT(nn.Module):
         # Cognitive CTM (in backbone) handles language. Memory CTM handles facts.
         # compact_memory() writes here exclusively.
         if self._has_memory_ctm:
-            mem_ctm_cache = ctm_cache  # share cache infrastructure
-            mem_layer_idx = self.config.n_layer  # virtual layer index after backbone
             _intervene_mem = intervene or getattr(self, '_viz_intervene', None)
+
+            # Memory CTM gets its own mini-cache (1 layer) — independent from cognitive CTM.
+            # During inference, memory CTM starts fresh each sequence (no cross-token state).
+            # Its "memory" lives in the weights (via compact_memory), not in the cache.
+            from nanochat.gpt import CTMCache as _MemCache
+            _mem_cache = _MemCache(1)  # single-layer cache
 
             # Memory CTM: multi-tick for training loss, single-tick for inference
             do_mem_multi_tick = (multi_tick and targets is not None)
             if do_mem_multi_tick:
                 mem_out, mem_tick_outputs = self.memory_ctm(
-                    x, ctm_cache=mem_ctm_cache, layer_idx=mem_layer_idx,
+                    x, ctm_cache=_mem_cache, layer_idx=0,
                     multi_tick=True, intervene=_intervene_mem)
                 # Use memory tick outputs for loss instead of cognitive CTM ticks
-                if tick_outputs is not None:
-                    tick_outputs = mem_tick_outputs
-                else:
-                    tick_outputs = mem_tick_outputs
+                tick_outputs = mem_tick_outputs
             else:
                 mem_out = self.memory_ctm(
-                    x, ctm_cache=mem_ctm_cache, layer_idx=mem_layer_idx,
+                    x, ctm_cache=_mem_cache, layer_idx=0,
                     intervene=_intervene_mem)
             x = x + mem_out.to(x.dtype)
 
