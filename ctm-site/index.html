@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CTM: Continuous Thought Machine</title>
+<meta name="description" content="Watch a language model learn to think. Live training data from a neuroplastic CTM running on a single GPU.">
+<link rel="prefetch" href="research.html">
+<link rel="prefetch" href="invest.html">
+<style>
+  :root {
+    --bg: #08090a;
+    --surface: #111214;
+    --border: #1e2024;
+    --text: #e0e2e8;
+    --text-dim: #6b7080;
+    --accent: #5b8af5;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body { height: 100%; overflow: hidden; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, sans-serif;
+  }
+
+  .nav {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.6rem 1.5rem;
+    background: rgba(8, 9, 10, 0.85);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    z-index: 100;
+    font-size: 0.85rem;
+  }
+  .nav-logo {
+    font-weight: 700; font-size: 1rem;
+    color: var(--accent); text-decoration: none;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .nav-links { display: flex; gap: 1.5rem; }
+  .nav-links a {
+    color: var(--text-dim); text-decoration: none;
+    font-size: 0.8rem; letter-spacing: 0.03em;
+    transition: color 0.15s;
+  }
+  .nav-links a:hover { color: var(--accent); }
+
+  /* Debugger fills viewport below nav */
+  .debugger-wrap {
+    position: fixed;
+    top: 37px; /* nav height */
+    left: 0; right: 0; bottom: 0;
+  }
+
+  #ctm-canvas {
+    width: 100%; height: 100%;
+    display: block;
+  }
+
+  /* Loading overlay */
+  #debugger-loading {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: var(--bg);
+    z-index: 10;
+  }
+  #debugger-loading .bar-track {
+    width: 200px; height: 2px;
+    background: var(--border); border-radius: 1px;
+    overflow: hidden;
+  }
+  #load-bar {
+    width: 0%; height: 100%;
+    background: var(--accent);
+    transition: width 0.3s;
+  }
+  #load-text {
+    color: var(--text-dim); font-size: 0.8rem;
+    margin-top: 0.75rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<nav class="nav">
+  <a href="index.html" class="nav-logo">CTM</a>
+  <div class="nav-links">
+    <a href="research.html">Research</a>
+    <a href="invest.html">Invest</a>
+  </div>
+</nav>
+
+<div class="debugger-wrap">
+  <div id="debugger-loading">
+    <div class="bar-track">
+      <div id="load-bar"></div>
+    </div>
+    <p id="load-text">loading training data...</p>
+  </div>
+  <canvas id="ctm-canvas"></canvas>
+</div>
+
+<script type="module">
+const bar = document.getElementById('load-bar');
+const txt = document.getElementById('load-text');
+const overlay = document.getElementById('debugger-loading');
+
+// check WebGL support before loading WASM
+const canvas = document.createElement('canvas');
+const hasWebGL = !!(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+if (!hasWebGL) {
+  // redirect to the dashboard (works without WebGL)
+  txt.textContent = 'WebGL not available, loading dashboard...';
+  bar.style.width = '100%';
+  setTimeout(() => { window.location.href = '/ctm-app/'; }, 500);
+  throw new Error('skip WASM');
+}
+
+const init = (await import('./ctm-debugger.js')).default;
+
+let progress = 0;
+const tick = setInterval(() => {
+  progress = Math.min(progress + (90 - progress) * 0.05, 90);
+  bar.style.width = progress + '%';
+}, 200);
+
+txt.textContent = 'fetching training data...';
+
+// Pre-fetch data into localStorage so WASM loads instantly
+try {
+  const resp = await fetch('ticks.json');
+  const data = await resp.text();
+  localStorage.setItem('ctm_ticks', data);
+  const count = JSON.parse(data).length;
+  txt.textContent = `${count} snapshots cached, loading WASM...`;
+} catch (e) {
+  txt.textContent = 'loading WASM (cached data)...';
+}
+
+bar.style.width = '50%';
+await init({ module_or_path: './ctm-debugger_bg.wasm' });
+
+clearInterval(tick);
+bar.style.width = '100%';
+txt.textContent = 'ready';
+setTimeout(() => { if (overlay) overlay.style.display = 'none'; }, 300);
+</script>
+
+</body>
+</html>
