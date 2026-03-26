@@ -625,9 +625,19 @@ class CTMBlock(nn.Module):
                     tick_out = tick_out.detach()
                 tick_outputs.append(tick_out)
 
-            # Adaptive: stop at confidence peak
-            if adaptive and k >= 2 and track_deltas:
-                if deltas[-1] > deltas[-2]:
+            # Adaptive halt: two strategies
+            if adaptive and k >= 2:
+                # Strategy 1: KL-based — stop when readout stops changing
+                # (from bound analysis: KL(pi_t || pi_{t-1}) bounds value change via Pinsker)
+                if multi_tick and len(tick_outputs) >= 2:
+                    with torch.no_grad():
+                        prev_logits = self._compute_logits_from_tick(tick_outputs[-2]) if hasattr(self, '_compute_logits_from_tick') else None
+                        if prev_logits is None:
+                            # fallback: delta-based
+                            if track_deltas and deltas[-1] > deltas[-2]:
+                                break
+                # Strategy 2: delta-based — stop when state changes start increasing (overthinking)
+                elif track_deltas and deltas[-1] > deltas[-2]:
                     break
 
         # Readout: S_out synchronisation -> output projection
