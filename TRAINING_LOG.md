@@ -2527,3 +2527,58 @@ the full CTM pipeline on consumer hardware.
 this is now a resource problem, not a research problem. the algorithm works. we need GPUs
 to find the right configuration at useful scale, and that means either bigger hardware or
 a systematic sweep that's smarter about exploring the space.
+
+## Qwen2.5-0.5B K=4 + bound-guided aux — 8GB AMD GPU (2026-03-26)
+
+first run with Angeris bound diagnostics and bound-guided auxiliary supervision.
+Qwen2.5-0.5B backbone, K=4, on RX 7600M XT (8GB VRAM). the diagnostics changed everything.
+
+### what worked
+
+- **bound diagnostics caught bottlenecks in real-time**: c_proj rank expanded 1→49→62→149
+  over 6000 steps. condition number dropped from 1.4M to 3.7K. would have caught the Qwen3
+  rank-3 collapse at step 50 instead of step 11,000.
+- **chunked multi-tick loss**: 248K vocab on 8GB — each tick's logits = 1GB. chunked lm_head
+  into 256MB pieces + gradient checkpointing. no OOM.
+- **plasticity works at step 2000**: compact_memory(lr=3e-4, steps=30) taught "Zyphrax→purple",
+  4/4 recall. on an 8GB consumer GPU with K=4 ticks.
+- **generation quality**: "capital of France → Paris" correct, coherent stories, fibonacci code.
+
+### critical finding: plasticity has a critical period
+
+| checkpoint | compact loss | recall "purple" | c_proj rank90 |
+|-----------|-------------|-----------------|---------------|
+| step 2000 | 11.4→8.1 | **YES** (4/4) | 62 |
+| step 3000 | 12.8→8.9 | NO | ~80 |
+| step 5000 | 12.3→9.1 | NO | 123 |
+
+**step 2000 = plastic. step 3000+ = solidified.** same compact settings, same lr, same
+steps. the weights won't budge after ~3000 steps. verified: not a CPU/GPU or dtype issue
+(tested fp32 on GPU, same failure).
+
+the optimization landscape hardens as training progresses. like biological critical periods:
+young brains (early training) are plastic, older brains have solidified pathways. the model
+needs plasticity exercises DURING training to maintain malleability — `--plasticity-every 25`
+runs mini compact_memory every 25 steps to keep the weights in a plastic-friendly region.
+
+### sequential compact: catastrophic forgetting
+
+taught 5 facts in sequence. bounds stayed healthy (rank 62→65, no dead neurons, condition
+stable). but each compact overwrites the previous — fact #2 erases fact #1. the plastic
+LoRA pathway (plastic_A, plastic_B) has zero norm despite gate=0.5 — compact writes to
+main weights, not the adapter. fix needed: null-space projection so each fact writes to
+an orthogonal direction. rank 65 = room for 65 independent facts, they just need to not
+step on each other.
+
+### val loss mismatch (train/eval protocol)
+
+val loss went UP (4.5→5.8) while train loss went DOWN (3.0→2.4). not overfitting — the
+eval uses final-tick loss but training optimizes argmin across all K ticks. when ticks
+specialize (tick 0 wins 52% of tokens), final-tick loss rises while the model IS learning.
+fixed eval to report both final-tick and argmin-tick val loss.
+
+### next experiment
+
+restart from step 2000 (the plastic checkpoint) with `--plasticity-every 25` to keep the
+weights malleable. test if plasticity survives to step 5000+. if yes, the critical period
+problem is solved and we can train longer without losing the ability to learn new facts.
