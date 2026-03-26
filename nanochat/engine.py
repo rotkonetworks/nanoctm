@@ -175,6 +175,8 @@ class RowState:
         self.forced_tokens = deque() # Queue of tokens to force inject
         self.in_python_block = False # Whether we are inside a python block
         self.python_expr_tokens = [] # Tokens of the current python expression
+        self.in_memorize_block = False # Whether we are inside a <|memorize|> block
+        self.memorize_tokens = [] # Tokens being memorized
         self.completed = False # Whether this row has completed generation
 
 class Engine:
@@ -200,6 +202,8 @@ class Engine:
         output_end = get_special("<|output_end|>")
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+        memorize_start = get_special("<|memorize|>")
+        memorize_end = get_special("<|/memorize|>")
 
         # Check if model manages its own KV cache (e.g. QwenBackboneGPT)
         own_cache = getattr(self.model, 'manages_own_cache', False)
@@ -347,6 +351,36 @@ class Engine:
                     state.python_expr_tokens = []
                 elif state.in_python_block:
                     state.python_expr_tokens.append(next_token)
+                # Memorize tool: model wraps text it wants to remember
+                if next_token == memorize_start and memorize_start is not None:
+                    state.in_memorize_block = True
+                    state.memorize_tokens = []
+                elif next_token == memorize_end and state.in_memorize_block:
+                    state.in_memorize_block = False
+                    if state.memorize_tokens and len(state.memorize_tokens) >= 5:
+                        # The model chose to remember this — run memorize()
+                        # Must exit inference_mode since memorize() needs gradients (Bug 3)
+                        memorize_fn = getattr(self.model, 'memorize',
+                                              getattr(self.model, 'compact_memory', None))
+                        if memorize_fn is not None and callable(memorize_fn):
+                            mem_ids = torch.tensor(
+                                [state.memorize_tokens[:-1]], dtype=torch.long, device=device)
+                            mem_targets = torch.tensor(
+                                [state.memorize_tokens[1:]], dtype=torch.long, device=device)
+                            try:
+                                with torch.inference_mode(False):
+                                    memorize_fn(
+                                        teaching_ids=mem_ids,
+                                        target_ids=mem_targets,
+                                        lr=1e-4, steps=10,
+                                        max_delta=0.05,
+                                    )
+                            except Exception as e:
+                                import warnings
+                                warnings.warn(f"memorize tool failed: {e}")
+                    state.memorize_tokens = []
+                elif state.in_memorize_block:
+                    state.memorize_tokens.append(next_token)
 
             # Yield the token column
             yield token_column, token_masks
@@ -439,7 +473,8 @@ class Session:
         session = Session.load("session_001.pt", model, tokenizer)
     """
 
-    def __init__(self, model, tokenizer, max_seq_len=None, seed=42, online_lr=0.0):
+    def __init__(self, model, tokenizer, max_seq_len=None, seed=42, online_lr=0.0,
+                 auto_memorize=False, memorize_threshold=1.5):
         self.model = model
         self.tokenizer = tokenizer
         self.device = model.get_device()
@@ -449,6 +484,11 @@ class Session:
         self.model.eval()
         self.seed = seed
         self.online_lr = online_lr  # >0 enables automatic learning from user messages
+        self.auto_memorize = auto_memorize  # automatically memorize surprising turns
+        self.memorize_threshold = memorize_threshold  # surprise std threshold for auto-memorize
+        self.memorize_stats = []  # history of auto-memorize events
+        self._memorized_up_to = 0  # token position of last memorize (idempotency guard)
+        self._auto_memorize_cooldown = 128  # min new tokens between auto-memorize calls
 
         m = model.config
         seq_len = max_seq_len or m.sequence_len
@@ -541,14 +581,225 @@ class Session:
             # Feed token through model (updates caches)
             logits = self._forward_tokens([token])
 
-        return self.tokenizer.decode(reply_tokens)
+        reply = self.tokenizer.decode(reply_tokens)
 
-    def compact(self, lr=1e-5):
+        # Auto-memorize: if enough new tokens since last memorize and the
+        # conversation is long enough, memorize the surprising parts.
+        new_since_memorize = len(self.all_tokens) - self._memorized_up_to
+        if (self.auto_memorize
+                and new_since_memorize >= self._auto_memorize_cooldown
+                and len(self.all_tokens) >= 64):
+            with torch.inference_mode(False):
+                stats = self.memorize_conversation(
+                    lr=1e-4, steps=15,
+                    max_delta=0.05,
+                    surprise_threshold=self.memorize_threshold,
+                )
+                if stats and not stats.get('skipped', False):
+                    self.memorize_stats.append(stats)
+
+        return reply
+
+    def memorize_this(self, text, lr=3e-4, steps=20, max_delta=0.10):
+        """Deliberately memorize a specific piece of text.
+
+        For when the model (or user) says: "remember this."
+        Dates, plans, names, codes, promises — anything worth keeping.
+
+        Args:
+            text: the text to memorize (string)
+            lr: learning rate
+            steps: consolidation steps
+            max_delta: plasticity budget (lower = gentler)
+
+        Returns: dict with memorize() diagnostics
+        """
+        memorize_fn = getattr(self.model, 'memorize',
+                              getattr(self.model, 'compact_memory', None))
+        if memorize_fn is None:
+            return {}
+
+        tokens = self.tokenizer.encode(text)
+        if len(tokens) < 4:
+            return {}
+
+        device = self.device
+        # Repeat for emphasis, like re-reading a note
+        doubled = tokens + tokens
+        ids = torch.tensor([doubled[:-1]], dtype=torch.long, device=device)
+        targets = torch.tensor([doubled[1:]], dtype=torch.long, device=device)
+
+        # Build recall pairs from the original text (standard input/target shift)
+        recall_pairs = []
+        mid = len(tokens) // 2
+        # First half as recall pair
+        if mid >= 5:  # need at least 5 tokens for a meaningful pair
+            r1 = tokens[:mid]
+            r1_in = torch.tensor([r1[:-1]], dtype=torch.long, device=device)
+            r1_tgt = torch.tensor([r1[1:]], dtype=torch.long, device=device)
+            recall_pairs.append((r1_in, r1_tgt))
+        # Second half as recall pair
+        r2 = tokens[mid:]
+        if len(r2) >= 5:
+            r2_in = torch.tensor([r2[:-1]], dtype=torch.long, device=device)
+            r2_tgt = torch.tensor([r2[1:]], dtype=torch.long, device=device)
+            recall_pairs.append((r2_in, r2_tgt))
+
+        with torch.inference_mode(False):
+            stats = memorize_fn(
+                teaching_ids=ids,
+                target_ids=targets,
+                lr=lr, steps=steps,
+                recall_pairs=recall_pairs if recall_pairs else None,
+                recall_weight=0.7,
+                max_delta=max_delta,
+            )
+
+        stats['memorized_text'] = text[:100]
+        stats['memorized_tokens'] = len(tokens)
+        return stats
+
+    def compact(self, lr=3e-4, steps=30, max_delta=0.15):
         """Write this conversation's memory into permanent weights.
-        Call at the end of a conversation to make the model remember it forever."""
+        Call at the end of a conversation to make the model remember it forever.
+
+        If CTMCache is available, uses the Hebbian sync-based compact (gpt.py).
+        Otherwise, uses self-feeding: the conversation itself becomes the
+        teaching material, weighted by surprise."""
         if self.ctm_cache is not None:
             return self.model.compact_memory(self.ctm_cache, lr=lr)
+        if len(self.all_tokens) >= 64:
+            return self.memorize_conversation(lr=lr, steps=steps, max_delta=max_delta)
         return {}
+
+    def memorize_conversation(self, lr=3e-4, steps=30, max_delta=0.15,
+                               surprise_threshold=1.0, recall_fraction=0.3,
+                               diagnostics=False):
+        """The model feeds itself: memorize this conversation's surprising moments.
+
+        No external teaching text needed. The conversation tokens become both
+        teaching and recall data. Dopamine-weighted tokens (the surprising ones)
+        drive the learning — boring, predictable tokens are masked out.
+
+        This is how memory should work: you don't remember everything.
+        You remember what surprised you.
+
+        Args:
+            lr: learning rate for memorize()
+            steps: gradient replay steps
+            max_delta: plasticity budget
+            surprise_threshold: CE multiplier above mean to count as "surprising".
+                1.0 = above average surprise, 1.5 = well above average
+            recall_fraction: fraction of conversation to use as recall pairs
+            diagnostics: pass through to memorize()
+
+        Returns: dict with memorize() diagnostics + conversation stats
+        """
+        # Only memorize tokens newer than last memorize (idempotency)
+        new_tokens = self.all_tokens[self._memorized_up_to:]
+        if len(new_tokens) < 64:
+            return {}
+
+        device = self.device
+        # Use new tokens, but include some context from before for coherence
+        context_len = min(128, self._memorized_up_to)
+        tokens = self.all_tokens[self._memorized_up_to - context_len:]
+
+        # Cap at 2048 tokens to avoid OOM on long conversations
+        if len(tokens) > 2048:
+            tokens = tokens[-2048:]
+
+        ids = torch.tensor([tokens[:-1]], dtype=torch.long, device=device)
+        targets = torch.tensor([tokens[1:]], dtype=torch.long, device=device)
+
+        # === WAKE: compute per-token surprise to find what's worth remembering ===
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model.forward(ids)
+            per_token_ce = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                reduction='none', ignore_index=-1,
+            )
+            ce_mean = per_token_ce.mean()
+            ce_std = per_token_ce.std()
+
+            # Tokens with CE above threshold are "surprising" — worth remembering.
+            # Everything else gets masked to -1 (ignored in loss).
+            surprising = per_token_ce > (ce_mean + surprise_threshold * ce_std)
+            n_surprising = surprising.sum().item()
+
+            # Don't bother if nothing was surprising
+            if n_surprising < 8:
+                return {'skipped': True, 'reason': 'nothing_surprising',
+                        'n_tokens': len(tokens), 'n_surprising': int(n_surprising)}
+
+            # Build dopamine-weighted targets: boring tokens masked out
+            dopamine_targets = targets.clone()
+            dopamine_targets[0, ~surprising] = -1
+
+        # === BUILD RECALL PAIRS from conversation chunks ===
+        # Split into overlapping windows. Weight by average surprise per chunk.
+        recall_pairs = []
+        recall_pair_weights = []
+        chunk_size = min(256, len(tokens) // 3)
+
+        if chunk_size >= 32:
+            n_chunks = max(1, int(len(tokens) * recall_fraction / chunk_size))
+            stride = max(1, (len(tokens) - chunk_size) // max(n_chunks, 1))
+
+            for start in range(0, len(tokens) - chunk_size, stride):
+                if len(recall_pairs) >= n_chunks:
+                    break
+                chunk = tokens[start:start + chunk_size]
+                r_input = torch.tensor([chunk[:-1]], dtype=torch.long, device=device)
+                r_target = torch.tensor([chunk[1:]], dtype=torch.long, device=device)
+                recall_pairs.append((r_input, r_target))
+
+                # Weight by surprise: chunks with more surprising tokens matter more
+                chunk_surprise = per_token_ce[start:start + chunk_size - 1]
+                recall_pair_weights.append(float(chunk_surprise.mean()))
+
+        # Normalize weights (higher surprise = more weight)
+        if not recall_pair_weights:
+            recall_pair_weights = None
+        # else: memorize() normalizes internally
+
+        # === MEMORIZE: the model commits surprising moments to permanent weights ===
+        # Use memorize() (née compact_memory) with conversation as teaching data
+        sanity_prompt = tokens[:20] if len(tokens) >= 20 else None
+
+        # Check if model has memorize (QwenBackboneGPT) or compact_memory (GPT)
+        memorize_fn = getattr(self.model, 'memorize',
+                              getattr(self.model, 'compact_memory', None))
+        if memorize_fn is None:
+            return {'skipped': True, 'reason': 'no_memorize_method'}
+
+        stats = memorize_fn(
+            teaching_ids=ids,
+            target_ids=dopamine_targets,
+            lr=lr, steps=steps,
+            recall_pairs=recall_pairs if recall_pairs else None,
+            recall_pair_weights=recall_pair_weights,
+            recall_weight=0.7,
+            max_delta=max_delta,
+            sanity_prompt=sanity_prompt,
+            diagnostics=diagnostics,
+        )
+
+        # Mark these tokens as memorized (idempotency: won't re-memorize)
+        self._memorized_up_to = len(self.all_tokens)
+
+        # Add conversation-level stats
+        stats['conversation_tokens'] = len(tokens)
+        stats['surprising_tokens'] = int(n_surprising)
+        stats['surprising_fraction'] = float(n_surprising / len(tokens))
+        stats['surprise_mean'] = float(ce_mean)
+        stats['surprise_std'] = float(ce_std)
+        stats['num_recall_chunks'] = len(recall_pairs)
+        stats['self_fed'] = True  # flag that this was self-feeding, not external teaching
+
+        return stats
 
     def _init_online_learning(self, lr):
         """Lazy init: collect plastic params, snapshot pretrained weights, build optimizer."""

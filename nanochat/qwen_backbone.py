@@ -837,12 +837,18 @@ class QwenBackboneGPT(nn.Module):
 
         return diag
 
-    def compact_memory(self, teaching_ids, target_ids, lr=3e-4, steps=30,
-                       recall_pairs=None, recall_weight=0.7,
-                       max_delta=0.15, sanity_prompt=None,
-                       kl_weight=0.3, kl_temperature=2.0,
-                       plastic_only=False, nullspace_proj=False):
-        """Recall-aware neuroplasticity: teach facts AND learn to recall them.
+    def memorize(self, teaching_ids, target_ids, lr=3e-4, steps=30,
+                 recall_pairs=None, recall_weight=0.7,
+                 recall_pair_weights=None,
+                 max_delta=0.15, sanity_prompt=None,
+                 kl_weight=0.3, kl_temperature=2.0,
+                 plastic_only=False, nullspace_proj=False,
+                 diagnostics=False):
+        """Intentionally commit something to permanent memory.
+
+        The model chooses to remember. This is not training — it's an act of will.
+        The teaching text becomes part of the model's permanent knowledge via
+        gradient-based consolidation with recall-aware optimization.
 
         Neuroscience-informed design (BCM theory + three-factor Hebbian):
           - LTP in hippocampus changes synaptic strength by 25-180%
@@ -869,10 +875,17 @@ class QwenBackboneGPT(nn.Module):
             steps: consolidation replay steps (default 30)
             recall_pairs: list of (input_ids, target_ids) tensors for recall
             recall_weight: weight for recall loss vs teaching loss (default 0.7)
+            recall_pair_weights: optional list of floats, one per recall pair. Higher
+                weight = more optimization pressure. Normalized internally to sum to 1.
+                Use this for interleaved replay: give current-fact pairs higher weight
+                than replay pairs so new learning isn't diluted. None = uniform weights.
             max_delta: max relative weight change before early stop (default 0.15 = 15%)
             sanity_prompt: token ids to generate from post-compact; rollback on collapse
             kl_weight: weight for KL divergence anchor loss (default 0.3)
             kl_temperature: temperature for KL softmax (default 2.0, higher = softer anchor)
+            diagnostics: if True, collect rich per-step diagnostics (slower but
+                essential for auto-researcher). Adds per_pair_losses, grad_cosines,
+                cproj_delta_svd, and sync_diagnostics to return dict.
         Returns:
             dict with diagnostics
         """
@@ -931,15 +944,17 @@ class QwenBackboneGPT(nn.Module):
         # =====================================================================
         # This prevents mode collapse / repetition by penalizing divergence
         # from the model's original output distribution (same idea as RLHF's KL penalty).
-        kl_anchors = []
+        kl_anchors = None  # (N, T_max, V) batched anchor or None
         if recall_pairs and kl_weight > 0:
             with torch.no_grad():
-                for r_input, r_target in recall_pairs:
-                    ref_logits = self.forward(r_input)
-                    # Store soft targets at elevated temperature (smoother anchor)
-                    kl_anchors.append(
-                        F.log_softmax(ref_logits / kl_temperature, dim=-1).detach()
-                    )
+                # Batch all recall pairs for a single forward pass
+                _kl_max_len = max(r_in.shape[1] for r_in, _ in recall_pairs)
+                _kl_batch = torch.zeros(
+                    len(recall_pairs), _kl_max_len, dtype=torch.long, device=device)
+                for i, (r_in, _) in enumerate(recall_pairs):
+                    _kl_batch[i, :r_in.shape[1]] = r_in[0]
+                ref_logits = self.forward(_kl_batch)
+                kl_anchors = F.log_softmax(ref_logits / kl_temperature, dim=-1).detach()
 
         # Record pre-compact norms for homeostatic scaling
         pre_norms = {}
@@ -1002,47 +1017,133 @@ class QwenBackboneGPT(nn.Module):
         # Compute total pre-norm for relative delta tracking
         total_pre_norm = sum(pre_params[k].norm().item() for k in pre_params)
 
+        # Pre-compute recall pair weights once (Bug 2: was recomputed every step)
+        _rpw = None
+        if recall_pairs:
+            if recall_pair_weights is not None:
+                _rpw = torch.tensor(recall_pair_weights, dtype=torch.float32)
+                _rpw = _rpw / _rpw.sum()
+            else:
+                _rpw = torch.ones(len(recall_pairs)) / len(recall_pairs)
+
+        # c_proj params for gradient cosine diagnostic (collected once)
+        _cproj_params = None
+        if diagnostics:
+            _cproj_params = [ctm.c_proj.weight for ctm in self.ctm_blocks.values()
+                             if ctm.c_proj.weight.requires_grad]
+
+        # === Diagnostics init ===
+        per_pair_losses = {}
+        grad_cosines = []
+        sync_pre = {}
+        if diagnostics:
+            if recall_pairs:
+                for pi in range(len(recall_pairs)):
+                    per_pair_losses[pi] = []
+            # Capture pre-compact sync signal
+            for idx, cached in da_cached_layers.items():
+                alpha_out = cached['alpha_out']
+                beta_out = cached['beta_out']
+                sync_sig = alpha_out / torch.sqrt(beta_out + 1e-8)
+                sync_pre[idx] = {
+                    'norm': float(sync_sig.norm()),
+                    'mean': float(sync_sig.mean()),
+                    'std': float(sync_sig.std()),
+                    'snapshot': sync_sig.detach().clone(),
+                }
+
+        # Pre-allocate step cache buffers (reuse across steps, copy-into instead of clone)
+        _step_cache = CTMCacheCls(self.config.n_layer)
+        for idx, cached in da_cached_layers.items():
+            _step_cache.layers[idx] = {
+                k: v.detach().clone() for k, v in cached.items()
+            }
+
         for step in range(steps):
             optimizer.zero_grad()
 
             # Teaching loss (with dopamine-shaped cache)
-            step_cache = CTMCacheCls(self.config.n_layer)
+            # Reuse pre-allocated buffers — copy_ is cheaper than clone (no alloc)
             for idx, cached in da_cached_layers.items():
-                step_cache.layers[idx] = {
-                    k: v.detach().clone() for k, v in cached.items()
-                }
+                for k, v in cached.items():
+                    _step_cache.layers[idx][k].copy_(v)
             _, loss_teach = self.forward(teaching_ids, targets=target_ids,
-                                         ctm_cache=step_cache)
+                                         ctm_cache=_step_cache)
 
             # Recall loss (fresh context — the actual test condition)
+            # Batched: pad all recall pairs to max length, single forward pass.
+            # Turns N sequential B=1 forwards into 1 forward with B=N.
             if recall_pairs:
                 loss_recall = torch.tensor(0.0, device=device)
                 loss_kl = torch.tensor(0.0, device=device)
-                for i, (r_input, r_target) in enumerate(recall_pairs):
-                    r_logits = self.forward(r_input)
-                    # Standard CE recall loss
+
+                # On first step, build the padded batch (reuse across steps)
+                if step == 0:
+                    _recall_max_len = max(r_in.shape[1] for r_in, _ in recall_pairs)
+                    _recall_n = len(recall_pairs)
+                    _recall_input_batch = torch.full(
+                        (_recall_n, _recall_max_len), 0, dtype=torch.long, device=device)
+                    _recall_target_batch = torch.full(
+                        (_recall_n, _recall_max_len), -1, dtype=torch.long, device=device)
+                    _recall_lengths = []
+                    for i, (r_in, r_tgt) in enumerate(recall_pairs):
+                        L = r_in.shape[1]
+                        _recall_input_batch[i, :L] = r_in[0]
+                        _recall_target_batch[i, :L] = r_tgt[0]
+                        _recall_lengths.append(L)
+
+                # Single batched forward for all recall pairs
+                r_logits_batch = self.forward(_recall_input_batch)  # (N, T_max, V)
+
+                # Per-pair CE loss (computed from the batch, no extra forward)
+                for i in range(_recall_n):
+                    L = _recall_lengths[i]
                     rl = F.cross_entropy(
-                        r_logits.reshape(-1, r_logits.size(-1)),
-                        r_target.reshape(-1),
+                        r_logits_batch[i, :L].reshape(-1, r_logits_batch.size(-1)),
+                        _recall_target_batch[i, :L].reshape(-1),
                         ignore_index=-1,
                     )
-                    loss_recall = loss_recall + rl
+                    loss_recall = loss_recall + _rpw[i] * rl
 
-                    # KL anchor: penalize divergence from pre-compact distribution
-                    if i < len(kl_anchors) and kl_weight > 0:
-                        current_log_probs = F.log_softmax(r_logits / kl_temperature, dim=-1)
-                        # KL(ref || current) — encourages current to stay close to ref
-                        kl = F.kl_div(current_log_probs, kl_anchors[i],
+                    if diagnostics and i in per_pair_losses:
+                        per_pair_losses[i].append(rl.item())
+
+                    # KL anchor
+                    if kl_anchors is not None and kl_weight > 0:
+                        current_log_probs = F.log_softmax(
+                            r_logits_batch[i:i+1, :L] / kl_temperature, dim=-1)
+                        kl = F.kl_div(current_log_probs, kl_anchors[i:i+1, :L],
                                       log_target=True, reduction='batchmean')
-                        loss_kl = loss_kl + kl
+                        loss_kl = loss_kl + _rpw[i] * kl
 
-                loss_recall = loss_recall / len(recall_pairs)
-                loss_kl = loss_kl / len(recall_pairs) if kl_anchors else loss_kl
+                loss_kl = loss_kl if kl_anchors is not None else loss_kl
                 loss = ((1 - recall_weight) * loss_teach
                         + recall_weight * loss_recall
                         + kl_weight * loss_kl)
             else:
                 loss = loss_teach
+
+            # === Gradient direction analysis (sampled every 10 steps) ===
+            # Read-only diagnostic: uses torch.autograd.grad to avoid consuming
+            # the computation graph or polluting .grad buffers. (Bug 1 fix)
+            if (diagnostics and recall_pairs and len(recall_pairs) > 1
+                    and _cproj_params and step % 10 == 0):
+                _pair_grads = []
+                for pi, (r_input, r_target) in enumerate(recall_pairs):
+                    _r_logits = self.forward(r_input)
+                    _rl = F.cross_entropy(
+                        _r_logits.reshape(-1, _r_logits.size(-1)),
+                        r_target.reshape(-1), ignore_index=-1)
+                    _g = torch.autograd.grad(_rl, _cproj_params,
+                                             retain_graph=False, allow_unused=True)
+                    _grads = [g.detach().flatten() for g in _g if g is not None]
+                    if _grads:
+                        _pair_grads.append(torch.cat(_grads))
+                if len(_pair_grads) >= 2:
+                    _stacked = torch.stack(_pair_grads)
+                    _norms = _stacked.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                    _cos = (_stacked @ _stacked.T) / (_norms @ _norms.T)
+                    grad_cosines.append({'step': step, 'cosines': _cos.cpu().tolist()})
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(all_ctm_params, 1.0)
@@ -1107,6 +1208,49 @@ class QwenBackboneGPT(nn.Module):
                     total_norm += pre_params[key].norm().item()
         rel_delta = total_delta / (total_norm + 1e-8)
 
+        # === Post-compact diagnostics ===
+        cproj_delta_svd = {}
+        sync_diagnostics = {}
+        if diagnostics:
+            # c_proj weight delta SVD — which directions did this compact write to?
+            for idx_str, ctm in self.ctm_blocks.items():
+                key = f"{idx_str}.c_proj.weight"
+                if key in pre_params:
+                    W_delta = (ctm.c_proj.weight.data - pre_params[key]).detach().float().cpu()
+                    svs = torch.linalg.svdvals(W_delta)
+                    sv_total = svs.sum() + 1e-8
+                    cumsum = svs.cumsum(0) / sv_total
+                    cproj_delta_svd[int(idx_str)] = {
+                        'singular_values': svs[:10].tolist(),  # top 10
+                        'rank90': int((cumsum < 0.9).sum().item()) + 1,
+                        'frobenius': float(W_delta.norm()),
+                        'spectral': float(svs[0]) if len(svs) > 0 else 0.0,
+                    }
+
+            # Sync change: how did the sync landscape shift?
+            with torch.no_grad():
+                post_cache = CTMCacheCls(self.config.n_layer)
+                for idx, cached in da_cached_layers.items():
+                    post_cache.layers[idx] = {
+                        k: v.detach().clone() for k, v in cached.items()
+                    }
+                self.forward(teaching_ids, ctm_cache=post_cache)
+                for idx in self.ctm_layer_indices:
+                    if post_cache.layers[idx] is not None and idx in sync_pre:
+                        pc = post_cache.layers[idx]
+                        post_sync = pc['alpha_out'] / torch.sqrt(pc['beta_out'] + 1e-8)
+                        pre_snap = sync_pre[idx]['snapshot']
+                        sync_diagnostics[idx] = {
+                            'pre_norm': sync_pre[idx]['norm'],
+                            'pre_mean': sync_pre[idx]['mean'],
+                            'post_norm': float(post_sync.norm()),
+                            'post_mean': float(post_sync.mean()),
+                            'cosine_shift': float(F.cosine_similarity(
+                                pre_snap.flatten().unsqueeze(0),
+                                post_sync.flatten().unsqueeze(0)).item()),
+                            'delta_norm': float((post_sync - pre_snap).norm()),
+                        }
+
         # Sanity check: generate from a known prompt and detect repetition collapse
         collapsed = False
         if sanity_prompt is not None and total_delta > 0:
@@ -1137,7 +1281,7 @@ class QwenBackboneGPT(nn.Module):
                         p.data.copy_(pre_params[key])
             total_delta = 0.0
 
-        return {
+        result = {
             'total_delta': total_delta,
             'rel_delta': rel_delta,
             'losses': losses,
@@ -1147,6 +1291,16 @@ class QwenBackboneGPT(nn.Module):
             'collapsed': collapsed,
             'early_stopped': len(losses) < steps,
         }
+        if diagnostics:
+            result['per_pair_losses'] = per_pair_losses
+            result['grad_cosines'] = grad_cosines
+            result['cproj_delta_svd'] = cproj_delta_svd
+            result['sync_diagnostics'] = sync_diagnostics
+        return result
+
+    def compact_memory(self, *args, **kwargs):
+        """Backward compat alias for memorize()."""
+        return self.memorize(*args, **kwargs)
 
     def consolidate(self, replay_batches, lr=1e-4, steps=4):
         """Sleep consolidation: certainty-weighted Hebbian update on replay buffer.

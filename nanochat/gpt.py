@@ -164,6 +164,11 @@ class MLP(nn.Module):
 
 # --- Continuous Thought Machine block (replaces MLP) ---
 # Adapted from https://github.com/sakana-ai/continuous-thought-machines
+try:
+    from nanochat.triton_sync import fused_sync_update
+    _has_fused_sync = True
+except ImportError:
+    _has_fused_sync = False
 # Each token gets K iterations of synapse -> trace update -> NLM processing.
 # Output is read via synchronisation (pairwise temporal correlation between neurons).
 
@@ -685,6 +690,10 @@ class CTMBlock(nn.Module):
 
                 # Update trace (rolling window: drop oldest, append newest)
                 trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
+                # NOTE: this allocates (BT, D, M) per tick. A ring buffer would be
+                # zero-alloc but changes column order, which breaks NLM (position-
+                # sensitive SuperLinear). To use ring buffer: train with ring buffer
+                # from step 0, or add learned position embeddings to trace columns.
 
                 # NLMs: per-neuron processing of trace history
                 h = F.glu(self.nlm1(trace), dim=-1)       # (BT, D, hidden)
@@ -701,19 +710,26 @@ class CTMBlock(nn.Module):
                 if modified is not None:
                     state = modified
 
-            # Update S_out synchronisation (for readout)
-            left_out = state[:, self.synch_out_left]
-            right_out = state[:, self.synch_out_right]
-            pp_out = left_out * right_out * dopamine  # dopamine-gated
-            alpha_out = r_out * alpha_out + pp_out
-            beta_out = r_out * beta_out + dopamine  # scale normalizer too so sync magnitude stays stable
+            # Update S_out and S_action synchronisation accumulators.
+            # Inference: fused Triton kernel (1 launch vs 6 gathers + 4 ops).
+            # Training: unfused PyTorch (autograd needs non-in-place ops).
+            if not self.training and _has_fused_sync:
+                fused_sync_update(state, alpha_out, beta_out,
+                                  self.synch_out_left, self.synch_out_right, r_out, dopamine)
+                fused_sync_update(state, alpha_act, beta_act,
+                                  self.synch_act_left, self.synch_act_right, r_act, dopamine)
+            else:
+                left_out = state[:, self.synch_out_left]
+                right_out = state[:, self.synch_out_right]
+                pp_out = left_out * right_out * dopamine
+                alpha_out = r_out * alpha_out + pp_out
+                beta_out = r_out * beta_out + dopamine
 
-            # Update S_action synchronisation (for attention queries)
-            left_act = state[:, self.synch_act_left]
-            right_act = state[:, self.synch_act_right]
-            pp_act = left_act * right_act * dopamine  # dopamine-gated
-            alpha_act = r_act * alpha_act + pp_act
-            beta_act = r_act * beta_act + dopamine  # scale normalizer too so sync magnitude stays stable
+                left_act = state[:, self.synch_act_left]
+                right_act = state[:, self.synch_act_right]
+                pp_act = left_act * right_act * dopamine
+                alpha_act = r_act * alpha_act + pp_act
+                beta_act = r_act * beta_act + dopamine
 
             # Multi-tick: save readout at each k for auxiliary loss
             # Detach early ticks to limit VRAM — only last multi_tick_grad ticks
