@@ -49,6 +49,7 @@ class GPTConfig:
     use_ctm: bool = False
     ctm_iterations: int = 4       # K thinking steps per token
     ctm_aux_weight: float = 0.1   # auxiliary per-tick supervision weight (0=off, 0.1=default)
+    ctm_bound_guided_aux: bool = False  # use Angeris synapse gap to weight per-tick aux loss
     ctm_memory_length: int = 16   # rolling trace history length (paper uses 25)
     ctm_n_synch: int = 384        # neuron pairs for synchronisation readout
     ctm_memory_hidden: int = 32   # NLM hidden dimension (-1 = n_synch // 4, scales with model. 32 for training memory budget)
@@ -405,6 +406,110 @@ class CTMBlock(nn.Module):
         self.plastic_A = nn.Parameter(torch.zeros(n_synch, self.plastic_rank))
         self.plastic_B = nn.Parameter(torch.zeros(self.plastic_rank, D))
         self.plastic_gate = nn.Parameter(torch.tensor(0.0))  # starts off, grows via compact
+
+        # Bound-guided aux supervision: per-tick weights from Angeris synapse gap.
+        # Updated periodically by dream() → _compute_tick_gaps(). Not a learnable param.
+        # Shape (K,): α_k = gap_k / sum(gaps). Ticks far from optimal get more supervision.
+        self.register_buffer('_tick_aux_weights', torch.ones(K) / K)
+
+    @torch.no_grad()
+    def compute_tick_gaps(self, x_sample):
+        """Compute per-tick synapse gap using Angeris optimality bounds.
+
+        Runs K ticks, captures synapse input/output at each tick, computes
+        the gap between actual synapse output and least-squares optimal W.
+        Ticks far from their bound need more supervision → higher weight.
+
+        Args:
+            x_sample: (1, T, D) sample input for probing
+
+        Updates self._tick_aux_weights in-place.
+        """
+        B, T, D = x_sample.shape
+        BT = B * T
+        K = self.active_K
+        dtype = x_sample.dtype
+        eps = 1e-8
+
+        # Precompute keys/values
+        H, HD = self.n_attn_heads, self.attn_head_dim
+        attn_k = norm(self.attn_k_proj(x_sample).view(B, T, H, HD))
+        attn_v = self.attn_v_proj(x_sample).view(B, T, H, HD)
+
+        # Init state
+        state = self.start_state.to(dtype).unsqueeze(0).expand(BT, -1)
+        trace = self.start_trace.to(dtype).unsqueeze(0).expand(BT, -1, -1).clone()
+
+        # Init sync
+        left_out_init = state[:, self.synch_out_left]
+        right_out_init = state[:, self.synch_out_right]
+        alpha_out = left_out_init * right_out_init
+        beta_out = torch.ones_like(alpha_out)
+        left_act_init = state[:, self.synch_act_left]
+        right_act_init = state[:, self.synch_act_right]
+        alpha_act = left_act_init * right_act_init
+        beta_act = torch.ones_like(alpha_act)
+        r_out = torch.exp(-self.decay_out.clamp(0, 15).to(dtype)).unsqueeze(0)
+        r_act = torch.exp(-self.decay_act.clamp(0, 15).to(dtype)).unsqueeze(0)
+
+        tick_gaps = []
+
+        for k in range(K):
+            # Cross-attention
+            synch_act = self._sync_readout(alpha_act, beta_act).to(dtype)
+            attn_q = norm(self.attn_q_proj(synch_act).view(B, T, H, HD))
+            obs = flash_attn.flash_attn_func(attn_q, attn_k, attn_v, causal=True)
+            obs = obs.reshape(BT, D)
+
+            # Synapse: capture input and output
+            tick_emb = self.tick_embed[k].unsqueeze(0).expand(BT, -1)
+            syn_in = torch.cat([obs, state + tick_emb], dim=-1)  # (BT, 2D)
+            syn_out = self.synapses(syn_in)  # (BT, D)
+
+            # Compute least-squares optimal gap for this tick
+            # Gap = ||syn_out - W_opt @ syn_in||² where W_opt = argmin ||syn_out - W @ syn_in||²
+            # = ||syn_out||² - ||syn_out @ syn_in^T @ (syn_in @ syn_in^T)^{-1} @ syn_in||²
+            # Simplified: use SVD-based residual
+            sin_f = syn_in.float()
+            sout_f = syn_out.float()
+            # Optimal W for this tick: W_opt = sout^T sin (sin^T sin)^-1
+            try:
+                gram = sin_f.T @ sin_f  # (2D, 2D)
+                cross = sout_f.T @ sin_f  # (D, 2D)
+                W_opt = cross @ torch.linalg.pinv(gram)
+                residual = (sout_f - sin_f @ W_opt.T).pow(2).sum().item()
+                total = sout_f.pow(2).sum().item()
+                gap = residual / (total + eps)
+            except Exception:
+                gap = 1.0  # default: full supervision if computation fails
+
+            tick_gaps.append(gap)
+
+            # Update state (continue the tick loop)
+            new_state = state + syn_out
+            trace = torch.cat([trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
+            h = F.glu(self.nlm1(trace), dim=-1)
+            state = F.glu(self.nlm2(h), dim=-1).squeeze(-1)
+
+            # Update sync
+            left_out = state[:, self.synch_out_left]
+            right_out = state[:, self.synch_out_right]
+            alpha_out = r_out * alpha_out + left_out * right_out
+            beta_out = r_out * beta_out + 1.0
+            left_act = state[:, self.synch_act_left]
+            right_act = state[:, self.synch_act_right]
+            alpha_act = r_act * alpha_act + left_act * right_act
+            beta_act = r_act * beta_act + 1.0
+
+        # Convert gaps to supervision weights:
+        # Higher gap = further from optimal = needs more supervision
+        # Normalize to sum to 1, add floor so no tick gets zero weight
+        gaps = torch.tensor(tick_gaps, device=x_sample.device, dtype=torch.float32)
+        floor = 0.01  # minimum 1% weight for every tick
+        weights = gaps + floor
+        weights = weights / weights.sum()
+        self._tick_aux_weights.copy_(weights)
+        return tick_gaps
 
     def _sync_readout(self, alpha, beta):
         """Normalize sync accumulator. sqrt (paper) or mean (K-invariant)."""
@@ -1211,14 +1316,42 @@ class GPT(nn.Module):
                     diagnostics['loss/argmax_cert'] = loss_argmax_cert.item()
 
             # Auxiliary per-tick supervision: every tick learns to predict, not just the selected one.
-            # This forces monotonic improvement across ticks (poker CTM finding: without this,
-            # later ticks diverge; with it, each tick measurably improves predictions).
+            # Two modes:
+            #   1. Uniform (default): all ticks weighted equally (poker CTM finding).
+            #   2. Bound-guided (Angeris): per-tick weight ∝ synapse gap from optimality.
+            #      Ticks far from their bound get more supervision. Ticks near optimal get less.
+            #      This solves the deep supervision open problems: where to supervise, how to
+            #      weight α, and when to stop (near-bound ticks = stop = no overfitting).
             aux_weight = getattr(self.config, 'ctm_aux_weight', 0.1)
             if aux_weight > 0:
-                aux_loss = all_losses.mean()  # average loss across ALL ticks and ALL tokens
+                use_bound_guided = getattr(self.config, 'ctm_bound_guided_aux', False)
+                K = all_losses.size(0)
+
+                # Find the last CTM block for its tick weights
+                _ctm_block = None
+                if use_bound_guided:
+                    for block in reversed(list(self.transformer.h)):
+                        if isinstance(block.mlp, CTMBlock):
+                            _ctm_block = block.mlp
+                            break
+                if use_bound_guided and _ctm_block is not None:
+                    # Weighted per-tick loss using Angeris gap weights
+                    ctm_block = _ctm_block
+                    tick_weights = ctm_block._tick_aux_weights[:K]  # (K,)
+                    # Weighted mean: sum_k(w_k * mean_token_loss_k)
+                    per_tick_loss = all_losses.mean(dim=1)  # (K,)
+                    aux_loss = (tick_weights * per_tick_loss).sum()
+                    if diagnostics is not None:
+                        for k in range(K):
+                            diagnostics[f'aux/tick_{k}_weight'] = tick_weights[k].item()
+                else:
+                    # Uniform: average across all ticks equally
+                    aux_loss = all_losses.mean()
+
                 task_loss = (1.0 - aux_weight) * task_loss + aux_weight * aux_loss
                 if diagnostics is not None:
                     diagnostics['loss/aux_all_ticks'] = aux_loss.item()
+                    diagnostics['loss/aux_mode'] = 1.0 if use_bound_guided else 0.0
 
             # Distillation: use the last tick's logits as the student output
             distill_loss, elastic_loss = self._distill_loss(self._compute_logits(last_layer_ticks[-1]), idx)

@@ -74,6 +74,7 @@ parser.add_argument("--sleep-every", type=int, default=50, help="CTM dream diagn
 # Regularization
 parser.add_argument("--spectral-reg", type=float, default=0.0, help="spectral reg weight: penalize c_proj σ₁ dominance (0=disable, try 0.1)")
 parser.add_argument("--ctm-aux-weight", type=float, default=0.1, help="auxiliary per-tick supervision weight (0=off, 0.1=default). Forces monotonic tick improvement.")
+parser.add_argument("--bound-guided-aux", action="store_true", help="use Angeris synapse gap to weight per-tick aux loss (default: uniform)")
 parser.add_argument("--plasticity-every", type=int, default=0, help="run plasticity rehearsal every N steps (0=disable, try 25)")
 parser.add_argument("--plasticity-lr", type=float, default=1e-4, help="LR for plasticity rehearsal compact step")
 parser.add_argument("--plasticity-steps", type=int, default=10, help="compact_memory steps during rehearsal")
@@ -190,6 +191,7 @@ ctm_kwargs = {
     "ctm_synapse_depth": args.ctm_synapse_depth,
     "ctm_adaptive_k": args.ctm_adaptive_k,
     "ctm_aux_weight": args.ctm_aux_weight,
+    "ctm_bound_guided_aux": args.bound_guided_aux,
 }
 # Remove None values so defaults in QwenBackboneGPT apply
 ctm_kwargs = {k: v for k, v in ctm_kwargs.items() if v is not None}
@@ -429,10 +431,47 @@ while step <= num_iterations:
         for layer_idx, d in dream_results.items():
             print0(f"  Dream L{layer_idx}: converged={d['converged']}, "
                    f"K={d['K_start']}, delta={d['final_distance']:.4f}")
+            # Bounds diagnostics
+            if 'c_proj_rank90' in d:
+                print0(f"    c_proj: rank90={d['c_proj_rank90']}, rank99={d['c_proj_rank99']}, "
+                       f"cond={d['c_proj_condition']:.0f}, frob={d['c_proj_frobenius']:.2f}")
+                print0(f"    c_proj top SVs: {['%.1f' % s for s in d.get('c_proj_top5_sv', [])]}")
+            if 'synapse_act_rank' in d:
+                print0(f"    synapse: act_rank={d['synapse_act_rank']}, "
+                       f"utilization={d['synapse_utilization_pct']:.1f}%, "
+                       f"gap={d.get('synapse_gap_pct', -1):.1f}%")
+            if 'n_dead_neurons' in d and d['n_dead_neurons'] >= 0:
+                print0(f"    neurons: dead={d['n_dead_neurons']}/{d.get('K_start', '?')}, "
+                       f"diversity={d.get('neuron_diversity', 0):.3f}, "
+                       f"norms=[{d['neuron_norm_min']:.3f}, {d['neuron_norm_mean']:.3f}, {d['neuron_norm_max']:.3f}]")
+            if 'plastic_gate' in d:
+                print0(f"    plastic: gate={d['plastic_gate']:.4f}, norm={d['plastic_norm']:.4f}")
+            if 'bottleneck' in d and d['bottleneck'] != 'none':
+                print0(f"    BOTTLENECK: {d['bottleneck']}")
+            if 'tick_gaps' in d:
+                gaps = d['tick_gaps']
+                weights = d['tick_aux_weights']
+                # Show top 5 ticks by weight (where supervision is concentrated)
+                top_k = sorted(range(len(weights)), key=lambda i: -weights[i])[:5]
+                top_str = ", ".join(f"t{k}:{weights[k]:.3f}(gap={gaps[k]:.3f})" for k in top_k)
+                print0(f"    bound-guided aux: {top_str}")
         log_data = {"step": step}
         for layer_idx, d in dream_results.items():
             log_data[f"ctm/L{layer_idx}_dream_converged"] = int(d['converged'])
             log_data[f"ctm/L{layer_idx}_dream_delta"] = d['final_distance']
+            # Log bounds metrics to wandb
+            for key in ('c_proj_rank90', 'c_proj_rank99', 'c_proj_condition', 'c_proj_frobenius',
+                        'synapse_act_rank', 'synapse_utilization_pct', 'synapse_gap_pct',
+                        'n_dead_neurons', 'neuron_diversity', 'neuron_norm_mean',
+                        'plastic_gate', 'plastic_norm'):
+                if key in d:
+                    log_data[f"ctm/L{layer_idx}_{key}"] = d[key]
+            if 'bottleneck' in d:
+                log_data[f"ctm/L{layer_idx}_bottleneck"] = d['bottleneck']
+            if 'tick_gaps' in d:
+                for k, (gap, w) in enumerate(zip(d['tick_gaps'], d['tick_aux_weights'])):
+                    log_data[f"ctm/L{layer_idx}_tick_{k}_gap"] = gap
+                    log_data[f"ctm/L{layer_idx}_tick_{k}_aux_w"] = w
 
         # Per-tick diagnostics: run multi_tick forward on current batch
         with torch.no_grad():

@@ -97,11 +97,39 @@ class QwenBackboneGPT(nn.Module):
         self.backbone = backbone
         qwen_config = backbone.config
 
+        # Detect Qwen3.5 (Gated DeltaNet hybrid) — must have linear_attention layers
+        self._is_qwen35 = (hasattr(qwen_config, 'layer_types')
+                           and 'linear_attention' in getattr(qwen_config, 'layer_types', []))
+        if self._is_qwen35:
+            self._qwen_config = qwen_config  # needed for Qwen3_5DynamicCache
+            # Find last full-attention layer for default CTM placement
+            full_attn_layers = [i for i, lt in enumerate(qwen_config.layer_types)
+                                if lt == "full_attention"]
+            self._full_attn_layers = set(full_attn_layers)
+            print0(f"  Qwen3.5: {len(full_attn_layers)} full-attn layers, "
+                   f"{qwen_config.num_hidden_layers - len(full_attn_layers)} linear-attn layers")
+
         # Which layers get CTM
         n_layers = qwen_config.num_hidden_layers
         if ctm_layer_indices is None:
-            ctm_layer_indices = [n_layers - 1]  # default: last layer only
+            if self._is_qwen35:
+                # Default: last full-attention layer (CTM needs self_attn, not linear_attn)
+                last_full = max(self._full_attn_layers)
+                ctm_layer_indices = [last_full]
+                print0(f"  CTM default: layer {last_full} (last full-attention)")
+            else:
+                ctm_layer_indices = [n_layers - 1]  # default: last layer only
         self.ctm_layer_indices = sorted(ctm_layer_indices)
+
+        # Validate: Qwen3.5 CTM layers must be full-attention (not linear/DeltaNet)
+        if self._is_qwen35:
+            for idx in self.ctm_layer_indices:
+                if idx not in self._full_attn_layers:
+                    raise ValueError(
+                        f"CTM layer {idx} is linear_attention (DeltaNet), not full_attention. "
+                        f"CTM requires self_attn. Full-attention layers: {sorted(self._full_attn_layers)}"
+                    )
+
         # Backwards compat: single-CTM code can still read ctm_layer_idx
         self.ctm_layer_idx = self.ctm_layer_indices[-1]
 
@@ -139,9 +167,11 @@ class QwenBackboneGPT(nn.Module):
         # This is set properly after checkpoint loading via set_replacement_layers()
         self._replacement_layers = set()  # layers where MLP is removed (trained CTMs)
 
-        # Freeze entire backbone
+        # Freeze entire backbone (selectively unfrozen later via unfreeze_layers())
         for p in self.backbone.parameters():
             p.requires_grad_(False)
+
+        self._unfrozen_layers = set()
 
         # Internal HF cache for KV during generation
         self._hf_cache = None
@@ -156,13 +186,29 @@ class QwenBackboneGPT(nn.Module):
             ctm_layer_indices: list of layer indices for CTM, e.g. [14, 27].
                                None = last layer only.
         """
-        from transformers import AutoModelForCausalLM
+        is_qwen35 = "qwen3.5" in model_name.lower() or "qwen3_5" in model_name.lower()
+
         print0(f"Loading backbone: {model_name}")
-        backbone = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",  # use PyTorch SDPA (works everywhere)
-        )
+        if is_qwen35:
+            from transformers import AutoConfig, Qwen3_5ForCausalLM
+            full_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            text_config = getattr(full_config, 'text_config', full_config)
+            backbone = Qwen3_5ForCausalLM.from_pretrained(
+                model_name,
+                config=text_config,
+                dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
+            print0(f"  Qwen3.5 loaded via text_config, layers: {text_config.num_hidden_layers}, "
+                   f"layer_types: {text_config.layer_types[:4]}...{text_config.layer_types[-2:]}")
+        else:
+            from transformers import AutoModelForCausalLM
+            backbone = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
+
         ctm_kwargs = ctm_kwargs or {}
         model = cls(backbone, ctm_kwargs, ctm_layer_indices)
         return model
@@ -264,19 +310,30 @@ class QwenBackboneGPT(nn.Module):
             cache_position = torch.arange(
                 self._cache_position, self._cache_position + T, device=device
             )
-            position_ids = cache_position.unsqueeze(0)
         else:
             cache_position = torch.arange(T, device=device)
-            position_ids = cache_position.unsqueeze(0)
 
-        # HF DynamicCache: create on first use, reuse across calls
-        from transformers import DynamicCache
+        # HF cache: create on first use, reuse across calls
         past_kv = self._hf_cache if use_cache else None
         if use_cache and past_kv is None:
-            past_kv = DynamicCache()
+            if self._is_qwen35:
+                from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+                past_kv = Qwen3_5DynamicCache(config=self._qwen_config)
+            else:
+                from transformers import DynamicCache
+                past_kv = DynamicCache()
 
         # Pre-compute rotary position embeddings (cos, sin)
-        position_embeddings = qwen_model.rotary_emb(x, position_ids)
+        if self._is_qwen35:
+            # MRoPE: position_ids must be (3, B, T) for rotary_emb
+            # For text-only: temporal/height/width all = text position
+            pos_1d = cache_position.view(1, 1, -1).expand(4, B, -1)
+            # Split: text_position_ids (unused), mrope_ids (3, B, T) for rotary
+            mrope_ids = pos_1d[1:]  # (3, B, T)
+            position_embeddings = qwen_model.rotary_emb(x, mrope_ids)
+        else:
+            position_ids = cache_position.unsqueeze(0)
+            position_embeddings = qwen_model.rotary_emb(x, position_ids)
 
         # === Run all layers, intercepting CTM layers' MLPs ===
         ctm_indices_set = set(self.ctm_layer_indices)
@@ -288,11 +345,11 @@ class QwenBackboneGPT(nn.Module):
             if i in ctm_indices_set:
                 ctm = self.ctm_blocks[str(i)]
 
-                # Custom path: Qwen attention + our CTMBlock
+                # Custom path: attention + our CTMBlock
                 residual = x
                 x_normed = layer.input_layernorm(x)
 
-                # Qwen attention
+                # Attention (Qwen3.5 CTM layers must be full_attention)
                 attn_outputs = layer.self_attn(
                     x_normed,
                     position_embeddings=position_embeddings,
@@ -335,14 +392,16 @@ class QwenBackboneGPT(nn.Module):
 
                 x = residual + mlp_out + ctm_out.to(residual.dtype)
             else:
-                # Standard Qwen layer (frozen)
-                x = layer(
-                    x,
+                # Standard layer (frozen) — handles both linear_attn and full_attn
+                layer_kwargs = dict(
                     position_embeddings=position_embeddings,
                     past_key_values=past_kv,
                     use_cache=use_cache,
                     cache_position=cache_position,
                 )
+                if self._is_qwen35:
+                    layer_kwargs['position_ids'] = mrope_ids
+                x = layer(x, **layer_kwargs)
 
         # Update cache state
         if use_cache:
@@ -481,6 +540,35 @@ class QwenBackboneGPT(nn.Module):
         self._tick_diagnostics['loss/last_tick'] = last_loss.item()
         self._tick_diagnostics['loss/grad_tick_frac'] = n_from_best / n_tokens if n_tokens > 0 else 0
 
+        # Auxiliary per-tick supervision (bound-guided or uniform)
+        aux_weight = getattr(self.config, 'ctm_aux_weight', 0.1)
+        if aux_weight > 0:
+            use_bound_guided = getattr(self.config, 'ctm_bound_guided_aux', False)
+
+            # Recompute per-tick mean loss (from detached pass 1 data — no extra VRAM)
+            # We need per-tick loss with grad for ticks that have it
+            per_tick_losses = []
+            for k in range(K):
+                if k in tick_losses:
+                    per_tick_losses.append(tick_losses[k].mean())
+                else:
+                    # Detached tick — use last_loss as proxy (has grad)
+                    per_tick_losses.append(last_loss)
+
+            if use_bound_guided:
+                ctm = self.ctm_blocks[str(self.ctm_layer_idx)]
+                tick_weights = ctm._tick_aux_weights[:K]  # (K,)
+                aux_loss = sum(w * l for w, l in zip(tick_weights, per_tick_losses))
+                self._tick_diagnostics['loss/aux_mode'] = 1.0
+                for k in range(K):
+                    self._tick_diagnostics[f'aux/tick_{k}_weight'] = tick_weights[k].item()
+            else:
+                aux_loss = sum(per_tick_losses) / K
+                self._tick_diagnostics['loss/aux_mode'] = 0.0
+
+            task_loss = (1.0 - aux_weight) * task_loss + aux_weight * aux_loss
+            self._tick_diagnostics['loss/aux_all_ticks'] = aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
+
         return logits_final, task_loss
 
     def reset_cache(self):
@@ -491,23 +579,75 @@ class QwenBackboneGPT(nn.Module):
     def get_device(self):
         return next(self.parameters()).device
 
-    def setup_optimizer(self, lr=0.001, weight_decay=0.0, **kwargs):
-        """Only optimize CTM block parameters (all CTM layers)."""
-        trainable = []
+    def unfreeze_layers(self, layer_indices):
+        """Unfreeze specific backbone layers for co-training with CTM.
+
+        Only unfreezes the MLP (FFN) of each specified layer, not attention.
+        Attention weights encode positional/relational structure that's hard
+        to recover if corrupted. MLP weights are more local and co-adapt
+        better with CTM.
+
+        Args:
+            layer_indices: list of layer indices to unfreeze, e.g. [23]
+        """
+        qwen_model = self.backbone.model if hasattr(self.backbone, 'model') else self.backbone.transformer
+        layers = qwen_model.layers if hasattr(qwen_model, 'layers') else qwen_model.h
+        unfrozen_params = 0
+        for idx in layer_indices:
+            layer = layers[idx]
+            # Unfreeze MLP only
+            mlp = layer.mlp if hasattr(layer, 'mlp') else layer.feed_forward
+            for p in mlp.parameters():
+                p.requires_grad_(True)
+                unfrozen_params += p.numel()
+            self._unfrozen_layers.add(idx)
+        print0(f"Unfroze MLP on backbone layers {list(layer_indices)}: "
+               f"{unfrozen_params:,} params now trainable")
+
+    def setup_optimizer(self, lr=0.001, weight_decay=0.0, backbone_lr_scale=0.1, **kwargs):
+        """Optimize CTM params + any unfrozen backbone params.
+
+        Backbone params get a lower learning rate (backbone_lr_scale * lr) to
+        avoid overwriting pretrained representations too aggressively.
+        """
+        ctm_params = []
         for idx_str, ctm in self.ctm_blocks.items():
             for p in ctm.parameters():
                 if p.requires_grad:
-                    trainable.append(p)
-        print0(f"Optimizer: {len(trainable)} CTM params across {len(self.ctm_blocks)} block(s), "
-               f"{sum(p.numel() for p in trainable):,} trainable params")
+                    ctm_params.append(p)
+        # Include unfrozen backbone params with lower LR
+        backbone_trainable = [p for p in self.backbone.parameters() if p.requires_grad]
 
-        # Simple AdamW for CTM params — no Muon (Muon is for large matrix params)
-        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay,
+        param_groups = [
+            {'params': ctm_params, 'lr': lr},
+        ]
+        if backbone_trainable:
+            backbone_lr = lr * backbone_lr_scale
+            param_groups.append({'params': backbone_trainable, 'lr': backbone_lr})
+            print0(f"  Backbone LR: {backbone_lr:.1e} ({backbone_lr_scale}x CTM LR)")
+
+        ctm_count = len(ctm_params)
+        print0(f"Optimizer: {ctm_count} CTM params across {len(self.ctm_blocks)} block(s)"
+               + (f" + {len(backbone_trainable)} backbone params from layers {sorted(self._unfrozen_layers)}"
+                  if backbone_trainable else "")
+               + f", {sum(p.numel() for p in ctm_params) + sum(p.numel() for p in backbone_trainable):,} trainable params")
+
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay,
                                        betas=(0.9, 0.95))
         return optimizer
 
     def dream(self, device=None, K_override=None):
-        """Run convergence diagnostics on all CTM blocks."""
+        """Run convergence + bounds diagnostics on all CTM blocks.
+
+        Returns per-layer dict with:
+          - Convergence: deltas, converged flag (original dream)
+          - Synapse capacity: c_proj SVD rank, condition number, top singular values
+          - Synapse utilization: activation rank vs weight rank
+          - Neuron health: NLM weight norms, dead neuron count, diversity
+          - Bottleneck: automatic diagnosis string
+
+        Adapted from Angeris SDP dual framework (bounds-analysis branch).
+        """
         from nanochat.gpt import CTMCache
         results = {}
         D = self.config.n_embd
@@ -529,39 +669,196 @@ class QwenBackboneGPT(nn.Module):
             ctm.active_K = old_K
 
             converged = len(deltas) >= 2 and deltas[-1] < deltas[0] * 0.1
-            results[layer_idx] = {
+            result = {
                 'converged': converged,
                 'K_start': ctm.K,
                 'K_end': len(deltas),
                 'deltas': deltas,
                 'final_distance': deltas[-1] if deltas else 0,
             }
+
+            # --- Bounds analysis (synapse + neuron diagnostics) ---
+            result.update(self._analyze_bounds(ctm, x_test, layer_idx))
+
+            # --- Bound-guided aux weights (Angeris → deep supervision) ---
+            if getattr(self.config, 'ctm_bound_guided_aux', False):
+                tick_gaps = ctm.compute_tick_gaps(x_test)
+                result['tick_gaps'] = tick_gaps
+                result['tick_aux_weights'] = ctm._tick_aux_weights.tolist()
+
+            results[layer_idx] = result
+
         return results
 
+    @torch.no_grad()
+    def _analyze_bounds(self, ctm, x_test, layer_idx):
+        """Angeris-style bound analysis for a single CTMBlock.
+
+        Measures:
+          1. c_proj weight rank (capacity) — SVD of the output projection
+          2. Synapse activation rank (utilization) — what actually flows through
+          3. NLM neuron health — weight norms, dead/diverse detection
+          4. Bottleneck identification
+        """
+        diag = {}
+        D = ctm.D
+        eps = 1e-8
+
+        # ── 1. c_proj weight capacity (SVD) ─────────────────────────
+        w = ctm.c_proj.weight.detach().float().cpu()  # (D, n_synch)
+        svs = torch.linalg.svdvals(w)
+        total_sv = svs.sum()
+        cumsum = svs.cumsum(0) / (total_sv + eps)
+        diag['c_proj_rank90'] = int((cumsum < 0.9).sum().item()) + 1
+        diag['c_proj_rank99'] = int((cumsum < 0.99).sum().item()) + 1
+        diag['c_proj_condition'] = float(svs[0] / (svs[-1] + eps))
+        diag['c_proj_top5_sv'] = svs[:5].tolist()
+        diag['c_proj_frobenius'] = float(w.norm())
+
+        # ── 2. Synapse activation utilization ────────────────────────
+        # Hook the synapse UNet to capture input/output activations
+        syn_inputs, syn_outputs = [], []
+        def hook_fn(module, inp, out):
+            syn_inputs.append(inp[0].detach().cpu().float())
+            syn_outputs.append(out.detach().cpu().float())
+
+        handle = ctm.synapses.register_forward_hook(hook_fn)
+        from nanochat.gpt import CTMCache
+        cache = CTMCache(self.config.n_layer)
+        ctm(x_test, dream=False, ctm_cache=cache, layer_idx=layer_idx)
+        handle.remove()
+
+        if syn_inputs:
+            # Stack all tick activations: each forward call runs K ticks,
+            # hook fires once per forward but synapses run inside tick loop.
+            # For a single forward, we get 1 capture (last tick only via hook).
+            # Use the captured data to estimate activation rank.
+            sin = syn_inputs[0]  # (BT, 2D)
+            sout = syn_outputs[0]  # (BT, D)
+            sv_in = torch.linalg.svdvals(sin.float())
+            act_rank = int((sv_in > sv_in[0] * 0.01).sum().item())
+            diag['synapse_act_rank'] = act_rank
+            diag['synapse_utilization_pct'] = act_rank / (diag['c_proj_rank90'] + eps) * 100
+
+            # Optimal synapse gap: ||actual - least-squares optimal||
+            try:
+                W_opt = sout.T @ sin @ torch.linalg.pinv(sin.T @ sin)
+                residual_actual = (sout - (sin @ W_opt.T)).norm().item() ** 2
+                residual_total = sout.norm().item() ** 2
+                diag['synapse_gap_pct'] = residual_actual / (residual_total + eps) * 100
+            except Exception:
+                diag['synapse_gap_pct'] = -1.0
+        else:
+            diag['synapse_act_rank'] = 0
+            diag['synapse_utilization_pct'] = 0
+            diag['synapse_gap_pct'] = -1.0
+
+        # ── 3. NLM neuron health ─────────────────────────────────────
+        # Weight norms from nlm1 (SuperLinear: w1 shape [M, 2*hidden, D])
+        nlm_norms = None
+        for name, param in ctm.named_parameters():
+            if 'nlm1' in name and ('w1' in name or 'weight' in name):
+                pw = param.detach().cpu().float()
+                if pw.dim() == 3:
+                    # SuperLinear: last dim is per-neuron
+                    nlm_norms = pw.reshape(-1, pw.shape[-1]).norm(dim=0).numpy()
+                elif pw.dim() == 2:
+                    nlm_norms = pw.norm(dim=0).numpy()
+                break
+
+        if nlm_norms is not None:
+            import numpy as np
+            mean_norm = nlm_norms.mean()
+            dead_mask = nlm_norms < mean_norm * 0.1
+            diag['n_dead_neurons'] = int(dead_mask.sum())
+            diag['neuron_norm_min'] = float(nlm_norms.min())
+            diag['neuron_norm_mean'] = float(mean_norm)
+            diag['neuron_norm_max'] = float(nlm_norms.max())
+            diag['neuron_norm_std'] = float(nlm_norms.std())
+        else:
+            diag['n_dead_neurons'] = -1
+            diag['neuron_norm_min'] = 0
+            diag['neuron_norm_mean'] = 0
+            diag['neuron_norm_max'] = 0
+            diag['neuron_norm_std'] = 0
+
+        # NLM diversity: cosine similarity between neuron weight vectors
+        diversity = 0.0
+        for name, param in ctm.named_parameters():
+            if 'nlm1' in name and ('w1' in name or 'weight' in name):
+                pw = param.detach().cpu().float()
+                if pw.dim() == 3 and pw.shape[-1] == D:
+                    # Each neuron d has a weight vector of shape (M, 2*hidden)
+                    vectors = pw.reshape(-1, D).T  # (D, features)
+                    vectors = vectors / (vectors.norm(dim=1, keepdim=True) + eps)
+                    cos = vectors @ vectors.T
+                    mask = torch.triu(torch.ones(D, D, dtype=torch.bool), diagonal=1)
+                    diversity = float(cos[mask].mean().abs())
+                break
+        diag['neuron_diversity'] = diversity
+
+        # Plastic LoRA status
+        gate = torch.sigmoid(ctm.plastic_gate).item()
+        diag['plastic_gate'] = gate
+        if gate > 1e-4:
+            pA = ctm.plastic_A.detach().float()
+            pB = ctm.plastic_B.detach().float()
+            diag['plastic_norm'] = float((pA @ pB).norm())
+        else:
+            diag['plastic_norm'] = 0.0
+
+        # ── 4. Bottleneck identification ─────────────────────────────
+        if diag.get('n_dead_neurons', 0) > D * 0.3:
+            diag['bottleneck'] = 'dead_neurons'
+        elif diag['c_proj_rank90'] <= 5:
+            diag['bottleneck'] = f'c_proj_rank_collapse (rank90={diag["c_proj_rank90"]})'
+        elif diag.get('synapse_utilization_pct', 100) < 10:
+            diag['bottleneck'] = 'low_synapse_utilization'
+        elif diag['c_proj_condition'] > 1000:
+            diag['bottleneck'] = f'c_proj_ill_conditioned (cond={diag["c_proj_condition"]:.0f})'
+        elif diversity > 0.5:
+            diag['bottleneck'] = f'neuron_collapse (diversity={diversity:.2f})'
+        else:
+            diag['bottleneck'] = 'none'
+
+        return diag
+
     def compact_memory(self, teaching_ids, target_ids, lr=3e-4, steps=30,
-                       recall_pairs=None, recall_weight=0.7):
+                       recall_pairs=None, recall_weight=0.7,
+                       max_delta=0.15, sanity_prompt=None,
+                       kl_weight=0.3, kl_temperature=2.0,
+                       plastic_only=False, nullspace_proj=False):
         """Recall-aware neuroplasticity: teach facts AND learn to recall them.
 
-        The key insight: training only on teaching text optimizes the CTM for
-        the teaching-context sync pattern, but recall happens from fresh context
-        with a DIFFERENT sync pattern. By including recall prompts in the loss,
-        we force the CTM to produce correct outputs from fresh-context sync.
+        Neuroscience-informed design (BCM theory + three-factor Hebbian):
+          - LTP in hippocampus changes synaptic strength by 25-180%
+          - BCM sliding threshold: recent plasticity raises future threshold
+          - Homeostatic scaling: global normalization prevents runaway excitation
+          - Sleep consolidation: replay + selective forgetting
 
         Three phases:
           WAKE: compute per-token dopamine (prediction error → surprise signal)
           ENCODE: build dopamine-gated sync trace (eligibility tagging)
-          SLEEP: gradient replay on BOTH teaching text AND recall prompts
+          SLEEP: gradient replay with BCM-like adaptive LR decay
 
-        Works with multi-CTM: all CTM blocks are jointly optimized.
+        Safety (anti-excitotoxicity):
+          - max_delta: stop early if relative weight change exceeds budget (default 15%,
+            maps to moderate LTP strength in hippocampal CA1)
+          - Adaptive LR decay: LR decreases as delta grows (BCM sliding threshold analog)
+          - sanity_prompt: generate after compact, rollback if repetition collapse
+            (analog to seizure detection → homeostatic reset)
 
         Args:
             teaching_ids: input token ids (B, T) — the teaching text
             target_ids: target token ids (B, T) — shifted teaching text
-            lr: base learning rate (default 3e-4, validated on Qwen3+CTM K=32)
+            lr: base learning rate (default 3e-4)
             steps: consolidation replay steps (default 30)
             recall_pairs: list of (input_ids, target_ids) tensors for recall
-                          prompts. If None, only teaches (old behavior).
             recall_weight: weight for recall loss vs teaching loss (default 0.7)
+            max_delta: max relative weight change before early stop (default 0.15 = 15%)
+            sanity_prompt: token ids to generate from post-compact; rollback on collapse
+            kl_weight: weight for KL divergence anchor loss (default 0.3)
+            kl_temperature: temperature for KL softmax (default 2.0, higher = softer anchor)
         Returns:
             dict with diagnostics
         """
@@ -613,14 +910,65 @@ class QwenBackboneGPT(nn.Module):
             return {}
 
         # =====================================================================
-        # SLEEP PHASE: recall-aware gradient descent
+        # SLEEP PHASE: recall-aware gradient descent with BCM-like decay
         # =====================================================================
+        # =====================================================================
+        # KL ANCHOR: cache pre-compact logit distributions on recall pairs
+        # =====================================================================
+        # This prevents mode collapse / repetition by penalizing divergence
+        # from the model's original output distribution (same idea as RLHF's KL penalty).
+        kl_anchors = []
+        if recall_pairs and kl_weight > 0:
+            with torch.no_grad():
+                for r_input, r_target in recall_pairs:
+                    ref_logits = self.forward(r_input)
+                    # Store soft targets at elevated temperature (smoother anchor)
+                    kl_anchors.append(
+                        F.log_softmax(ref_logits / kl_temperature, dim=-1).detach()
+                    )
+
+        # Record pre-compact norms for homeostatic scaling
+        pre_norms = {}
+        for idx_str, ctm in self.ctm_blocks.items():
+            for n, p in ctm.named_parameters():
+                pre_norms[f"{idx_str}.{n}"] = p.data.norm().item()
+
+        # Null-space projection: compute top singular directions of c_proj
+        # so we can project gradients away from them during optimization
+        nullspace_hooks = []
+        if nullspace_proj:
+            for idx_str, ctm in self.ctm_blocks.items():
+                W = ctm.c_proj.weight.data  # (D, n_synch)
+                U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+                # Keep top-k directions that carry 90% of energy
+                cumulative = torch.cumsum(S ** 2, dim=0) / (S ** 2).sum()
+                k = max(1, (cumulative < 0.90).sum().item() + 1)
+                top_U = U[:, :k].detach()  # (D, k) — directions to avoid
+
+                def make_hook(top_dirs):
+                    def hook(grad):
+                        # Remove gradient component along top singular directions
+                        # grad shape: (D, n_synch)
+                        proj = top_dirs @ (top_dirs.T @ grad)  # project onto top-k space
+                        return grad - proj  # keep only null-space component
+                    return hook
+
+                h = ctm.c_proj.weight.register_hook(make_hook(top_U))
+                nullspace_hooks.append(h)
+                print(f"  nullspace: c_proj L{idx_str} rank90={k}, projecting grads into null space")
+
         param_groups = []
         for idx_str, ctm in self.ctm_blocks.items():
             for name, p in ctm.named_parameters():
                 if not p.requires_grad:
                     continue
-                if 'start_state' in name or 'start_trace' in name:
+                # plastic_only: only update LoRA adapter + gate, freeze everything else
+                if plastic_only and 'plastic_' not in name:
+                    continue
+                if 'plastic_' in name:
+                    # LoRA adapter gets higher LR
+                    param_groups.append({'params': [p], 'lr': lr * 3.0, 'weight_decay': 0.0})
+                elif 'start_state' in name or 'start_trace' in name:
                     param_groups.append({'params': [p], 'lr': lr * 2.0, 'weight_decay': 0.01})
                 elif 'c_proj' in name:
                     param_groups.append({'params': [p], 'lr': lr * 1.5, 'weight_decay': 0.005})
@@ -637,6 +985,9 @@ class QwenBackboneGPT(nn.Module):
         for ctm in self.ctm_blocks.values():
             all_ctm_params.extend(ctm.parameters())
 
+        # Compute total pre-norm for relative delta tracking
+        total_pre_norm = sum(pre_params[k].norm().item() for k in pre_params)
+
         for step in range(steps):
             optimizer.zero_grad()
 
@@ -652,11 +1003,30 @@ class QwenBackboneGPT(nn.Module):
             # Recall loss (fresh context — the actual test condition)
             if recall_pairs:
                 loss_recall = torch.tensor(0.0, device=device)
-                for r_input, r_target in recall_pairs:
-                    _, rl = self.forward(r_input, targets=r_target)
+                loss_kl = torch.tensor(0.0, device=device)
+                for i, (r_input, r_target) in enumerate(recall_pairs):
+                    r_logits = self.forward(r_input)
+                    # Standard CE recall loss
+                    rl = F.cross_entropy(
+                        r_logits.reshape(-1, r_logits.size(-1)),
+                        r_target.reshape(-1),
+                        ignore_index=-1,
+                    )
                     loss_recall = loss_recall + rl
+
+                    # KL anchor: penalize divergence from pre-compact distribution
+                    if i < len(kl_anchors) and kl_weight > 0:
+                        current_log_probs = F.log_softmax(r_logits / kl_temperature, dim=-1)
+                        # KL(ref || current) — encourages current to stay close to ref
+                        kl = F.kl_div(current_log_probs, kl_anchors[i],
+                                      log_target=True, reduction='batchmean')
+                        loss_kl = loss_kl + kl
+
                 loss_recall = loss_recall / len(recall_pairs)
-                loss = (1 - recall_weight) * loss_teach + recall_weight * loss_recall
+                loss_kl = loss_kl / len(recall_pairs) if kl_anchors else loss_kl
+                loss = ((1 - recall_weight) * loss_teach
+                        + recall_weight * loss_recall
+                        + kl_weight * loss_kl)
             else:
                 loss = loss_teach
 
@@ -665,22 +1035,103 @@ class QwenBackboneGPT(nn.Module):
             optimizer.step()
             losses.append(loss.item())
 
+            # BCM sliding threshold: as delta grows, reduce LR (metaplasticity)
+            # Recent plasticity raises the threshold for future plasticity.
+            # This prevents the runaway potentiation that caused repetition collapse.
+            if (step + 1) % 5 == 0:
+                running_delta = sum(
+                    (p - pre_params[f"{idx_str}.{n}"]).norm().item()
+                    for idx_str, ctm in self.ctm_blocks.items()
+                    for n, p in ctm.named_parameters()
+                    if f"{idx_str}.{n}" in pre_params
+                )
+                rel_delta = running_delta / (total_pre_norm + 1e-8)
+
+                # Early stop if we've exceeded the plasticity budget
+                if max_delta > 0 and rel_delta > max_delta:
+                    print(f"  compact_memory: early stop at step {step+1}/{steps}, "
+                          f"relative delta {rel_delta:.3f} > max {max_delta:.3f} "
+                          f"(abs delta {running_delta:.1f})")
+                    break
+
+                # BCM decay: scale LR down as we approach the budget
+                # At 0% budget used → full LR. At 100% budget → 10% LR.
+                bcm_scale = max(0.1, 1.0 - 0.9 * (rel_delta / (max_delta + 1e-8)))
+                for group in optimizer.param_groups:
+                    base_lr = group.get('initial_lr', group['lr'])
+                    if 'initial_lr' not in group:
+                        group['initial_lr'] = group['lr']
+                    group['lr'] = base_lr * bcm_scale
+
+            # Homeostatic scaling: after each step, clamp per-param norms
+            # to at most 50% growth from pre-compact state (prevents excitotoxicity
+            # on individual weight matrices while allowing overall 15% relative change)
+            with torch.no_grad():
+                for idx_str, ctm in self.ctm_blocks.items():
+                    for n, p in ctm.named_parameters():
+                        key = f"{idx_str}.{n}"
+                        if key in pre_norms and pre_norms[key] > 1e-6:
+                            current_norm = p.data.norm().item()
+                            max_norm = pre_norms[key] * 1.5  # 50% max growth per param
+                            if current_norm > max_norm:
+                                p.data.mul_(max_norm / current_norm)
+
         self.eval()
 
-        # Measure total change
+        # Clean up null-space hooks
+        for h in nullspace_hooks:
+            h.remove()
+
+        # Measure total change (absolute and relative)
         total_delta = 0.0
+        total_norm = 0.0
         for idx_str, ctm in self.ctm_blocks.items():
             for n, p in ctm.named_parameters():
                 key = f"{idx_str}.{n}"
                 if key in pre_params:
                     total_delta += (p - pre_params[key]).norm().item()
+                    total_norm += pre_params[key].norm().item()
+        rel_delta = total_delta / (total_norm + 1e-8)
+
+        # Sanity check: generate from a known prompt and detect repetition collapse
+        collapsed = False
+        if sanity_prompt is not None and total_delta > 0:
+            with torch.no_grad():
+                from nanochat.engine import Engine as _Eng
+                _engine = _Eng(self, self._tokenizer if hasattr(self, '_tokenizer') else None)
+                if _engine.tokenizer is not None:
+                    results, _ = _engine.generate_batch(
+                        sanity_prompt, num_samples=1, max_tokens=20,
+                        temperature=0.7, seed=42, repetition_penalty=1.3)
+                    gen_tokens = results[0][len(sanity_prompt):]
+                    # Detect repetition: if any single token is >50% of output, it's collapsed
+                    if len(gen_tokens) > 5:
+                        from collections import Counter
+                        counts = Counter(gen_tokens)
+                        most_common_frac = counts.most_common(1)[0][1] / len(gen_tokens)
+                        if most_common_frac > 0.5:
+                            collapsed = True
+                            print(f"  compact_memory: ROLLBACK — repetition collapse detected "
+                                  f"(top token {most_common_frac:.0%} of output)")
+
+        # Rollback if collapsed
+        if collapsed:
+            for idx_str, ctm in self.ctm_blocks.items():
+                for n, p in ctm.named_parameters():
+                    key = f"{idx_str}.{n}"
+                    if key in pre_params:
+                        p.data.copy_(pre_params[key])
+            total_delta = 0.0
 
         return {
             'total_delta': total_delta,
+            'rel_delta': rel_delta,
             'losses': losses,
             'dopamine_mean': dopamine_per_token.mean().item(),
             'dopamine_std': dopamine_per_token.std().item(),
             'ce_mean': ce_mean.item(),
+            'collapsed': collapsed,
+            'early_stopped': len(losses) < steps,
         }
 
     def consolidate(self, replay_batches, lr=1e-4, steps=4):
@@ -738,12 +1189,24 @@ class QwenBackboneGPT(nn.Module):
         return stats
 
     def get_ctm_state_dict(self):
-        """Get all CTM blocks' state dict for checkpointing.
+        """Get all CTM blocks' state dict + unfrozen backbone layers for checkpointing.
 
         Returns dict keyed by layer index string, e.g.:
             {"27": {ctm_block_state_dict}, "14": {...}}
         Single-CTM backward compat: if only one block, returns flat state_dict.
+        If backbone layers are unfrozen, includes them under "_backbone_layers" key.
         """
+        if self._unfrozen_layers:
+            # Multi-format with backbone layers included
+            result = {idx_str: ctm.state_dict() for idx_str, ctm in self.ctm_blocks.items()}
+            qwen_model = self.backbone.model if hasattr(self.backbone, 'model') else self.backbone.transformer
+            layers = qwen_model.layers if hasattr(qwen_model, 'layers') else qwen_model.h
+            backbone_sd = {}
+            for idx in self._unfrozen_layers:
+                mlp = layers[idx].mlp if hasattr(layers[idx], 'mlp') else layers[idx].feed_forward
+                backbone_sd[str(idx)] = {k: v for k, v in mlp.state_dict().items()}
+            result["_backbone_layers"] = backbone_sd
+            return result
         if len(self.ctm_blocks) == 1:
             # Backward compatible: single block → flat dict
             return next(iter(self.ctm_blocks.values())).state_dict()
@@ -756,18 +1219,28 @@ class QwenBackboneGPT(nn.Module):
         - Flat dict (single-CTM checkpoint) → loads into last CTM block
         - Keyed dict {"14": {...}, "27": {...}} → loads each block
         """
+        # Load unfrozen backbone layers if present
+        if "_backbone_layers" in state_dict:
+            backbone_sd = state_dict.pop("_backbone_layers")
+            qwen_model = self.backbone.model if hasattr(self.backbone, 'model') else self.backbone.transformer
+            layers = qwen_model.layers if hasattr(qwen_model, 'layers') else qwen_model.h
+            for idx_str, mlp_sd in backbone_sd.items():
+                mlp = layers[int(idx_str)].mlp if hasattr(layers[int(idx_str)], 'mlp') else layers[int(idx_str)].feed_forward
+                mlp.load_state_dict(mlp_sd)
+                print0(f"  Loaded unfrozen backbone MLP L{idx_str}")
+
         # Detect format: if keys are layer index strings with dict values, it's multi-CTM
         sample_key = next(iter(state_dict))
         if sample_key in self.ctm_blocks and isinstance(state_dict[sample_key], dict):
             # Multi-CTM format
             for idx_str, block_sd in state_dict.items():
                 if idx_str in self.ctm_blocks:
-                    self.ctm_blocks[idx_str].load_state_dict(block_sd)
+                    self.ctm_blocks[idx_str].load_state_dict(block_sd, strict=False)
                     print0(f"  Loaded CTM L{idx_str} weights")
         else:
             # Flat format (single-CTM checkpoint) → load into last block
             last_idx = str(self.ctm_layer_indices[-1])
-            self.ctm_blocks[last_idx].load_state_dict(state_dict)
+            self.ctm_blocks[last_idx].load_state_dict(state_dict, strict=False)
             print0(f"  Loaded single-CTM weights into L{last_idx}")
 
     @property
