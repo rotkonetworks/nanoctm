@@ -4,97 +4,32 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CTM: Continuous Thought Machine</title>
-<meta name="description" content="Watch a language model learn to think. Live training data from a neuroplastic CTM running on a single GPU.">
-<link rel="prefetch" href="research.html">
-<link rel="prefetch" href="invest.html">
+<meta name="description" content="Watch a language model learn to think. Live training data from a neuroplastic CTM.">
 <style>
-  :root {
-    --bg: #08090a;
-    --surface: #111214;
-    --border: #1e2024;
-    --text: #e0e2e8;
-    --text-dim: #6b7080;
-    --accent: #5b8af5;
-  }
-
+  :root { --bg: #08090a; --surface: #111214; --border: #1e2024; --text: #e0e2e8; --text-dim: #6b7080; --accent: #5b8af5; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   html, body { height: 100%; overflow: hidden; }
-
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'Inter', -apple-system, sans-serif;
-  }
-
-  .nav {
-    position: fixed; top: 0; left: 0; right: 0;
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 0.6rem 1.5rem;
-    background: rgba(8, 9, 10, 0.85);
-    backdrop-filter: blur(8px);
-    border-bottom: 1px solid var(--border);
-    z-index: 100;
-    font-size: 0.85rem;
-  }
-  .nav-logo {
-    font-weight: 700; font-size: 1rem;
-    color: var(--accent); text-decoration: none;
-    font-family: 'JetBrains Mono', monospace;
-  }
+  body { background: var(--bg); color: var(--text); font-family: 'Inter', -apple-system, sans-serif; }
+  .nav { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 1.5rem; background: rgba(8,9,10,0.85); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); z-index: 100; font-size: 0.85rem; }
+  .nav-logo { font-weight: 700; font-size: 1rem; color: var(--accent); text-decoration: none; font-family: 'JetBrains Mono', monospace; }
   .nav-links { display: flex; gap: 1.5rem; }
-  .nav-links a {
-    color: var(--text-dim); text-decoration: none;
-    font-size: 0.8rem; letter-spacing: 0.03em;
-    transition: color 0.15s;
-  }
+  .nav-links a { color: var(--text-dim); text-decoration: none; font-size: 0.8rem; letter-spacing: 0.03em; transition: color 0.15s; }
   .nav-links a:hover { color: var(--accent); }
-
-  /* Debugger fills viewport below nav */
-  .debugger-wrap {
-    position: fixed;
-    top: 37px; /* nav height */
-    left: 0; right: 0; bottom: 0;
-  }
-
-  #ctm-canvas {
-    width: 100%; height: 100%;
-    display: block;
-  }
-
-  /* Loading overlay */
-  #debugger-loading {
-    position: absolute;
-    top: 0; left: 0; right: 0; bottom: 0;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    background: var(--bg);
-    z-index: 10;
-  }
-  #debugger-loading .bar-track {
-    width: 200px; height: 2px;
-    background: var(--border); border-radius: 1px;
-    overflow: hidden;
-  }
-  #load-bar {
-    width: 0%; height: 100%;
-    background: var(--accent);
-    transition: width 0.3s;
-  }
-  #load-text {
-    color: var(--text-dim); font-size: 0.8rem;
-    margin-top: 0.75rem;
-    font-family: 'JetBrains Mono', monospace;
-  }
+  .debugger-wrap { position: fixed; top: 37px; left: 0; right: 0; bottom: 0; }
+  #ctm-canvas { width: 100%; height: 100%; display: block; }
+  #debugger-loading { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--bg); z-index: 10; }
+  .bar-track { width: 200px; height: 2px; background: var(--border); border-radius: 1px; overflow: hidden; }
+  #load-bar { width: 0%; height: 100%; background: var(--accent); transition: width 0.3s; }
+  #load-text { color: var(--text-dim); font-size: 0.8rem; margin-top: 0.75rem; font-family: 'JetBrains Mono', monospace; }
+  .fallback-link { color: var(--accent); text-decoration: underline; cursor: pointer; font-size: 0.75rem; margin-top: 1rem; }
 </style>
-<link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 </head>
 <body>
-
 <nav class="nav">
-  <a href="index.html" class="nav-logo">CTM</a>
+  <a href="/" class="nav-logo">CTM</a>
   <div class="nav-links">
+    <a href="/ctm-app/">Dashboard</a>
     <a href="research.html">Research</a>
     <a href="invest.html">Invest</a>
   </div>
@@ -102,10 +37,9 @@
 
 <div class="debugger-wrap">
   <div id="debugger-loading">
-    <div class="bar-track">
-      <div id="load-bar"></div>
-    </div>
-    <p id="load-text">loading training data...</p>
+    <div class="bar-track"><div id="load-bar"></div></div>
+    <p id="load-text">loading...</p>
+    <a class="fallback-link" href="/ctm-app/" style="display:none" id="fallback-link">open dashboard instead</a>
   </div>
   <canvas id="ctm-canvas"></canvas>
 </div>
@@ -114,57 +48,59 @@
 const bar = document.getElementById('load-bar');
 const txt = document.getElementById('load-text');
 const overlay = document.getElementById('debugger-loading');
+const fallback = document.getElementById('fallback-link');
 
-function goToDashboard(reason) {
-  txt.textContent = reason + ' — loading dashboard...';
-  bar.style.width = '100%';
-  window.location.href = '/ctm-app/';
-}
+// show fallback link after 3s regardless
+setTimeout(() => { fallback.style.display = 'block'; }, 3000);
 
 try {
-  // check WebGL
-  const canvas = document.createElement('canvas');
-  if (!(canvas.getContext('webgl2') || canvas.getContext('webgl'))) {
-    goToDashboard('WebGL not available');
-  } else {
-    const { default: init } = await import('./ctm-debugger.js');
+  txt.textContent = 'connecting to live data...';
+  bar.style.width = '20%';
 
-    let progress = 0;
-    const tick = setInterval(() => {
-      progress = Math.min(progress + (90 - progress) * 0.05, 90);
-      bar.style.width = progress + '%';
-    }, 200);
-
-    txt.textContent = 'fetching training data...';
-
+  // fetch latest data via WebSocket or HTTP
+  let ticksData = '[]';
+  try {
+    const resp = await fetch('/api/snapshots');
+    if (resp.ok) ticksData = await resp.text();
+  } catch {
     try {
-      const resp = await fetch('ticks.json');
-      const data = await resp.text();
-      localStorage.setItem('ctm_ticks', data);
-      const count = JSON.parse(data).length;
-      txt.textContent = `${count} snapshots cached, loading WASM...`;
-    } catch (e) {
-      txt.textContent = 'loading WASM...';
-    }
-
-    bar.style.width = '50%';
-    await init({ module_or_path: './ctm-debugger_bg.wasm' });
-
-    clearInterval(tick);
-    bar.style.width = '100%';
-    txt.textContent = 'ready';
-    setTimeout(() => { if (overlay) overlay.style.display = 'none'; }, 300);
+      const resp = await fetch('/ticks.json');
+      ticksData = await resp.text();
+    } catch {}
   }
+  localStorage.setItem('ctm_ticks', ticksData);
+  const count = JSON.parse(ticksData).length;
+  txt.textContent = `${count} snapshots, loading 3D debugger...`;
+  bar.style.width = '40%';
+
+  // connect WebSocket for live updates (debugger polls localStorage)
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      const existing = JSON.parse(localStorage.getItem('ctm_ticks') || '[]');
+      existing.push(msg);
+      localStorage.setItem('ctm_ticks', JSON.stringify(existing));
+    } catch {}
+  };
+
+  // load WASM
+  const { default: init } = await import('./ctm-debugger.js');
+  bar.style.width = '70%';
+  await init({ module_or_path: './ctm-debugger_bg.wasm' });
+
+  bar.style.width = '100%';
+  txt.textContent = 'ready';
+  setTimeout(() => { if (overlay) overlay.style.display = 'none'; }, 300);
+
 } catch (e) {
-  console.warn('WASM debugger failed:', e);
-  goToDashboard('Debugger unavailable');
+  console.warn('3D debugger failed:', e.message || e);
+  txt.textContent = 'debugger unavailable (WebGL required)';
+  bar.style.width = '100%';
+  bar.style.background = '#f55';
+  fallback.style.display = 'block';
 }
-
-clearInterval(tick);
-bar.style.width = '100%';
-txt.textContent = 'ready';
-setTimeout(() => { if (overlay) overlay.style.display = 'none'; }, 300);
 </script>
-
 </body>
 </html>
