@@ -40,6 +40,7 @@ parser.add_argument("--ctm-synapse-depth", type=int, default=32, help="U-NET syn
 parser.add_argument("--ctm-adaptive-k", action="store_true", help="use mean sync normalization (K-invariant)")
 parser.add_argument("--ctm-layers", type=str, default="last", help="which layers get CTM: 'last', '14,27', etc.")
 parser.add_argument("--additive", action="store_true", help="keep MLP on CTM layers (CTM adds on top, paper-style)")
+parser.add_argument("--memory-ctm", action="store_true", help="add dedicated memory CTM (hippocampus) after backbone for plasticity")
 parser.add_argument("--unfreeze-ctm-layer-ffn", action="store_true", help="unfreeze MLP on CTM layers for co-training")
 parser.add_argument("--backbone-lr-scale", type=float, default=0.1, help="backbone LR = main LR * this (default 0.1)")
 # Training
@@ -205,6 +206,7 @@ ctm_kwargs = {
     "ctm_adaptive_k": args.ctm_adaptive_k,
     "ctm_aux_weight": args.ctm_aux_weight,
     "ctm_bound_guided_aux": args.bound_guided_aux,
+    "memory_ctm": args.memory_ctm,
 }
 # Remove None values so defaults in QwenBackboneGPT apply
 ctm_kwargs = {k: v for k, v in ctm_kwargs.items() if v is not None}

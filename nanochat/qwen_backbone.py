@@ -167,6 +167,13 @@ class QwenBackboneGPT(nn.Module):
         # This is set properly after checkpoint loading via set_replacement_layers()
         self._replacement_layers = set()  # layers where MLP is removed (trained CTMs)
 
+        # Memory CTM: separate hippocampus-like module for plasticity/fact storage.
+        # Sits after backbone norm, before lm_head. Doesn't replace any FFN.
+        # compact_memory() targets this exclusively. Training loss flows through it
+        # so it learns to be a useful pass-through, but its purpose is memory.
+        self.memory_ctm = CTMBlock(self.config) if ctm_config.get("memory_ctm", False) else None
+        self._has_memory_ctm = self.memory_ctm is not None
+
         # Freeze entire backbone (selectively unfrozen later via unfreeze_layers())
         for p in self.backbone.parameters():
             p.requires_grad_(False)
@@ -286,6 +293,8 @@ class QwenBackboneGPT(nn.Module):
             if only_layers is not None and idx not in only_layers:
                 continue
             self._init_single_ctm(ctm, label=f"L{idx} ")
+        if self._has_memory_ctm:
+            self._init_single_ctm(self.memory_ctm, label="memory ")
 
     def forward(self, idx, targets=None, kv_cache=None, ctm_cache=None,
                 pos_offset=0, multi_tick=False, intervene=None, **kwargs):
@@ -410,6 +419,31 @@ class QwenBackboneGPT(nn.Module):
 
         # Final norm
         x = qwen_model.norm(x)
+
+        # Memory CTM: hippocampus layer — additive residual after backbone
+        # Cognitive CTM (in backbone) handles language. Memory CTM handles facts.
+        # compact_memory() writes here exclusively.
+        if self._has_memory_ctm:
+            mem_ctm_cache = ctm_cache  # share cache infrastructure
+            mem_layer_idx = self.config.n_layer  # virtual layer index after backbone
+            _intervene_mem = intervene or getattr(self, '_viz_intervene', None)
+
+            # Memory CTM: multi-tick for training loss, single-tick for inference
+            do_mem_multi_tick = (multi_tick and targets is not None)
+            if do_mem_multi_tick:
+                mem_out, mem_tick_outputs = self.memory_ctm(
+                    x, ctm_cache=mem_ctm_cache, layer_idx=mem_layer_idx,
+                    multi_tick=True, intervene=_intervene_mem)
+                # Use memory tick outputs for loss instead of cognitive CTM ticks
+                if tick_outputs is not None:
+                    tick_outputs = mem_tick_outputs
+                else:
+                    tick_outputs = mem_tick_outputs
+            else:
+                mem_out = self.memory_ctm(
+                    x, ctm_cache=mem_ctm_cache, layer_idx=mem_layer_idx,
+                    intervene=_intervene_mem)
+            x = x + mem_out.to(x.dtype)
 
         # Compute logits
         logits = self.backbone.lm_head(x)
@@ -629,6 +663,11 @@ class QwenBackboneGPT(nn.Module):
             for p in ctm.parameters():
                 if p.requires_grad:
                     ctm_params.append(p)
+        # Include memory CTM params
+        if self._has_memory_ctm:
+            for p in self.memory_ctm.parameters():
+                if p.requires_grad:
+                    ctm_params.append(p)
         # Include unfrozen backbone params with lower LR
         backbone_trainable = [p for p in self.backbone.parameters() if p.requires_grad]
 
@@ -701,6 +740,33 @@ class QwenBackboneGPT(nn.Module):
                 result['tick_aux_weights'] = ctm._tick_aux_weights.tolist()
 
             results[layer_idx] = result
+
+        # Memory CTM diagnostics (hippocampus health)
+        if self._has_memory_ctm:
+            mem_idx = 0  # reuse index 0 for standalone probe (not shared with backbone)
+            ctm_cache = CTMCache(max(self.config.n_layer, 1))
+            ctm = self.memory_ctm
+
+            old_K = ctm.active_K
+            if K_override is not None:
+                ctm.active_K = K_override
+
+            with torch.no_grad():
+                _, deltas = ctm(x_test, dream=True, ctm_cache=ctm_cache, layer_idx=mem_idx)
+
+            ctm.active_K = old_K
+
+            converged = len(deltas) >= 2 and deltas[-1] < deltas[0] * 0.1
+            result = {
+                'converged': converged,
+                'K_start': ctm.K,
+                'K_end': len(deltas),
+                'deltas': deltas,
+                'final_distance': deltas[-1] if deltas else 0,
+                'is_memory_ctm': True,
+            }
+            result.update(self._analyze_bounds(ctm, x_test, mem_idx))
+            results['memory'] = result
 
         return results
 
@@ -986,8 +1052,16 @@ class QwenBackboneGPT(nn.Module):
                 nullspace_hooks.append(h)
                 print(f"  nullspace: c_proj L{idx_str} rank90={k}, projecting grads into null space")
 
+        # Target memory CTM (hippocampus) when available, else all CTM blocks
+        # Memory CTM is dedicated to plasticity — compact_memory writes here exclusively.
+        # Cognitive CTM (in backbone) stays frozen during compact to preserve language ability.
+        if self._has_memory_ctm:
+            target_ctms = {'memory': self.memory_ctm}
+        else:
+            target_ctms = dict(self.ctm_blocks)
+
         param_groups = []
-        for idx_str, ctm in self.ctm_blocks.items():
+        for idx_str, ctm in target_ctms.items():
             for name, p in ctm.named_parameters():
                 if not p.requires_grad:
                     continue
@@ -1011,7 +1085,7 @@ class QwenBackboneGPT(nn.Module):
         self.train()
         losses = []
         all_ctm_params = []
-        for ctm in self.ctm_blocks.values():
+        for ctm in target_ctms.values():
             all_ctm_params.extend(ctm.parameters())
 
         # Compute total pre-norm for relative delta tracking
@@ -1378,10 +1452,13 @@ class QwenBackboneGPT(nn.Module):
                 backbone_sd[str(idx)] = {k: v for k, v in mlp.state_dict().items()}
             result["_backbone_layers"] = backbone_sd
             return result
-        if len(self.ctm_blocks) == 1:
+        if len(self.ctm_blocks) == 1 and not self._has_memory_ctm:
             # Backward compatible: single block → flat dict
             return next(iter(self.ctm_blocks.values())).state_dict()
-        return {idx_str: ctm.state_dict() for idx_str, ctm in self.ctm_blocks.items()}
+        result = {idx_str: ctm.state_dict() for idx_str, ctm in self.ctm_blocks.items()}
+        if self._has_memory_ctm:
+            result["_memory_ctm"] = self.memory_ctm.state_dict()
+        return result
 
     def load_ctm_state_dict(self, state_dict):
         """Load CTM block(s) state dict from checkpoint.
