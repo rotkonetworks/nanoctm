@@ -445,23 +445,29 @@ class QwenBackboneGPT(nn.Module):
         norm = self.backbone.model.norm
         lm_dtype = lm_head.weight.dtype
 
-        # --- Pass 1: find best ticks (no grad) ---
-        # Use cross-entropy loss as proxy for certainty too (avoids V-sized softmax)
-        # Lower loss = higher certainty (strongly correlated, saves ~2GB per tick)
+        # --- Pass 1: find best ticks (no grad, VRAM-efficient) ---
+        # On large-vocab models (248K for Qwen3.5), computing full logits per tick
+        # costs ~1GB each. Instead, use chunked CE: process tokens in small chunks
+        # so only chunk_size × V logits are in VRAM at once.
         all_losses_d = torch.empty(K, n_tokens, device=flat_targets.device)
+
+        # Chunk size: target ~256MB per chunk. V*4bytes per token → chunk = 256M/(V*4)
+        chunk_size = max(1, min(n_tokens, (256 * 1024 * 1024) // (V * 4)))
 
         with torch.no_grad():
             for ki, tick_out in enumerate(tick_outputs):
-                x_at_tick = pre_ctm_residual + tick_out
-                x_at_tick = norm(x_at_tick)
-                tick_logits = lm_head(x_at_tick.to(lm_dtype))
-                tick_logits_flat = tick_logits.reshape(-1, V)
-                all_losses_d[ki] = F.cross_entropy(tick_logits_flat, flat_targets,
-                                                    ignore_index=-1, reduction='none')
-                del x_at_tick, tick_logits, tick_logits_flat
+                x_at_tick = norm(pre_ctm_residual + tick_out).to(lm_dtype)
+                # Chunked lm_head + CE to avoid V-sized logit tensor in full
+                for start in range(0, n_tokens, chunk_size):
+                    end = min(start + chunk_size, n_tokens)
+                    chunk_logits = lm_head(x_at_tick.reshape(-1, x_at_tick.shape[-1])[start:end])
+                    all_losses_d[ki, start:end] = F.cross_entropy(
+                        chunk_logits, flat_targets[start:end],
+                        ignore_index=-1, reduction='none')
+                    del chunk_logits
+                del x_at_tick
 
         best_tick_idx = all_losses_d.argmin(dim=0)        # [n_tokens]
-        # Certainty proxy: tick with lowest loss is most certain
         certain_tick_idx = best_tick_idx  # same as argmin when using loss as proxy
 
         # Store diagnostics
@@ -470,51 +476,59 @@ class QwenBackboneGPT(nn.Module):
             tick_counts = torch.bincount(best_tick_idx, minlength=K).float()
             for k in range(K):
                 self._tick_diagnostics[f'tick_{k}/loss'] = all_losses_d[k].mean().item()
-                # Compute certainty only for the last tick (cheap, for monitoring)
                 self._tick_diagnostics[f'tick_{k}/selected_pct'] = (tick_counts[k] / n_tokens * 100).item()
 
-            # Full certainty only for final tick (diagnostic)
-            final_logits = lm_head(norm(pre_ctm_residual + tick_outputs[-1]).to(lm_dtype))
-            final_probs = F.softmax(final_logits.reshape(-1, V), dim=-1)
-            final_entropy = -(final_probs * (final_probs + 1e-10).log()).sum(dim=-1)
-            final_certainty = 1.0 - final_entropy / max_entropy
-            self._tick_diagnostics['certainty/mean'] = final_certainty.mean().item()
-            self._tick_diagnostics['certainty/std'] = final_certainty.std().item()
-            del final_logits, final_probs, final_entropy, final_certainty
+            # Certainty for final tick (chunked to save VRAM)
+            x_final = norm(pre_ctm_residual + tick_outputs[-1]).to(lm_dtype).reshape(-1, lm_head.weight.shape[1])
+            cert_sum, cert_sq_sum, cert_min, cert_max = 0.0, 0.0, 1.0, 0.0
+            for start in range(0, n_tokens, chunk_size):
+                end = min(start + chunk_size, n_tokens)
+                chunk_logits = lm_head(x_final[start:end])
+                chunk_probs = F.softmax(chunk_logits, dim=-1)
+                chunk_entropy = -(chunk_probs * (chunk_probs + 1e-10).log()).sum(dim=-1)
+                chunk_cert = 1.0 - chunk_entropy / max_entropy
+                cert_sum += chunk_cert.sum().item()
+                cert_sq_sum += chunk_cert.pow(2).sum().item()
+                cert_min = min(cert_min, chunk_cert.min().item())
+                cert_max = max(cert_max, chunk_cert.max().item())
+                del chunk_logits, chunk_probs, chunk_entropy, chunk_cert
+            del x_final
+            cert_mean = cert_sum / n_tokens
+            self._tick_diagnostics['certainty/mean'] = cert_mean
+            self._tick_diagnostics['certainty/std'] = (cert_sq_sum / n_tokens - cert_mean ** 2) ** 0.5
+            self._tick_diagnostics['certainty/min'] = cert_min
+            self._tick_diagnostics['certainty/max'] = cert_max
 
         del all_losses_d
 
-        # --- Pass 2: compute loss WITH grad ---
-        # Always compute loss at the last tick (has grad). Blend with best-tick selection.
-        # This ensures gradients always flow, even if all tokens prefer early (detached) ticks.
+        # --- Pass 2: compute loss WITH grad (VRAM-efficient) ---
+        # Use gradient checkpointing on lm_head to avoid storing V-sized logits.
+        # On 248K vocab models, each logit tensor is ~1GB — checkpointing trades
+        # compute (recompute lm_head in backward) for VRAM (don't store logits).
+        from torch.utils.checkpoint import checkpoint as grad_ckpt
         grad_ticks = getattr(self.ctm_block, 'multi_tick_grad', 4)
         last_k = K - 1
 
-        # Last-tick loss (always has grad)
-        x_last = pre_ctm_residual + tick_outputs[last_k]
-        x_last = norm(x_last)
-        last_logits = lm_head(x_last.to(lm_dtype))
-        last_loss = F.cross_entropy(last_logits.reshape(-1, V), flat_targets,
-                                     ignore_index=-1)
-        del x_last, last_logits
+        def _tick_ce_loss(tick_out, targets_flat, reduce='mean'):
+            """Compute CE loss for a tick with gradient checkpointing on lm_head."""
+            x_t = norm(pre_ctm_residual + tick_out).to(lm_dtype)
+            logits = lm_head(x_t.reshape(-1, x_t.shape[-1]))
+            return F.cross_entropy(logits, targets_flat, ignore_index=-1, reduction=reduce)
+
+        # Last-tick loss (always has grad, checkpointed)
+        last_loss = grad_ckpt(_tick_ce_loss, tick_outputs[last_k], flat_targets, 'mean',
+                              use_reentrant=False)
 
         # Best-tick loss: recompute only for ticks that have grad (last N)
-        # For tokens selecting detached ticks, fall back to last-tick loss
         selected_ticks = best_tick_idx.unique()
         grad_tick_set = set(range(K - grad_ticks, K))
 
         tick_losses = {}
         for k in selected_ticks.tolist():
             if k in grad_tick_set:
-                tick_out = tick_outputs[k]
-                x_at_tick = pre_ctm_residual + tick_out
-                x_at_tick = norm(x_at_tick)
-                tick_logits = lm_head(x_at_tick.to(lm_dtype))
-                tick_logits_flat = tick_logits.reshape(-1, V)
-                token_losses = F.cross_entropy(tick_logits_flat, flat_targets,
-                                                ignore_index=-1, reduction='none')
+                token_losses = grad_ckpt(_tick_ce_loss, tick_outputs[k], flat_targets, 'none',
+                                         use_reentrant=False)
                 tick_losses[k] = token_losses
-                del x_at_tick, tick_logits, tick_logits_flat
 
         # Gather per-token loss: use best tick if it has grad, else last tick
         best_tick_loss_parts = []
