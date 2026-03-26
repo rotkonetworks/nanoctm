@@ -48,6 +48,7 @@ class GPTConfig:
     # Paper: https://arxiv.org/abs/2505.05522
     use_ctm: bool = False
     ctm_iterations: int = 4       # K thinking steps per token
+    ctm_aux_weight: float = 0.1   # auxiliary per-tick supervision weight (0=off, 0.1=default)
     ctm_memory_length: int = 16   # rolling trace history length (paper uses 25)
     ctm_n_synch: int = 384        # neuron pairs for synchronisation readout
     ctm_memory_hidden: int = 32   # NLM hidden dimension (-1 = n_synch // 4, scales with model. 32 for training memory budget)
@@ -398,6 +399,13 @@ class CTMBlock(nn.Module):
         # Output projection: S_out synchronisation -> residual stream
         self.c_proj = Linear(n_synch, D, bias=False)
 
+        # LoRA adapter for plasticity — compact_memory only updates this
+        # Separate pathway so plastic updates don't corrupt c_proj
+        self.plastic_rank = 8
+        self.plastic_A = nn.Parameter(torch.zeros(n_synch, self.plastic_rank))
+        self.plastic_B = nn.Parameter(torch.zeros(self.plastic_rank, D))
+        self.plastic_gate = nn.Parameter(torch.tensor(0.0))  # starts off, grows via compact
+
     def _sync_readout(self, alpha, beta):
         """Normalize sync accumulator. sqrt (paper) or mean (K-invariant)."""
         if self.adaptive_k:
@@ -608,6 +616,10 @@ class CTMBlock(nn.Module):
             if multi_tick:
                 synch_k = self._sync_readout(alpha_out, beta_out)
                 tick_out = self.c_proj(synch_k).reshape(B, T, D)
+                # Plastic LoRA for multi-tick path
+                _gate = torch.sigmoid(self.plastic_gate)
+                if _gate > 1e-4:
+                    tick_out = tick_out + _gate * (synch_k @ self.plastic_A @ self.plastic_B).reshape(B, T, D)
                 grad_ticks = getattr(self, 'multi_tick_grad', 4)
                 if k < K - grad_ticks:
                     tick_out = tick_out.detach()
@@ -621,6 +633,12 @@ class CTMBlock(nn.Module):
         # Readout: S_out synchronisation -> output projection
         synch = self._sync_readout(alpha_out, beta_out)
         out = self.c_proj(synch).reshape(B, T, D)
+
+        # Plastic LoRA: additive pathway for compact_memory-learned knowledge
+        gate = torch.sigmoid(self.plastic_gate)
+        if gate > 1e-4:  # skip when gate is ~0 (untrained)
+            plastic_out = (synch @ self.plastic_A @ self.plastic_B).reshape(B, T, D)
+            out = out + gate * plastic_out
 
         # ROADMAP (phase 5 - metacognitive tokens):
         # At this point we have per-token internal state that could be emitted as
@@ -1181,6 +1199,16 @@ class GPT(nn.Module):
                     diagnostics['certainty/max'] = final_certainty.max().item()
                     diagnostics['loss/argmin'] = loss_argmin.item()
                     diagnostics['loss/argmax_cert'] = loss_argmax_cert.item()
+
+            # Auxiliary per-tick supervision: every tick learns to predict, not just the selected one.
+            # This forces monotonic improvement across ticks (poker CTM finding: without this,
+            # later ticks diverge; with it, each tick measurably improves predictions).
+            aux_weight = getattr(self.config, 'ctm_aux_weight', 0.1)
+            if aux_weight > 0:
+                aux_loss = all_losses.mean()  # average loss across ALL ticks and ALL tokens
+                task_loss = (1.0 - aux_weight) * task_loss + aux_weight * aux_loss
+                if diagnostics is not None:
+                    diagnostics['loss/aux_all_ticks'] = aux_loss.item()
 
             # Distillation: use the last tick's logits as the student output
             distill_loss, elastic_loss = self._distill_loss(self._compute_logits(last_layer_ticks[-1]), idx)
