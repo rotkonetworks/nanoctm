@@ -1059,40 +1059,39 @@ class QwenBackboneGPT(nn.Module):
                 k: v.detach().clone() for k, v in cached.items()
             }
 
+        # Pre-build padded recall batch (reuse across steps, no init inside loop)
+        _recall_n = 0
+        _recall_input_batch = None
+        _recall_target_batch = None
+        _recall_lengths = []
+        if recall_pairs:
+            _recall_max_len = max(r_in.shape[1] for r_in, _ in recall_pairs)
+            _recall_n = len(recall_pairs)
+            _recall_input_batch = torch.full(
+                (_recall_n, _recall_max_len), 0, dtype=torch.long, device=device)
+            _recall_target_batch = torch.full(
+                (_recall_n, _recall_max_len), -1, dtype=torch.long, device=device)
+            for i, (r_in, r_tgt) in enumerate(recall_pairs):
+                L = r_in.shape[1]
+                _recall_input_batch[i, :L] = r_in[0]
+                _recall_target_batch[i, :L] = r_tgt[0]
+                _recall_lengths.append(L)
+
         for step in range(steps):
             optimizer.zero_grad()
 
             # Teaching loss (with dopamine-shaped cache)
-            # Reuse pre-allocated buffers — copy_ is cheaper than clone (no alloc)
             for idx, cached in da_cached_layers.items():
                 for k, v in cached.items():
                     _step_cache.layers[idx][k].copy_(v)
             _, loss_teach = self.forward(teaching_ids, targets=target_ids,
                                          ctm_cache=_step_cache)
 
-            # Recall loss (fresh context — the actual test condition)
-            # Batched: pad all recall pairs to max length, single forward pass.
-            # Turns N sequential B=1 forwards into 1 forward with B=N.
+            # Recall loss — single batched forward for all pairs
             if recall_pairs:
                 loss_recall = torch.tensor(0.0, device=device)
                 loss_kl = torch.tensor(0.0, device=device)
 
-                # On first step, build the padded batch (reuse across steps)
-                if step == 0:
-                    _recall_max_len = max(r_in.shape[1] for r_in, _ in recall_pairs)
-                    _recall_n = len(recall_pairs)
-                    _recall_input_batch = torch.full(
-                        (_recall_n, _recall_max_len), 0, dtype=torch.long, device=device)
-                    _recall_target_batch = torch.full(
-                        (_recall_n, _recall_max_len), -1, dtype=torch.long, device=device)
-                    _recall_lengths = []
-                    for i, (r_in, r_tgt) in enumerate(recall_pairs):
-                        L = r_in.shape[1]
-                        _recall_input_batch[i, :L] = r_in[0]
-                        _recall_target_batch[i, :L] = r_tgt[0]
-                        _recall_lengths.append(L)
-
-                # Single batched forward for all recall pairs
                 r_logits_batch = self.forward(_recall_input_batch)  # (N, T_max, V)
 
                 # Per-pair CE loss (computed from the batch, no extra forward)

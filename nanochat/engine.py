@@ -474,7 +474,7 @@ class Session:
     """
 
     def __init__(self, model, tokenizer, max_seq_len=None, seed=42, online_lr=0.0,
-                 auto_memorize=False, memorize_threshold=1.5):
+                 auto_memorize=False, memorize_threshold=1.5, memorize_cooldown=128):
         self.model = model
         self.tokenizer = tokenizer
         self.device = model.get_device()
@@ -488,7 +488,9 @@ class Session:
         self.memorize_threshold = memorize_threshold  # surprise std threshold for auto-memorize
         self.memorize_stats = []  # history of auto-memorize events
         self._memorized_up_to = 0  # token position of last memorize (idempotency guard)
-        self._auto_memorize_cooldown = 128  # min new tokens between auto-memorize calls
+        self._auto_memorize_cooldown = memorize_cooldown
+        # Resolve memorize function once (QwenBackboneGPT has .memorize, GPT has .compact_memory)
+        self._memorize_fn = getattr(model, 'memorize', getattr(model, 'compact_memory', None))
 
         m = model.config
         seq_len = max_seq_len or m.sequence_len
@@ -614,9 +616,7 @@ class Session:
 
         Returns: dict with memorize() diagnostics
         """
-        memorize_fn = getattr(self.model, 'memorize',
-                              getattr(self.model, 'compact_memory', None))
-        if memorize_fn is None:
+        if self._memorize_fn is None:
             return {}
 
         tokens = self.tokenizer.encode(text)
@@ -646,7 +646,7 @@ class Session:
             recall_pairs.append((r2_in, r2_tgt))
 
         with torch.inference_mode(False):
-            stats = memorize_fn(
+            stats = self._memorize_fn(
                 teaching_ids=ids,
                 target_ids=targets,
                 lr=lr, steps=steps,
@@ -703,7 +703,8 @@ class Session:
         device = self.device
         # Use new tokens, but include some context from before for coherence
         context_len = min(128, self._memorized_up_to)
-        tokens = self.all_tokens[self._memorized_up_to - context_len:]
+        start = max(0, self._memorized_up_to - context_len)
+        tokens = self.all_tokens[start:]
 
         # Cap at 2048 tokens to avoid OOM on long conversations
         if len(tokens) > 2048:
@@ -769,13 +770,10 @@ class Session:
         # Use memorize() (née compact_memory) with conversation as teaching data
         sanity_prompt = tokens[:20] if len(tokens) >= 20 else None
 
-        # Check if model has memorize (QwenBackboneGPT) or compact_memory (GPT)
-        memorize_fn = getattr(self.model, 'memorize',
-                              getattr(self.model, 'compact_memory', None))
-        if memorize_fn is None:
+        if self._memorize_fn is None:
             return {'skipped': True, 'reason': 'no_memorize_method'}
 
-        stats = memorize_fn(
+        stats = self._memorize_fn(
             teaching_ids=ids,
             target_ids=dopamine_targets,
             lr=lr, steps=steps,

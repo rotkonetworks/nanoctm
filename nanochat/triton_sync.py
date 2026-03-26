@@ -92,7 +92,10 @@ def fused_sync_update(state, alpha, beta, left_idx, right_idx, r, dopamine):
         dopamine: float or scalar tensor
     """
     if not HAS_TRITON or not state.is_cuda:
-        # Fallback: unfused PyTorch (identical semantics)
+        # Fallback: unfused PyTorch — in-place ops, inference only
+        assert not alpha.requires_grad, (
+            "fused_sync_update fallback uses in-place ops, incompatible with autograd. "
+            "Use the non-fused path in CTMBlock.forward for training.")
         left = state[:, left_idx]
         right = state[:, right_idx]
         pp = left * right * dopamine
