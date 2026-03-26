@@ -115,40 +115,50 @@ const bar = document.getElementById('load-bar');
 const txt = document.getElementById('load-text');
 const overlay = document.getElementById('debugger-loading');
 
-// check WebGL support before loading WASM
-const canvas = document.createElement('canvas');
-const hasWebGL = !!(canvas.getContext('webgl2') || canvas.getContext('webgl'));
-if (!hasWebGL) {
-  // redirect to the dashboard (works without WebGL)
-  txt.textContent = 'WebGL not available, loading dashboard...';
+function goToDashboard(reason) {
+  txt.textContent = reason + ' — loading dashboard...';
   bar.style.width = '100%';
-  setTimeout(() => { window.location.href = '/ctm-app/'; }, 500);
-  throw new Error('skip WASM');
+  window.location.href = '/ctm-app/';
 }
 
-const init = (await import('./ctm-debugger.js')).default;
-
-let progress = 0;
-const tick = setInterval(() => {
-  progress = Math.min(progress + (90 - progress) * 0.05, 90);
-  bar.style.width = progress + '%';
-}, 200);
-
-txt.textContent = 'fetching training data...';
-
-// Pre-fetch data into localStorage so WASM loads instantly
 try {
-  const resp = await fetch('ticks.json');
-  const data = await resp.text();
-  localStorage.setItem('ctm_ticks', data);
-  const count = JSON.parse(data).length;
-  txt.textContent = `${count} snapshots cached, loading WASM...`;
-} catch (e) {
-  txt.textContent = 'loading WASM (cached data)...';
-}
+  // check WebGL
+  const canvas = document.createElement('canvas');
+  if (!(canvas.getContext('webgl2') || canvas.getContext('webgl'))) {
+    goToDashboard('WebGL not available');
+  } else {
+    const { default: init } = await import('./ctm-debugger.js');
 
-bar.style.width = '50%';
-await init({ module_or_path: './ctm-debugger_bg.wasm' });
+    let progress = 0;
+    const tick = setInterval(() => {
+      progress = Math.min(progress + (90 - progress) * 0.05, 90);
+      bar.style.width = progress + '%';
+    }, 200);
+
+    txt.textContent = 'fetching training data...';
+
+    try {
+      const resp = await fetch('ticks.json');
+      const data = await resp.text();
+      localStorage.setItem('ctm_ticks', data);
+      const count = JSON.parse(data).length;
+      txt.textContent = `${count} snapshots cached, loading WASM...`;
+    } catch (e) {
+      txt.textContent = 'loading WASM...';
+    }
+
+    bar.style.width = '50%';
+    await init({ module_or_path: './ctm-debugger_bg.wasm' });
+
+    clearInterval(tick);
+    bar.style.width = '100%';
+    txt.textContent = 'ready';
+    setTimeout(() => { if (overlay) overlay.style.display = 'none'; }, 300);
+  }
+} catch (e) {
+  console.warn('WASM debugger failed:', e);
+  goToDashboard('Debugger unavailable');
+}
 
 clearInterval(tick);
 bar.style.width = '100%';
