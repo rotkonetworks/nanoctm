@@ -2577,8 +2577,113 @@ eval uses final-tick loss but training optimizes argmin across all K ticks. when
 specialize (tick 0 wins 52% of tokens), final-tick loss rises while the model IS learning.
 fixed eval to report both final-tick and argmin-tick val loss.
 
-### next experiment
+## dual-CTM experiment — hippocampus + neocortex (2026-03-26)
 
-restart from step 2000 (the plastic checkpoint) with `--plasticity-every 25` to keep the
-weights malleable. test if plasticity survives to step 5000+. if yes, the critical period
-problem is solved and we can train longer without losing the ability to learn new facts.
+implemented separate memory CTM (hippocampus) and cognitive CTM (neocortex) in the same
+model. the idea: neocortex handles language (stable, can solidify), hippocampus handles
+memory (kept plastic via compact_memory).
+
+- cognitive CTM: replaces last FFN in backbone (existing behavior)
+- memory CTM: extra layer after backbone norm, before lm_head
+- compact_memory targets hippocampus exclusively
+- both train on language loss but serve different purposes
+
+tested on Qwen2.5-0.5B + K=4, 8GB AMD GPU. VRAM: 52% (fits). ran to step ~200 before
+killing — loss 2.9 at 2.8s/step.
+
+### why this doesn't solve the problem
+
+the frozen backbone constrains BOTH CTMs equally. training on language modeling loss
+causes BOTH to solidify around the same task. the hippocampus label is cosmetic — there's
+no training signal that teaches it to be a memory module vs a language module. it will
+hit the same critical period as the single CTM.
+
+the real issue: compact_memory's 30-step gradient descent and training's 10k-step gradient
+descent compete for the same weight space. training always wins.
+
+## the synthesis — what the full training log teaches (2026-03-27)
+
+reading the entire log from step 0 to here reveals a pattern. every failed experiment
+shares one root cause, every success confirms the same principle.
+
+### the pattern of failures
+
+1. **12 CTMs (d12, K=3)**: 11 untrained CTMs corrupt signal → fix: single CTM
+2. **single CTM K=1**: generation works, plasticity fails (1 tick = no convergence) → fix: more ticks
+3. **K-ramp 1→2**: generation breaks (new tick injects noise) → fix: train at target K from start
+4. **isis warm-start**: FFN patterns baked in, CTM generates garbage → fix: train from scratch
+5. **frozen Qwen + CTM**: plasticity works at step 2000, dies by step 3000 → fix: ???
+6. **frozen Qwen + dual CTM**: same problem, frozen backbone constrains both CTMs
+
+every fix creates the next problem. we're patching a leaky boat.
+
+### the invariant across all successes
+
+- **d12 from scratch** produced the best generation quality (coherent paragraphs at step 5k)
+- **single CTM with cache-aware from step 0** produced working CTMCache generation
+- **Qwen2.5-0.5B at step 2000** (young model) produced working plasticity (4/4 recall)
+- **K at target from step 0** avoided all K-ramp disasters
+
+every success had: from-scratch or young weights + single CTM + cache-aware + target K.
+
+### the root cause
+
+compact_memory's gradient descent and training's gradient descent compete for the same
+weight space. training pushes weights toward language modeling. compact pushes toward
+fact recall. whoever runs longer wins. training runs for 10k steps. compact runs for 30.
+training always wins.
+
+separate modules (dual CTM) don't help if the training objective is the same. the
+hippocampus solidifies around language modeling just like the neocortex.
+
+### the solution: plasticity-preserving training
+
+train from scratch — d12 + single CTM at target K from step 0 — with a dual-objective
+training loop:
+
+1. **70% of steps**: normal language modeling loss (learn to speak)
+2. **30% of steps**: plasticity exercise — pick a random fact from training data, compact
+   it, verify recall, continue training. the loss includes "can I still compact?"
+
+this is weight training with stretching. the model learns to STAY PLASTIC while learning
+language. the plasticity exercises during training prevent weights from solidifying into a
+rigid minimum that rejects future compact_memory calls.
+
+### what we built this session (2026-03-26/27)
+
+code contributions:
+- **Angeris bound diagnostics** in dream(): c_proj SVD rank/condition, synapse utilization,
+  neuron health, bottleneck identification. caught rank-1 collapse at step 50 instead of 11k.
+- **bound-guided aux loss**: per-tick supervision weight ∝ synapse gap from optimality.
+  connects Angeris SDP framework with deep supervision theory.
+- **chunked multi-tick loss**: 248K vocab on 8GB — chunked lm_head into 256MB pieces +
+  gradient checkpointing. no OOM on consumer GPU.
+- **dual eval**: final-tick + argmin-tick val loss. exposed the train/eval protocol mismatch.
+- **dual-CTM architecture**: hippocampus + neocortex. works but doesn't solve root cause.
+- **compact_memory cache fix**: rebuild cache each step to avoid backward graph leak.
+- **plastic LoRA dtype fix**: bf16/fp32 mismatch in plastic pathway.
+
+key findings:
+- c_proj rank expanded 1→149 over 6000 steps on Qwen2.5-0.5B (healthy)
+- plasticity has a **critical period**: works at step 2000, dead by step 3000
+- sequential compact causes **catastrophic forgetting** — each fact overwrites previous
+- plastic LoRA pathway (plastic_A/B) has zero norm — compact writes to main weights
+- val loss mismatch is train/eval protocol difference, not overfitting
+- 4B backbone without multi-tick = useless (CTM is a passthrough)
+
+### the plan: d12 from scratch with plasticity exercises
+
+the rational path forward:
+
+```
+d12, single CTM, K=4 or K=8 from step 0
+cache-aware 0.30 from step 0
+bound-guided aux from step 0
+plasticity exercises every 25 steps during training
+Angeris diagnostics every 50 steps
+train on FineWeb/climbmix
+8GB AMD GPU (d12 fits easily)
+```
+
+d12 won't be GPT-4. but if plasticity survives 10k+ steps of training with interleaved
+exercises, that's the real breakthrough — a model that never stops learning.
