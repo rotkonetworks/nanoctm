@@ -128,6 +128,85 @@ should add:
 - [ ] wandb logging of per-tick selection over time
 - [ ] cache-aware ratio defaults to 0.30 when --use-ctm is set
 
+## findings from bound analysis + poker plasticity experiments (2026-03-28)
+
+### bound analysis (Angeris 2022 SDP duals applied to CTM)
+
+ran optimality bounds on trained trading CTM v5 (256 neurons, 30 ticks).
+
+1. **synapse has rank-270 capacity but only rank-4 utilization.** the bottleneck
+   is upstream — attention produces low-rank queries. all ticks "think" the same.
+   fix: tick embeddings must enter attention queries, not just synapse input.
+   (currently `tick_embed` only enters at `state + tick_emb` in _tick_core line 425)
+
+2. **all 256 neurons are diverse** (pairwise cosine sim 0.0002), none truly dead.
+   what looked like 87% "dead neurons" was actually sparse activation — different
+   inputs activate different subsets (~25% active per input). this is healthy.
+
+3. **synapse depth 32 is overkill** when activation rank is 4. either fix upstream
+   rank problem (then depth matters) or reduce to depth 4-8.
+
+4. **early ticks need 2.8× more gradient** than later ticks. the thinking warmup
+   is the weakest link. bound-guided tick weighting helps.
+
+5. **fp32 required for sync accumulation.** bf16 loses the small deltas. sync path
+   must stay fp32 even when everything else is bf16.
+
+### poker plasticity experiments
+
+tested neuroplasticity on poker CTM-MoE experts. question: can the model adapt
+its strategy after seeing new opponent patterns WITHOUT retraining?
+
+**what doesn't work:**
+- LoRA adapter (compact_memory): plasticity 0.001. rank-8 additive on frozen base
+  can't override learned policy. even rank=128 with 500 steps only reaches 0.012.
+- persistent sync with detached gradients: model learns to ignore sync input (it's
+  noise during training). plasticity ~0.001.
+- persistent sync with full gradients: training diverges after ~60 epochs (gradient
+  explosion through long accumulation chains).
+
+**what works:**
+- **sync in graph for short training (40-60 epochs):** plasticity 0.035-0.046 with
+  ZERO gradient updates at test time. the sync accumulation pattern shifts behavior.
+  fold_river: +0.031 river betting after 100 observed hands.
+- **policy head fine-tuning:** plasticity 0.267 but requires gradient updates (not
+  true architectural plasticity).
+
+**key lesson (same as cache-aware finding):** the model must be TRAINED with the
+mechanism active from step 0. sync accumulation only works when training includes
+persistent sessions. this parallels the cache-aware finding — if the model never
+trains with cache, it treats cache as noise.
+
+**the fundamental tension:** gradients through sync = model learns to use sync but
+training diverges. detached sync = stable but model ignores sync. solution: truncated
+BPTT with cosine LR decay, or the "sync-aware ratio" approach (30% of batches with
+accumulated sync, 70% fresh). currently searching optimal config.
+
+**grid search result (32 experiments):** detached persistent sync (truncated BPTT)
+gives max plasticity 0.002 regardless of sync_ratio, LR, grad_clip, or epochs.
+the model simply ignores detached sync — within-hand gradient (8 ticks) is too
+short to teach inter-hand information use. confirmed: detached persist is a dead end.
+
+**what actually works:** non-detached sync (in gradient graph across hands) for
+40-60 epochs with cosine LR and grad_clip=0.5. gets plasticity 0.035-0.046 but
+diverges after epoch ~60-80. the fix is early stopping + aggressive LR warmdown.
+
+**implication for nanochat:** the CTMCache sync accumulators (alpha/beta) must
+stay in the gradient graph during training, not just at inference. this means
+cache-aware training should backprop THROUGH the accumulated sync, with truncation
+at ~20-30 tokens to prevent explosion. the compact_memory approach (post-hoc LoRA)
+is the wrong direction — the model should adapt through its own dynamics.
+
+### what to change in next training run
+
+- [ ] inject tick_embed into attention query (not just synapse), diversifies per-tick
+      observation → increases activation rank through synapse
+- [ ] sync path forced fp32 via `torch.float32` context in _tick_core
+- [ ] reduce synapse depth 32→8 (save compute, activation rank is 4 anyway)
+- [ ] add bound analysis callback every 500 steps (diagnostic, no training change)
+- [ ] cache-aware 30% includes ACCUMULATED sync, not just fresh cache state
+- [ ] run plasticity search to find optimal sync_ratio × lr × grad_clip × epochs
+
 ## hardware notes
 
 - CTM at K=1-2 is ~2% MFU. GPU matmul power is wasted. cheaper GPU is fine.

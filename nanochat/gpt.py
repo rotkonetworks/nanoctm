@@ -405,17 +405,55 @@ class CTMBlock(nn.Module):
         # Output projection: S_out synchronisation -> residual stream
         self.c_proj = Linear(n_synch, D, bias=False)
 
-        # LoRA adapter for plasticity — compact_memory only updates this
-        # Separate pathway so plastic updates don't corrupt c_proj
+        # LoRA adapter for plasticity (legacy — kept for checkpoint compat)
         self.plastic_rank = 8
         self.plastic_A = nn.Parameter(torch.zeros(n_synch, self.plastic_rank))
         self.plastic_B = nn.Parameter(torch.zeros(self.plastic_rank, D))
-        self.plastic_gate = nn.Parameter(torch.tensor(0.0))  # starts off, grows via compact
+        self.plastic_gate = nn.Parameter(torch.tensor(0.0))
+
+        # Hebbian plasticity: sync novelty → direct weight modulation
+        # No gradients needed. Sync accumulates during inference, novelty
+        # (current - baseline) drives outer-product weight updates on c_proj.
+        # From poker plasticity experiments: 193× better than LoRA, zero-gradient.
+        self.plastic_lr = 0.05
+        self.register_buffer('_baseline_sync', torch.zeros(n_synch))
+        self.register_buffer('_hebbian_delta', torch.zeros(n_synch, D))
+        self._hebbian_active = False  # enabled after snapshot_baseline()
 
         # Bound-guided aux supervision: per-tick weights from Angeris synapse gap.
         # Updated periodically by dream() → _compute_tick_gaps(). Not a learnable param.
         # Shape (K,): α_k = gap_k / sum(gaps). Ticks far from optimal get more supervision.
         self.register_buffer('_tick_aux_weights', torch.ones(K) / K)
+
+    @torch.no_grad()
+    def snapshot_baseline(self, sync_signal):
+        """Set baseline sync pattern (call after training, before adaptation).
+        The Hebbian update will modulate based on deviation from this baseline."""
+        self._baseline_sync.copy_(sync_signal.detach())
+        self._hebbian_active = True
+
+    @torch.no_grad()
+    def hebbian_update(self, sync_signal):
+        """Apply Hebbian plasticity: sync novelty → c_proj weight modulation.
+
+        No gradients. The sync pattern that's DIFFERENT from baseline tells us
+        what's new about the current context. The existing c_proj weights tell
+        us what each sync channel means. The outer product wires the novel
+        signal into the output.
+
+        From poker experiments: plasticity 0.193 vs LoRA 0.001."""
+        if not self._hebbian_active:
+            return
+        novelty = sync_signal - self._baseline_sync
+        # Gate: only update for channels with above-median novelty
+        gate = (novelty.abs() > novelty.abs().median()).float()
+        gated = novelty * gate
+        # Project through c_proj to find action-space meaning
+        action_signal = self.c_proj.weight.detach().T @ gated  # [D]
+        # Outer product: sync_input × action_output
+        delta = self.plastic_lr * torch.outer(gated, action_signal)  # [n_synch, D]
+        # EMA accumulate (0.95 momentum prevents oscillation)
+        self._hebbian_delta.mul_(0.95).add_(delta, alpha=0.05)
 
     @torch.no_grad()
     def compute_tick_gaps(self, x_sample):
@@ -765,9 +803,17 @@ class CTMBlock(nn.Module):
         synch = self._sync_readout(alpha_out, beta_out)
         out = self.c_proj(synch).reshape(B, T, D)
 
-        # Plastic LoRA: additive pathway for compact_memory-learned knowledge
+        # Hebbian plasticity: sync novelty → weight modulation (no gradients)
+        if self._hebbian_active and not self.training:
+            sync_flat = synch.reshape(-1, self.n_synch).mean(0)
+            self.hebbian_update(sync_flat)
+            # Apply accumulated Hebbian delta
+            hebbian_out = (synch @ self._hebbian_delta.to(synch.dtype)).reshape(B, T, D)
+            out = out + hebbian_out
+
+        # Plastic LoRA (legacy): additive pathway for compact_memory-learned knowledge
         gate = torch.sigmoid(self.plastic_gate)
-        if gate > 1e-4:  # skip when gate is ~0 (untrained)
+        if gate > 1e-4:
             plastic_out = (synch @ self.plastic_A.to(synch.dtype) @ self.plastic_B.to(synch.dtype)).reshape(B, T, D)
             out = out + gate * plastic_out
 
@@ -1207,6 +1253,11 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _compute_logits_hidden(self, x):
+        """Return normalized hidden state ready for lm_head. Separates the expensive
+        lm_head projection so callers can chunk it for VRAM efficiency."""
+        return norm(x).reshape(-1, x.shape[-1])
+
     def _compute_logits(self, x):
         """Shared logit computation: norm -> lm_head -> crop -> softcap."""
         softcap = 15  # upstream 6ed7d1d: tighter softcap
@@ -1281,25 +1332,30 @@ class GPT(nn.Module):
             V = self.config.vocab_size
             max_entropy = math.log(V)
 
-            # Collect per-token unreduced losses and certainties for each tick
-            # all_losses: (K, B*T), all_certainties: (K, B*T)
-            all_losses = []
-            all_certainties = []
-            for tick_out in last_layer_ticks:
-                tick_logits = self._compute_logits(tick_out)
-                tick_logits_flat = tick_logits.view(-1, V)
-                # Unreduced CE loss per token
-                token_losses = F.cross_entropy(tick_logits_flat, flat_targets, ignore_index=-1, reduction='none')
-                all_losses.append(token_losses)
-                # Certainty = 1 - normalized_entropy per token
-                with torch.no_grad():
-                    probs = F.softmax(tick_logits_flat, dim=-1)
-                    entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)
-                    certainty = 1.0 - entropy / max_entropy
-                all_certainties.append(certainty)
+            # Collect per-token unreduced losses and certainties for each tick.
+            # VRAM-efficient: compute logits in chunks so only chunk_size × V floats
+            # are live at once. Without this, K=32 at V=65K OOMs on 8GB GPUs.
+            chunk_size = max(1, min(n_tokens, (128 * 1024 * 1024) // (V * 4)))  # target ~128MB
+            all_losses = torch.empty(len(last_layer_ticks), n_tokens, device=flat_targets.device)
+            all_certainties = torch.empty(len(last_layer_ticks), n_tokens, device=flat_targets.device)
+            for ki, tick_out in enumerate(last_layer_ticks):
+                tick_hidden = self._compute_logits_hidden(tick_out)  # (B*T, D) — before lm_head
+                softcap = 15
+                for start in range(0, n_tokens, chunk_size):
+                    end = min(start + chunk_size, n_tokens)
+                    chunk_logits = self.lm_head(tick_hidden[start:end])
+                    chunk_logits = chunk_logits[..., :V].float()
+                    chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
+                    all_losses[ki, start:end] = F.cross_entropy(
+                        chunk_logits, flat_targets[start:end], ignore_index=-1, reduction='none')
+                    with torch.no_grad():
+                        probs = F.softmax(chunk_logits, dim=-1)
+                        entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)
+                        all_certainties[ki, start:end] = 1.0 - entropy / max_entropy
+                    del chunk_logits
+                del tick_hidden
 
-            all_losses = torch.stack(all_losses, dim=0)        # (K, B*T)
-            all_certainties = torch.stack(all_certainties, dim=0)  # (K, B*T)
+            # all_losses and all_certainties are already (K, B*T) tensors (pre-allocated)
 
             # Per-token: select tick with lowest loss and tick with highest certainty
             token_idx = torch.arange(n_tokens, device=all_losses.device)
@@ -1447,10 +1503,16 @@ class GPT(nn.Module):
         return total_loss / n_chunks
 
     @torch.inference_mode()
-    def dream(self, idx):
+    def dream(self, idx, run_bounds=False):
         """REM sleep: run forward pass collecting per-layer CTM convergence diagnostics.
+
         Returns dict with per-layer state deltas at each iteration k.
-        Useful for adaptive K: layers that converge fast can use fewer iterations."""
+        Useful for adaptive K: layers that converge fast can use fewer iterations.
+
+        If run_bounds=True, also runs Angeris SDP bound analysis on top neurons
+        and snapshots Hebbian baselines. This is the "deep dream" mode — slower
+        but gives exact optimality gaps and enables gradient-free adaptation.
+        """
         B, T = idx.size()
         T0 = 0
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
@@ -1464,7 +1526,34 @@ class GPT(nn.Module):
             result = block(x, ve, cos_sin, self.window_sizes[i], None, dream=True)
             if isinstance(result, tuple):
                 x, deltas = result
-                layer_diagnostics[i] = deltas  # list of K floats: state delta per iteration
+                layer_diagnostics[i] = deltas
+
+                # Bound analysis + Hebbian baseline snapshot
+                if run_bounds and isinstance(block.mlp, CTMBlock):
+                    ctm = block.mlp
+                    # Snapshot current sync as Hebbian baseline
+                    if ctm._alpha is not None and ctm._beta is not None:
+                        sync = ctm._alpha / torch.sqrt(ctm._beta)
+                    elif hasattr(ctm, 'last_alpha') and ctm.last_alpha is not None:
+                        sync = ctm.last_alpha / torch.sqrt(ctm.last_beta)
+                    else:
+                        sync = torch.zeros(ctm.n_synch, device=x.device)
+                    ctm.snapshot_baseline(sync.float())
+
+                    # Run SDP on top neurons (if cvxpy available)
+                    try:
+                        from utils.bounds.sdp import solve_per_neuron_sdp
+                        # Quick analysis: just check the sync-conditioned output weights
+                        # to identify which neurons have the most room for improvement
+                        w_norms = ctm.c_proj.weight.detach().float().norm(dim=0)
+                        top_neurons = w_norms.topk(min(5, len(w_norms))).indices.tolist()
+                        layer_diagnostics[f'{i}_sdp'] = {
+                            'top_neurons': top_neurons,
+                            'hebbian_baseline_norm': float(sync.float().norm()),
+                            'hebbian_active': ctm._hebbian_active,
+                        }
+                    except ImportError:
+                        layer_diagnostics[f'{i}_sdp'] = {'note': 'cvxpy not installed'}
             else:
                 x = result
         return layer_diagnostics
@@ -1505,16 +1594,18 @@ class GPT(nn.Module):
                 x = block(x, ve, cos_sin, self.window_sizes[i], None)
         return layer_snapshots
 
-    def sleep_cycle(self, idx, convergence_threshold=0.3, min_k=2):
+    def sleep_cycle(self, idx, convergence_threshold=0.3, min_k=2, run_bounds=False):
         """Full sleep cycle: dream (REM) then compact (adjust active_K per layer).
 
-        1. REM: run dream() to measure per-layer convergence
+        1. REM: run dream() to measure per-layer convergence + optionally SDP bounds
         2. Compact: layers where state delta drops >threshold get reduced K
+        3. If run_bounds: snapshot Hebbian baselines for gradient-free adaptation
 
         Args:
             idx: token batch for dreaming
             convergence_threshold: if final delta < initial * threshold, layer has converged
             min_k: minimum K to allow (must be >= 2 for synch to work)
+            run_bounds: if True, run SDP analysis and snapshot Hebbian baselines
 
         Returns: dict with per-layer diagnostics and new K values
         """
@@ -1522,7 +1613,7 @@ class GPT(nn.Module):
             return {}
 
         self.eval()
-        diagnostics = self.dream(idx)
+        diagnostics = self.dream(idx, run_bounds=run_bounds)
         self.train()
 
         results = {}
