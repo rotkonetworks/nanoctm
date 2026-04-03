@@ -56,6 +56,7 @@ class GPTConfig:
     ctm_n_attn_heads: int = 1     # cross-attention heads for data re-observation
     ctm_synapse_depth: int = 32   # U-NET synapse depth (half down, half up). Paper uses 16.
     ctm_layers: str = "all"       # which layers get CTM: "all", "last", "last:N", or "0,5,11"
+    ctm_v2: bool = False           # use CTMv2Block (4 brain regions) instead of CTMBlock
     ctm_adaptive_k: bool = False   # use mean normalization (alpha/beta) instead of sqrt (alpha/sqrt(beta)).
                                    # makes output K-invariant so K can change mid-training or per-token.
                                    # tradeoff: loses sqrt amplification (more ticks = louder signal).
@@ -864,22 +865,32 @@ def _layer_uses_ctm(layer_idx, config):
     return layer_idx in indices
 
 
+def _is_ctm(module):
+    """Check if a module is any CTM variant (v1 CTMBlock or v2 CTMv2Block)."""
+    return isinstance(module, CTMBlock) or hasattr(module, 'regions')
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
         self.attn = CausalSelfAttention(config, layer_idx)
         use_ctm_here = config.use_ctm and _layer_uses_ctm(layer_idx, config)
-        self.mlp = CTMBlock(config) if use_ctm_here else MLP(config)
+        if use_ctm_here and config.ctm_v2:
+            from nanochat.ctm_v2_block import CTMv2Block
+            self.mlp = CTMv2Block(config)
+        elif use_ctm_here:
+            self.mlp = CTMBlock(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, dream=False, multi_tick=False, adaptive=False, ctm_cache=None):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        if isinstance(self.mlp, CTMBlock) and (dream or multi_tick or adaptive):
+        if _is_ctm(self.mlp) and (dream or multi_tick or adaptive):
             mlp_out, extras = self.mlp(norm(x), dream=dream, multi_tick=multi_tick, adaptive=adaptive,
                                        ctm_cache=ctm_cache, layer_idx=self.layer_idx)
             x = x + mlp_out
             return x, extras  # extras = deltas (dream) or tick_outputs (multi_tick)
-        if isinstance(self.mlp, CTMBlock):
+        if _is_ctm(self.mlp):
             x = x + self.mlp(norm(x), ctm_cache=ctm_cache, layer_idx=self.layer_idx)
         else:
             x = x + self.mlp(norm(x))
@@ -956,7 +967,10 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            if isinstance(block.mlp, CTMBlock):
+            if hasattr(block.mlp, 'regions'):
+                # CTMv2Block: has its own init_weights() that handles everything
+                block.mlp.init_weights()
+            elif _is_ctm(block.mlp):
                 ctm = block.mlp
                 # Cross-attention projections: uniform like c_q/c_k/c_v
                 torch.nn.init.uniform_(ctm.attn_q_proj.weight, -s, s)
@@ -1108,7 +1122,7 @@ class GPT(nn.Module):
         self._elastic_snapshot = {}
         if self.config.use_ctm:
             for block in self.transformer.h:
-                if isinstance(block.mlp, CTMBlock):
+                if _is_ctm(block.mlp):
                     for p in block.mlp.parameters():
                         if p.requires_grad:
                             self._elastic_snapshot[id(p)] = p.data.clone()
@@ -1167,7 +1181,7 @@ class GPT(nn.Module):
         if ew > 0 and snapshot:
             penalty = 0.0
             for block in self.transformer.h:
-                if isinstance(block.mlp, CTMBlock):
+                if _is_ctm(block.mlp):
                     for p in block.mlp.parameters():
                         if id(p) in snapshot:
                             penalty = penalty + (p - snapshot[id(p)]).pow(2).sum()
@@ -1403,7 +1417,7 @@ class GPT(nn.Module):
                 _ctm_block = None
                 if use_bound_guided:
                     for block in reversed(list(self.transformer.h)):
-                        if isinstance(block.mlp, CTMBlock):
+                        if _is_ctm(block.mlp):
                             _ctm_block = block.mlp
                             break
                 if use_bound_guided and _ctm_block is not None:
@@ -1529,7 +1543,7 @@ class GPT(nn.Module):
                 layer_diagnostics[i] = deltas
 
                 # Bound analysis + Hebbian baseline snapshot
-                if run_bounds and isinstance(block.mlp, CTMBlock):
+                if run_bounds and _is_ctm(block.mlp):
                     ctm = block.mlp
                     # Snapshot current sync as Hebbian baseline
                     if ctm._alpha is not None and ctm._beta is not None:
@@ -1579,7 +1593,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            probe_this = isinstance(block.mlp, CTMBlock) and (layers is None or i in layers)
+            probe_this = _is_ctm(block.mlp) and (layers is None or i in layers)
             if probe_this:
                 states = []
                 def capture(k, state, trace, _states=states):
@@ -1619,7 +1633,7 @@ class GPT(nn.Module):
         results = {}
         for i, deltas in diagnostics.items():
             block = self.transformer.h[i]
-            if not isinstance(block.mlp, CTMBlock):
+            if not _is_ctm(block.mlp):
                 continue
 
             old_k = block.mlp.active_K
@@ -1673,7 +1687,7 @@ class GPT(nn.Module):
         # Collect only synapse/NLM params — the "plastic" parameters
         plastic_params = set()
         for block in self.transformer.h:
-            if not isinstance(block.mlp, CTMBlock):
+            if not _is_ctm(block.mlp):
                 continue
             ctm = block.mlp
             plastic_params.update(p for p in ctm.synapses.parameters() if p.requires_grad)
@@ -1773,7 +1787,7 @@ class GPT(nn.Module):
         stats = {}
         with torch.no_grad():
             for i, block in enumerate(self.transformer.h):
-                if not isinstance(block.mlp, CTMBlock):
+                if not _is_ctm(block.mlp):
                     continue
                 cached = ctm_cache.layers[i]
                 if cached is None:

@@ -79,6 +79,7 @@ parser.add_argument("--ctm-n-synch", type=int, default=-1, help="CTM synchronisa
 parser.add_argument("--ctm-memory-hidden", type=int, default=32, help="CTM NLM hidden dimension (-1 = n_synch // 4, scales with model)")
 parser.add_argument("--ctm-synapse-depth", type=int, default=32, help="CTM U-NET synapse depth (even, half down + half up). Paper uses 16, we use 32.")
 parser.add_argument("--ctm-layers", type=str, default="all", help="which layers get CTM: 'all', 'last', 'last:N', or '0,5,11'")
+parser.add_argument("--ctm-v2", action="store_true", help="use CTMv2Block (4 brain regions: input/attention/output/motor) instead of flat CTMBlock")
 parser.add_argument("--ctm-adaptive-k", action="store_true", help="use mean sync normalization (alpha/beta) instead of sqrt (alpha/sqrt(beta)). K-invariant but loses amplification. NOT RECOMMENDED unless you need K-ramp.")
 parser.add_argument("--warm-start-from", type=str, default=None, help="warm-start from MLP checkpoint dir (loads attention+embeddings, fresh CTM init)")
 parser.add_argument("--freeze-non-ctm", action="store_true", help="freeze attention+embeddings, only train CTM blocks (Phase 2 fine-tuning)")
@@ -183,6 +184,7 @@ def build_model_meta(depth):
         ctm_memory_hidden=args.ctm_memory_hidden, ctm_synapse_depth=args.ctm_synapse_depth,
         ctm_layers=args.ctm_layers,
         ctm_adaptive_k=args.ctm_adaptive_k,
+        ctm_v2=getattr(args, 'ctm_v2', False),
     )
     with torch.device("meta"):
         model_meta = GPT(config)

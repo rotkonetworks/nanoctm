@@ -155,10 +155,17 @@ class QwenBackboneGPT(nn.Module):
             ctm_adaptive_k=ctm_config.get("ctm_adaptive_k", False),
         )
 
-        # Create one CTMBlock per designated layer
-        self.ctm_blocks = nn.ModuleDict({
-            str(idx): CTMBlock(self.config) for idx in self.ctm_layer_indices
-        })
+        # Create one CTMBlock (or CTMv2Block) per designated layer
+        use_v2 = ctm_config.get("ctm_v2", False)
+        if use_v2:
+            from nanochat.ctm_v2_block import CTMv2Block
+            self.ctm_blocks = nn.ModuleDict({
+                str(idx): CTMv2Block(self.config) for idx in self.ctm_layer_indices
+            })
+        else:
+            self.ctm_blocks = nn.ModuleDict({
+                str(idx): CTMBlock(self.config) for idx in self.ctm_layer_indices
+            })
         # Backwards compat alias
         self.ctm_block = self.ctm_blocks[str(self.ctm_layer_idx)]
 
