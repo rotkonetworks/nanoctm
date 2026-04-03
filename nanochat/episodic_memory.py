@@ -358,3 +358,197 @@ class EpisodicMemory:
         with open(path, 'w') as f:
             json.dump(data, f)
         return sum(len(eps) for eps in self.episodes.values())
+
+    # ─── Engram Competition (Active Forgetting) ──────────────────
+
+    def _find_competing(self, prompt: str, alter: str,
+                         backbone, tokenizer, target_layer: int,
+                         get_hidden_fn, similarity_threshold: float = 0.80):
+        """Find existing episodes that compete with a new prompt.
+
+        Two memories compete when their prompt keys are similar —
+        same cue, different answers. The prefrontal cortex detects
+        the conflict and suppresses the weaker trace.
+        """
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_input = torch.tensor([prompt_ids], device=self.device)
+        with torch.no_grad():
+            h = get_hidden_fn(backbone, prompt_input, target_layer, self.device)
+        query = h[0, -1].float().cpu()
+        query = query / (query.norm() + 1e-8)
+
+        competitors = []
+        for alt_name, eps in self.episodes.items():
+            for ep in eps:
+                # Check the PROMPT_END key (exact prompt match)
+                for key, tok, pos in ep.keys:
+                    if tok == "[PROMPT_END]":
+                        sim = F.cosine_similarity(
+                            query.unsqueeze(0), key.unsqueeze(0)).item()
+                        if sim > similarity_threshold:
+                            competitors.append((ep, alt_name, sim))
+                        break
+        return competitors
+
+    @torch.no_grad()
+    def teach_with_competition(self, backbone, tokenizer,
+                                prompt: str, answer: str,
+                                alter: str = "default",
+                                target_layer: int = 23,
+                                importance: float = 1.0,
+                                get_hidden_fn=None, get_logits_fn=None):
+        """Teach with engram competition — conflicting memories compete.
+
+        When a new fact has the same prompt as an existing fact:
+        - If new is stronger → old gets SUPPRESSED (marked, strength reduced)
+        - If old is stronger → new gets WEAK encoding
+        - If same answer → REINFORCEMENT (reconsolidation boost)
+
+        Brain analog: prefrontal cortex detects conflict between competing
+        memory traces, actively inhibits the weaker one (retrieval-induced
+        forgetting, Anderson et al. 2004).
+        """
+        # Find competing memories
+        competitors = self._find_competing(
+            prompt, alter, backbone, tokenizer, target_layer, get_hidden_fn)
+
+        suppressed = []
+        reinforced = []
+        competition_result = "new"  # new, suppressed, reinforced
+
+        for comp_ep, comp_alter, sim in competitors:
+            if comp_ep.answer.lower() == answer.lower():
+                # Same answer = REINFORCEMENT (reconsolidation)
+                comp_ep.recall_count += 3  # strong reconsolidation
+                comp_ep.strength = max(comp_ep.strength, importance)
+                reinforced.append(comp_ep)
+                competition_result = "reinforced"
+            else:
+                # Different answer = CONFLICT
+                new_strength = importance  # before auto-modulation
+                old_strength = comp_ep.effective_strength()
+
+                if new_strength >= old_strength:
+                    # New wins → suppress old
+                    comp_ep.strength *= 0.1  # 90% suppression
+                    suppressed.append(comp_ep)
+                    competition_result = "new_wins"
+                else:
+                    # Old wins → new gets weak encoding
+                    importance *= 0.3
+                    competition_result = "old_wins"
+
+        # Now teach the new fact (possibly with reduced importance)
+        stats = self.teach(
+            backbone, tokenizer, prompt, answer, alter, target_layer,
+            get_hidden_fn, get_logits_fn, importance)
+
+        stats['competition'] = competition_result
+        stats['suppressed'] = [(ep.prompt[:30], ep.answer) for ep in suppressed]
+        stats['reinforced'] = [(ep.prompt[:30], ep.answer) for ep in reinforced]
+        return stats
+
+    # ─── Sleep Consolidation (Hippocampus → Cortex Transfer) ─────
+
+    @torch.no_grad()
+    def sleep_consolidate(self, backbone, tokenizer,
+                           target_layer: int = 23,
+                           get_hidden_fn=None, get_logits_fn=None,
+                           min_recalls: int = 3,
+                           top_n: int = 5,
+                           blend: float = 0.3):
+        """Sleep consolidation: graduate frequent memories from KV bank to weights.
+
+        During biological sleep:
+        1. Hippocampus replays most-accessed memories
+        2. Neocortical synapses change slightly on each replay
+        3. After enough replays, the memory lives in cortex
+        4. Hippocampal trace can be pruned
+
+        Our implementation:
+        1. Select top-N most-recalled episodes (above min_recalls threshold)
+        2. Collect their sync → output mappings
+        3. Least-squares solve for optimal c_proj update
+        4. Blend into a "consolidated weights" delta
+        5. Mark graduated episodes (reduce strength, stop logit injection)
+
+        The consolidated delta is a SEPARATE weight matrix (like the memory JSON
+        but as a weight diff). Apply it during inference: output += delta @ sync
+
+        Returns: consolidation stats + the weight delta
+        """
+        # Collect episodes eligible for consolidation
+        candidates = []
+        for alter, eps in self.episodes.items():
+            for ep in eps:
+                if ep.recall_count >= min_recalls:
+                    candidates.append((ep, alter))
+
+        # Sort by recall count (most replayed = most ready for consolidation)
+        candidates.sort(key=lambda x: x[0].recall_count, reverse=True)
+        candidates = candidates[:top_n]
+
+        if not candidates:
+            return {'consolidated': 0, 'reason': 'no episodes above min_recalls'}
+
+        D = backbone.config.hidden_size
+        n_synch = D // 2  # matches CTMv2Block convention
+
+        # For each candidate: get the prompt hidden state and target output
+        # The "replay" is: run the prompt through the backbone, see what the
+        # memory bank would inject, record that as the target for weight update
+        replay_hiddens = []
+        replay_targets = []
+
+        for ep, alter in candidates:
+            prompt_ids = tokenizer.encode(ep.prompt, add_special_tokens=False)
+            prompt_input = torch.tensor([prompt_ids], device=self.device)
+            hidden = get_hidden_fn(backbone, prompt_input, target_layer, self.device)
+
+            # The hidden state at the prompt's last token
+            h = hidden[0, -1].float()
+            replay_hiddens.append(h)
+
+            # The target: what the backbone SHOULD output to produce the answer
+            # = the lm_head direction for the first answer token, scaled by strength
+            answer_ids = tokenizer.encode(ep.answer, add_special_tokens=False)
+            first_answer_id = answer_ids[0]
+            target_direction = backbone.lm_head.weight[first_answer_id].float()
+            # Scale by episode strength (strong memories consolidate more)
+            target = target_direction * ep.effective_strength() * 0.01
+            replay_targets.append(target)
+
+        H = torch.stack(replay_hiddens)  # (N, D)
+        Y = torch.stack(replay_targets)  # (N, D)
+
+        # Least-squares: find weight delta that maps hidden → target
+        # delta_W such that H @ delta_W ≈ Y
+        HtH = H.T @ H + 1e-4 * torch.eye(D, device=H.device)
+        HtY = H.T @ Y
+        try:
+            delta_W = torch.linalg.solve(HtH, HtY)  # (D, D)
+        except Exception:
+            return {'consolidated': 0, 'reason': 'solve failed'}
+
+        # Mark consolidated episodes: reduce strength (they're in weights now)
+        graduated = []
+        for ep, alter in candidates:
+            old_strength = ep.strength
+            ep.strength *= (1.0 - blend)  # reduce proportionally to blend
+            ep.metadata['consolidated'] = True
+            ep.metadata['consolidated_at'] = time.time()
+            graduated.append({
+                'prompt': ep.prompt[:40],
+                'answer': ep.answer,
+                'recalls': ep.recall_count,
+                'old_strength': round(old_strength, 2),
+                'new_strength': round(ep.strength, 2),
+            })
+
+        return {
+            'consolidated': len(candidates),
+            'delta_W': delta_W.cpu(),  # the weight update to apply
+            'delta_norm': delta_W.norm().item(),
+            'blend': blend,
+            'graduated': graduated,
+        }
