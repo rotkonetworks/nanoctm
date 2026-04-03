@@ -270,10 +270,10 @@ class EpisodicMemory:
                     for key, tok, pos in ep.keys:
                         sim = F.cosine_similarity(
                             query.unsqueeze(0), key.unsqueeze(0)).item()
-                        # Weight by episode strength
-                        weighted_sim = sim * ep.effective_strength() / max(ep.strength, 0.1)
-                        if weighted_sim > best_sim:
-                            best_sim = weighted_sim
+                        # Match on RAW similarity only — strength affects
+                        # logit bias magnitude, NOT gate threshold
+                        if sim > best_sim:
+                            best_sim = sim
                             best_episode = ep
                             best_alter = alter_name
 
