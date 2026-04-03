@@ -356,9 +356,11 @@ class Brain:
         4. Working memory provides recent context
         5. Generate with all biases applied
         """
-        # 1. Procedural: prepend behavioral rules
-        rule_prefix = self.cerebellum.get_instruction_prefix(prompt)
-        full_prompt = rule_prefix + prompt if rule_prefix else prompt
+        # 1. Procedural: rules modify behavior but DON'T prepend to prompt
+        # (prepending leaks rule text into output). Instead, rules will
+        # apply as logit biases in future iterations. For now, track them.
+        active_rules = self.cerebellum.get_active_rules(prompt)
+        full_prompt = prompt
 
         # 2. Amygdala: check for avoidance
         suppression, triggered_avoidances = self.amygdala.check(
@@ -427,8 +429,7 @@ class Brain:
                 'triggered': [(av.pattern[:30], av.reason, round(gate, 2))
                               for av, sim, gate in (triggered_avoidances or [])],
             },
-            'rules': [r.instruction for r in
-                      self.cerebellum.get_active_rules(prompt)],
+            'rules': [r.instruction for r in active_rules],
             'working_memory_size': len(self.working_memory),
         }
 

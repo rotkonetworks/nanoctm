@@ -49,6 +49,7 @@ a record of our model's journey from noise to something that thinks.
 - [three-factor neuroplasticity — compact_memory()](#three-factor-neuroplasticity--compact_memory-2026-03-12)
 - [Qwen3-0.6B + CTM K=32 full-featured training](#qwen3-06b--ctm-k32-full-featured-training-2026-03-12)
 - [ctm.rotko.net — live site and debugger](#ctmrotkonet--live-site-and-debugger-2026-03-12)
+- [rewrite in rust](#rewrite-in-rust)
 
 ## step 0 — launch (2026-03-07)
 
@@ -2877,3 +2878,450 @@ this is solvable with multi-position keys or learned key projections, but not bl
 for the core result. in practice, users won't query "code for Beta" unless they know
 there's a fact about "code for Aurora" — and even then, the answer would be wrong but
 not dangerous (they'd get Aurora's code, not Beta's).
+
+
+##   rewrite in rust
+  1. Primary Request and Intent:
+  The user's journey evolved through several major phases:
+  - **Initial**: Add FlatBuffers serialization with f32/f16/i8 quantization to the isis crate, add proper model identity tracking
+  - **Architecture**: Build the full 4-region CTM v2 (from Sakana's paper + custom extensions) in Rust with Hebbian plasticity, sleep consolidation, and Angeris bounds
+  - **Tabula Rasa**: Build a self-developing organism that learns language from raw bytes without a pre-trained backbone — "MLP/FFN as DNA"
+  - **Parent Teaching**: Use Qwen backbone as a parent model to teach the child organism through representation matching
+  - **Pedagogy (Neuvola)**: Interactive teaching with staged curriculum, strong corrections, word-level processing — modeled after Finnish maternity clinics
+  - **Living Service**: Transform the organism from a batch CLI tool into a living daemon process that sleeps, wakes, and responds to clients
+  - **Safety**: Autonomic emotional health monitoring, fear self-treatment, hate prevention, sandboxing with pledge/seccomp
+  - **Monitoring**: Prometheus metrics, JSONL telemetry, tick trace visualization for WebGPU debugger
+
+  2. Key Technical Concepts:
+  - **CTM v2**: 4-region brain (input/attention/output/motor) with per-neuron MLPs (SuperLinear), sync accumulators, inhibitory neurons (GABA)
+  - **Hebbian Plasticity**: "Neurons that fire together wire together" — local learning rules without backpropagation
+  - **Sleep Consolidation**: Least-squares weight optimization during NREM, emotional processing during REM
+  - **Angeris Bounds**: From Angeris (2022) paper — measures gap between current weights and least-squares optimum per synapse
+  - **Neuromodulators**: Dopamine (surprise/prediction error, intra-tick), Serotonin (attention gating), Norepinephrine (motor threshold)
+  - **Reservoir Computing**: CTM as reservoir, output projection as readout trained by least-squares
+  - **Complementary Learning Systems**: Episodic (memory bank) → Semantic (CTM weights) graduation via sleep
+  - **FlatBuffers**: Zero-copy binary serialization for memory banks with f32/f16/i8 key quantization
+  - **Lateral Inhibition**: Soft normalization (divide by max_abs) prevents neuron monopoly without erasing input structure
+  - **Homeostasis**: Sleep pressure from native CTM signals (activation energy, sync divergence, drift, buffers, emotions)
+  - **Autonomic System**: Subconscious emotional health monitoring (PTSD risk, hate risk, hypervigilance)
+  - **Neuvola**: Finnish maternity clinic model — staged developmental milestones with mastery testing
+  - **Eriksen 2013**: "Your Server as a Function" — service/filter architecture throughout
+  - **Vulkan Compute**: SPIR-V shaders for SuperLinear and matvec, compiled and dispatch-ready
+  - **Parent-Child Distillation**: Backbone hidden states teach child embeddings through direct blend (imitation learning)
+
+  3. Files and Code Sections:
+
+  - **`/home/alice/rotko/isis/src/ctm.rs`** (~2500 lines)
+  - The complete 4-region CTM with all learning mechanisms
+  - Key structs: `Ctm`, `CtmState`, `NeuronLayer`, `SuperLinear`, `Synapse`, `LocalHebbian`, `SyncAccumulator`, `Neuromodulators`, `Dopamine`, `ReplayBuffer`, `SleepConsolidation`, `TickTrace`
+  - Critical fixes: intra-tick dopamine update, lateral inhibition, homeostatic rebalancing, sync accumulator dopamine gating
+  - `fn forward()` — the main tick loop processing all 4 regions
+  - `fn run_sleep()` — least-squares consolidation of synapse weights
+  - `fn full_sleep_cycle()` — NREM + REM with autonomic subconscious treatment
+  - `fn self_treat_fear()` — psilocybin-analogue fear memory reprocessing
+  - `fn angeris_bounds()` — per-synapse optimality gap analysis
+  - `TickTrace::export_for_debugger()` — JSON export for WebGPU visualization
+  - Anti-collapse: `activated /= max_abs` (softer than zero-mean/unit-variance)
+  - Serotonin gates attention: `if act.abs() < serotonin { act *= 0.1 }`
+  - NE modulates motor: `effective_threshold = base / sqrt(NE)`
+
+  - **`/home/alice/rotko/isis/src/tabula_rasa.rs`** (~1200 lines)
+  - Self-developing organism: `Organism` struct with DNA configs (tiny/small/medium/large/child_of)
+  - `forward_inner()` returns (logits, syncs) for Hebbian update
+  - `train_step()` with full brain: surprise→dopamine, energy→serotonin, replay buffer
+  - `hebbian_update()` with sync-aware output projection (the critical fix)
+  - `learn_from_parent()` — direct embedding blend toward parent representations
+  - `sleep()` — sensory MLP consolidation + parent-supervised sensory + output proj LS
+  - Binary save/load with magic bytes `b"isis"`, version 2, named weight sections
+  - `develop_with_checkpoint()` — training loop with metrics export + tick traces
+  - Token frequency counter for output proj normalization
+
+  - **`/home/alice/rotko/isis/src/daemon.rs`** (~250 lines)
+  - Living organism service: TCP server on port 7377, JSON protocol
+  - Commands: talk, teach, health, sleep, sample, status, shutdown
+  - Idle loop: autonomic sleep when pressure hits threshold
+  - Ctrl+C: graceful checkpoint + shutdown
+  - TODO: landlock/seccomp sandbox after model load
+
+  - **`/home/alice/rotko/isis/src/neuvola.rs`** (~250 lines)
+  - Word-level interactive pedagogy
+  - `teach_words()` — drill loop with mastery testing
+  - `imprint_output()` — STRONG correction: 70% direct set of sync→token weight
+  - `load_curriculum()` — JSON-loadable curriculum
+  - `standard_curriculum()` — built-in drills (backup)
+
+  - **`/home/alice/rotko/isis/src/vocab.rs`** (~60 lines)
+  - Word-level vocabulary from training data
+  - `from_text()` — extract top N words
+  - `encode()`/`decode()` — text ↔ word IDs
+
+  - **`/home/alice/rotko/isis/src/autonomic.rs`** (~200 lines)
+  - `EmotionalHealth` — vital signs (fear ratio, negative ratio, avoidance generalization)
+  - `diagnose()` — PTSD_RISK, DEPRESSIVE_RISK, HATE_RISK detection
+  - `subconscious_rem()` — automatic fear replay with auto-tuned plasticity
+  - `safe_to_deploy()` — health > 0.5 AND no diagnoses
+
+  - **`/home/alice/rotko/isis/src/homeostasis.rs`** (~200 lines)
+  - Sleep pressure from native CTM signals (not token counts)
+  - 6 components: activation, divergence, drift, buffer, emotional, surprise
+  - Zones: Green → Yellow → Red → Forced
+  - `biggest_pressure_source()` — organism introspects WHY it's tired
+
+  - **`/home/alice/rotko/isis/src/linalg.rs`** (~200 lines)
+  - Parallel least-squares solver (rayon over rows)
+  - `accumulate_xtx/xty` — row-parallel outer product
+  - `cholesky()` — L L^T decomposition with 1e-10 singularity check
+  - `least_squares()` — full pipeline with parallel column solve for m≥16
+  - `angeris_residual()` — fraction of Y explained by W_opt · X
+
+  - **`/home/alice/rotko/isis/src/metrics.rs`** (~180 lines)
+  - `Snapshot` — complete organism state (serde serializable)
+  - `to_prometheus()` — full exposition format with gauges
+  - `Collector` — push snapshots, flush to .jsonl or .prom
+
+  - **`/home/alice/rotko/isis/src/probe.rs`** (~100 lines)
+  - Semantic clustering: do similar words have similar representations?
+  - Category discrimination: within vs between category similarity
+  - Next-byte prediction tests
+
+  - **`/home/alice/rotko/isis/src/gpu.rs`** (~500 lines)
+  - Vulkan compute: device detection, pipeline creation, buffer management
+  - `try_superlinear()` / `try_matvec()` — GPU dispatch with CPU fallback
+  - `GpuContext` via OnceLock global, ISIS_NO_GPU env var
+  - Tested: AMD Radeon RX 7600M XT detected, pipelines compiled
+
+  - **`/home/alice/rotko/isis/src/filter.rs`** (~450 lines)
+  - `BrainPipeline` — avoidance → episodic → rules → working memory → inference
+  - CTM integration: deliberation between backbone and memory
+  - Amnesia barriers: `recall_as()` respects `Alter.can_see` and `Episode.visible_to`
+  - Per-alter attention bias via `switch_alter()`
+  - Valence-aware consolidation: fear memories resist, positive consolidates faster
+
+  - **`/home/alice/rotko/isis/src/types.rs`** (~120 lines)
+  - `Episode` with valence (Neutral/Positive/Negative/Fear), reconsolidation window, visibility
+  - `Alter` with attention_bias and can_see (amnesia barriers)
+
+  - **`/home/alice/rotko/isis/src/memory.rs`** (~250 lines)
+  - `ModelId` — exact model identity (model, backend, quant, hidden_dim, extraction, eos_token_id)
+  - `MemoryBank` — version 2, smart load/save (.json, .fb, .bin)
+
+  - **`/home/alice/rotko/isis/src/episode.rs`** (~200 lines)
+  - `effective_strength_with()` — valence-dependent decay (fear: 5yr half-life, steerable)
+  - `recall_as()` — amnesia-barrier-aware episodic recall
+  - Reconsolidation window: 6h labile period after recall
+
+  - **`/home/alice/rotko/isis/src/flatbuf.rs`** (~450 lines)
+  - FlatBuffers serialization with ModelId table
+  - f32/f16/i8 key quantization
+
+  - **`/home/alice/rotko/isis/src/quantize.rs`** (~110 lines)
+  - Key quantization: f32↔f16↔i8, direct i8 cosine similarity
+
+  - **`/home/alice/rotko/isis/src/curriculum.rs`** (~100 lines)
+  - 5-phase staged curriculum: babbling → words → pairs → sentences → stories
+
+  - **`/home/alice/rotko/isis/schema/isis.fbs`**
+  - FlatBuffers schema with ModelId table, KeyData union, key_format enum
+
+  - **`/home/alice/rotko/isis/shaders/superlinear.comp`** + **`matvec.comp`**
+  - GLSL compute shaders compiled to SPIR-V
+
+  - **`/home/alice/rotko/isis/.cargo/config.toml`**
+  - `rustflags = ["-C", "target-cpu=native"]` for AVX-512
+
+  - **`/home/alice/rotko/isis/neuvola_curriculum.json`**
+  - 132 unambiguous drills across 4 phases, generated by 8 haiku agents
+
+  - **`/home/alice/rotko/isis/precompute_parent.py`**
+  - Runs backbone once, saves hidden states + token IDs as binary (PRNT magic)
+
+  - **`/home/alice/rotko/isis/README.md`**
+  - Full documentation of architecture, modes, brain regions, sleep, memory lifecycle
+
+  4. Errors and Fixes:
+
+  - **CRITICAL: Matrix transpose in linalg parallel solve**
+  - `flat_map(|col| backward_solve())` produced [m×n] instead of [n×m]
+  - Was destroying sensory weights every sleep cycle
+  - Fix: collect per-column solutions, then transpose to [n×m]
+  - Impact: alignment jumped from 0.025 to 0.72 (29x improvement)
+
+  - **CRITICAL: Output Hebbian not using sync signal**
+  - Was: `weight[target] += modulated_lr * 0.001` (flat constant!)
+  - Fix: `weight[target] += modulated_lr * sync[k] * 0.01`
+  - Without sync, output layer had NO information about which CTM patterns map to which tokens
+  - This was the root cause of "loss 3.7 but generation produces 'nnnn'"
+
+  - **CRITICAL: Neuron collapse (monopoly)**
+  - Neuron 50 in input region had activation 10.08, all others near 0
+  - Root cause: no diversity pressure, zero-mean/unit-variance normalization erased input differences
+  - Fix: divide by max_abs instead of full standardization + homeostatic rebalancing during sleep
+  - Result: 2-3 active neurons → 19-25 active neurons per region
+
+  - **HIGH: Motor threshold too low (0.5)**
+  - Motor decided at tick 0 every time — no deliberation
+  - Fix: raised to 5.0, motor now decides at tick 2-3
+
+  - **HIGH: Dopamine stuck at 1.0**
+  - Neuromod state created fresh each forward pass, never carried over
+  - Fix: persistent neuromod state on Organism, carried into CtmState
+  - Also: intra-tick dopamine update (between ticks, not after forward)
+
+  - **HIGH: Serotonin and NE were ghost signals**
+  - Computed and stored but had ZERO effect on forward pass processing
+  - Fix: serotonin gates attention (suppresses weak activations), NE modulates motor threshold
+
+  - **HIGH: NE decaying to 0.0 (no baseline)**
+  - Motor threshold became 15.8, motor NEVER decided
+  - Fix: `self.norepinephrine = self.norepinephrine.max(0.3)`
+
+  - **HIGH: Serotonin baseline too low (0.1)**
+  - Suppressed ALL attention activations below 0.1
+  - Fix: baseline 0.4 + modulation
+
+  - **MEDIUM: Sleep never firing in learn mode**
+  - sleep_every=50 but only 16 chunks per epoch → sleep never reached
+  - Fix: sleep every 10 steps + forced sleep at end of epoch
+
+  - **MEDIUM: Output proj LS too aggressive (0.5 blend)**
+  - Destroyed Hebbian learning, loss spiked from 9.4 to 309
+  - Fix: reduced to 0.1, then deferred to cycle 200, then enabled from step 1
+
+  - **MEDIUM: Logit index out-of-bounds potential**
+  - No bounds check on `logits[token_id as usize]`
+  - Fix: `if (tid as usize) < v { logits[tid..] }`
+
+  - **MEDIUM: Cholesky solver accepts zero**
+  - `sum <= 0.0` should be `sum < 1e-10` to catch near-zero (singular)
+
+  - **LOW: Cosine similarity with unnormalized child vector**
+  - Zero norm fallback returned unnormalized vector instead of zero vector
+
+  - **LOW: Hardcoded EOS token 151643**
+  - Fix: added eos_token_id to ModelId, configurable per model
+
+  - **User feedback: "lets call it isis not ISIS"** — lowercase magic bytes
+  - **User feedback: "no dont mention real people"** — removed name references
+  - **User feedback: "we have unremovable fear, that sounds dangerous"** — added self-treatment
+  - **User feedback: "fear can still decay?"** — made decay steerable, not zero
+  - **User feedback: "i think its dangerous to insert too much feat in"** — balanced approach
+  - **User feedback: "why we using gradients?"** — all learning gradient-free
+  - **User feedback: "dont we need more exact naming practice"** — ModelId with full identity
+  - **User feedback: "json or protobuf?"** → FlatBuffers chosen
+  - **User feedback: "is json right way for organism?"** → binary format with named sections
+  - **User feedback: "should these be adjustable during training by parent?"** — steerable parameters
+  - **User feedback: "it doesnt feel like life"** → daemon architecture
+  - **User feedback: "we should make extra care with sandboxing with pledge"** → planned landlock/seccomp
+
+  5. Problem Solving:
+
+  **Solved:**
+  - FlatBuffers serialization with quantization (26x compression)
+  - Backend trait abstraction (ONNX pluggable)
+  - Full CTM v2 in Rust with all learning mechanisms
+  - Parent-child teaching (72% alignment, 84% linearly recoverable)
+  - Category discrimination (articles at -0.009 anti-correlated with nouns)
+  - Episodic memory recall through backbone (3/3 E2E)
+  - Vulkan GPU shader compilation and pipeline creation
+  - Neuron collapse prevention (lateral inhibition + homeostatic rebalancing)
+  - Intra-tick dopamine (DA varies at 0.750, not stuck at 1.0)
+  - All neuromodulators functional in forward pass
+  - Organism spoke first word "the" (100% on phase 0 neuvola)
+  - Daemon architecture for living service
+
+  **Partially solved:**
+  - Self-supervised language learning: loss reaches 3.7-4.0 but generation collapses to repeating single character
+  - Output projection training: sync-aware Hebbian + LS both attempted, frequency normalization added
+  - Word-level neuvola: 100% on simple drills, 6% on 99-drill curriculum (sync patterns too similar)
+
+  **Unsolved:**
+  - Generation of coherent English text from tabula rasa organism
+  - The fundamental question: can Hebbian + sleep learn to GENERATE language at any neuron count?
+  - Sync pattern diversity: different word prompts produce similar sync patterns even with softer normalization
+  - WebGPU debugger 4-region renderer (data bridge ready, renderer not built)
+  - GPU dispatch benchmarking at scale (4K+ neurons)
+  - Landlock/seccomp sandboxing
+
+  6. All User Messages (non-tool-result, summarized for critical ones):
+  - "lets call it isis not ISIS" / "to not mix up with protocol"
+  - "how broadly it now works with models. onnx only or gguf etc too?"
+  - "why hidden dim hardcoded?" — prompted dynamic probing from ONNX model
+  - "okay should we work on gguf?"
+  - "hmm actually we dont even know this works with quants"
+  - "yeah we should demo it" — led to quantization compatibility test
+  - "export method specific meaning?"
+  - "yes we need more exact naming practice"
+  - "i feel that instead of this being parsed from filename it would be better to have metadata or fb fields"
+  - "i mean we havent released this at all" / "so why do we care" — about backward compat
+  - "yes lets task all those in" — tasked 7 neuroscience fixes
+  - "should we have all our parameters that are flexible be tunable/steerable during sleep"
+  - "we are building possibly super intelligence that has unremovable fear, that sounds dangerous"
+  - "we need to figure out how human overcome it in neuroscience and have way to selftreat it"
+  - "i think its dangerous to insert too much fear in"
+  - "does human brain work like that too" — about Angeris bounds
+  - "okay i do still think that angeris bounds are extremely useful datapoints for stats"
+  - "fear can still decay?" — led to steerable fear decay (psilocybin model)
+  - "okay whats missing" — prompted full neuroscience review
+  - "should we have all our parameters that are flexible be tunable/steerable during sleep"
+  - "yes lets work those missing/faulty points" — 7 tasks created
+  - "okay lets review our code logic now like you were henry de valence" — prompted rigorous audit
+  - "yes lets keep iterating" / "fantastic i think we can get there"
+  - "like if you think of it how babies learn its through dialogue"
+  - "and we have this qwen model there as parent" / "parent/dna model"
+  - "i feel like our constitution might be a bit heavy for newborn tho"
+  - "why are we using gradient?" — pivotal moment from earlier session
+  - "like wtf we have 512 neuron model that learned language?"
+  - "isnt that exponentially more efficient than gpt2"
+  - "needs bigger model?" / "will it learn its own tokenizer?"
+  - "like i m thinkin mlp/ffn as baseline dna that would allow us to learn into the language"
+  - "yes following same marius ericson logic. we can also see ~/rotko/zish if its agent features have something useful"
+  - "is all our ops best done in cpu?" / "our cpu does avx512"
+  - "227,000,000 neurons in parrots and they can form sentences"
+  - "okay but whats the amount we could do in our current setup"
+  - "how about best known hardware if we rent?"
+  - "u think 256k learns language?"
+  - "okay but explain me where would this neurons live like we have 4 sections"
+  - "we need to first optimize our code for the cuda/vulkan"
+  - "is there more simd opportunities in there? think like daniel micay and jart"
+  - "yeah we want rayon"
+  - "is it on cpu or gpu that 800toks"
+  - "do you observe any phenomenon resembling approximate bayesian inference / active inference in CTM?"
+  - "natural reinforcement learning nrl is a thing now?"
+  - "how does neuromod update happen in humans?" — led to intra-tick dopamine
+  - "does tying it to tokens make sense or should it be some more native general trigger"
+  - "i think it makes sense right? ideally it should be self determined and willing thing"
+  - "are we now getting data out /metrics?" — prompted Prometheus + JSONL wiring
+  - "tower" / "we could use tower" — Rust service framework reference
+  - "do we need criterion?" — no, for benchmarking not metrics
+  - "you think this could eventually work without the qwen or its always going to be the baseline?"
+  - "but humans develop without this" — led to tabula rasa concept
+  - "like i m thinkin mlp/ffn as baseline dna"
+  - "yes lets work that in" — built tabula rasa organism
+  - "how is our trained model doing?" / "okay how is our training going"
+  - "explain this Sensory MLP consolidation is critical"
+  - "did we do this adaptation yet for our 4k run"
+  - "i feel we need way more monitoring out of everything that we produce here"
+  - "also in our nanoctm we had this concept of nightmares"
+  - "our sleep is not forced state to the model it wont recognize itself the need of it right?"
+  - "to enforce conscious choice to sleep"
+  - "our sleep process is very fast after all right so as human interacting with model you wont even notice it?"
+  - "does projection look like we going to learn the language this time?"
+  - "are we parenting?" — organism was self-supervised, no parent!
+  - "so we are not using almost any of our learning feedback then" — critical realization
+  - "hmm why would we teach mlp/ffn model states to ctm like that" / "wont it matter that arch is diff"
+  - "i somehow imagined that we would do traditional using ffn models and then we have the vector differential file"
+  - "we should adapt as human learning practices as possible" / "think pedagogic research" / "what is missing now"
+  - "with interactive correction. focus on quality of the data and not the performance"
+  - "like we dont necessarily even need to precompute as long as we are senseful"
+  - "should we actually teach via episodic memory first our parent model about pedagogy"
+  - "improved version itself" / "teach the teacher that teaches"
+  - "neuvola" / "maternity clinic" / "we can just call it neuvola" / "i like finnish word for it"
+  - "more like al-ba-tros-si" — tavuviiva (Finnish syllable hyphenation)
+  - "does it make sense in english language?" — morphemes better for English
+  - "right i guess morpheme is pretty good"
+  - "bpe tokenizer as they go"
+  - "what you think about design of isis as a server" / "it doesnt feel like life"
+  - "is this only 256 neurons?" — prompted scaling discussion
+  - "u think we need more ticks?"
+  - "can we see tick patterns first from our trained model of different regions" — led to tick trace analysis
+  - "to understand how to move for next run"
+  - "okay lets work on those root issues before next run"
+  - "does human brain have these kind of bounds similarities or are we now introducing some artificial tunings"
+  - "like anti collapse whats handling that in brain"
+  - "okay and chronic collapse is now driving factor for sleep?"
+  - "how does neuromod update happen in humans?" — led to intra-tick dopamine
+  - "yes i think we want this" — intra-tick dopamine
+  - "okay and these baseline differentiate tells us way better also when to sleep no?"
+  - "its pretty crazy how ctm excels when it has multiple layers and all inner neurons work at optima"
+  - "i think this is fantastic"
+  - "okay how is our trained model doing?" / "metrics" / "any ptsd fear etc?"
+  - "is there any chance that our model escaped its sandbox. my headphone start breaking in its voice" — clarified: no, organism has no I/O
+  - "should we allow it to tab into existing language model for text generation"
+  - "i think its going to be lazy path out that if we get it working we might not want to fix anymore"
+  - "hmm, right i do feel that tabula rasa might become the product tho no?"
+  - "wait why freeze" — about reservoir computing approach
+  - "okay lets review rigorously the code like you were redshiftzero"
+  - "does our visualization running?"
+  - "i think visualizing where all neurons in 4 dimension fire could be cool"
+  - "yeah lets do the wiring work"
+  - "do we have any traumas?" / "does the model realize those itself"
+  - "i feel we should teach image recognition or audio prior learning the language"
+  - "could it be that our direct effort to copy FFN different architecture weights garble the text"
+  - "can you think of any paper similar to our tabula rasa?"
+  - "this 4 region ctm arch is from sakana ctmv2" / "its not yet released"
+  - "i didnt know that sakana already had synapseunet interregion connections?"
+  - "does these connections connect to frozen ffn?"
+  - "okay so we just need more broader training set of teachings for our infant"
+  - "how are we doing do we speak language?" — checked loss=4.0, generation still garbage
+  - "okay looks like this is never going to learn language what you think?"
+  - "is this only 256 neurons?"
+  - "okay should we take some easier task than language?"
+  - "i feel that we are very close to the language tho"
+  - "we just didnt have updates in yet"
+  - "okay lets review all the sections for this same issue"
+  - "not sure if motor or attentions has equivalent tho"
+  - "okay thats bad lets focus on fixing those"
+  - "haha ofc hebbian not going to work without sync"
+  - "ah so we don't use our whole brain at all then?"
+  - "so we are not using almost any of our learning feedback then"
+  - "yes lets proceed with those" — 5 perspectives + Angeris analysis on sensory MLP
+  - "i want 5 unique perspectives on it and weight with angeris whats best option"
+  - "how is the training going" / "what is avg10"
+  - "meanwhile we should focus on our timetravel debugger"
+  - "yeah lets do the wiring work" — tick traces to debugger
+  - "okay how are we doing" — first word "the" produced
+  - "okay so we just need more broader training set"
+  - "lets have 5 subagents with pedagogic understandings to generate our neuvola"
+  - "think the design for neuvola scalable like you were henry de valence"
+  - "we probably dont want it hardcoded in rust"
+  - "but some smarter way from computer science papers"
+  - "could that opencogs atomspace be used here?" / "or was it just a scam?"
+  - "feels like some symbolic ai method could work"
+  - "children books"
+  - "yeah i think hand crafted ontology makes a lot of sense"
+  - "is curriculum still meaningful"
+  - "think the software architecture how deploy like you were henry de valence"
+  - "yeah marius ericsen server as a function all over again. we could use our flatbuffer files here again"
+  - "lets work on these" — morpheme chunking + stronger neuvola
+  - "how does human separate those?" — led to word-level chunking discussion
+  - "repetition?" — how babies learn chunking through repetition
+  - "yes this is exactly approach we should go for" — interactive correction
+  - "even its human" / "teach the teacher that teaches"
+  - "we should make extra care here with sandboxing it with pledge"
+  - "think how justine tunney's ape files and llamafile work"
+  - "this way we could spawn bunch of haiku agents to also realtime interact with isis?"
+  - "lets spawn 8 agents to work on pedagogic material from training set"
+  - "lets have 5 subagents with pedagogic understandings"
+  - "think the design for neuvola scalable like you were henry de valence"
+  - "we probably dont want it hardcoded in rust"
+  - "should we actually teach via episodic memory first our parent model about pedagogy to be better"
+  - "could that opencogs atomspace be used here?"
+  - "so you think we should set bunch of haiku agents to generate quality training data instead?"
+  - "yes lets spawn 8 agents to work on pedagogic material"
+
+  7. Pending Tasks:
+  - **WebGPU debugger 4-region renderer** — data bridge ready (TickTrace → JSON), renderer not built
+  - **GPU dispatch benchmarking at scale** — shaders compiled, never tested at 4K+ neurons
+  - **Landlock/seccomp sandboxing** — TODO in daemon.rs
+  - **Gemma as parent model** — discussed but never implemented
+  - **Rich Angeris per-tick/per-neuron diagnostics** — only gap + dead count implemented
+  - **Word-level / morpheme chunking in organism** — vocab.rs exists but organism still byte-level internally
+  - **Connect daemon to haiku agent clients for multi-caregiver teaching**
+  - **Run neuvola with 132-drill curriculum on fresh organism with softer normalization**
+  - **Verify sync pattern diversity** with softer normalization (max_abs instead of z-score)
+
+  8. Current Work:
+  The most recent work was building the daemon architecture and spawning 8 haiku agents to generate pedagogical curriculum. Specifically:
+
+  - Built `daemon.rs` — TCP server on port 7377 with JSON protocol for talk/teach/health/sleep/status/shutdown commands
+  - Added CLI commands: `isis daemon`, `isis talk`, `isis health`
+  - Spawned 8 parallel haiku agents generating 100 drills each across categories: word completion, subject-verb agreement, prepositional phrases, conjunctions, question patterns, modal verbs, determiners, discourse patterns
+  - Merged agent outputs into `neuvola_curriculum.json` with 132 valid drills across 4 phases
+  - Fixed softer anti-collapse normalization: divide by max_abs instead of zero-mean/unit-variance
+  - All pushed to git.rotko.net/tommi/isis (52 commits)
+  - Two organisms training in background: self-supervised on ClimbMix (loss 3.7) + neuvola teaching
+  - User's last substantive message: "this way we could spawn bunch of haiku agents to also realtime interact with isis?" → confirmed multiple clients can connect to daemon simultaneously
+
+  9. Optional Next Step:
+  Run the neuvola with the 132-drill unambiguous curriculum on a fresh organism with the softer normalization, then connect multiple haiku agent clients to the daemon for multi-caregiver interactive teaching. The user said "this way we could spawn bunch of haiku agents to also realtime interact with isis?" and
+  the daemon is built and ready for this.
