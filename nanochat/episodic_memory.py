@@ -127,7 +127,8 @@ class EpisodicMemory:
     @torch.no_grad()
     def teach(self, backbone, tokenizer, prompt: str, answer: str,
               alter: str = "default", target_layer: int = 23,
-              get_hidden_fn=None, get_logits_fn=None):
+              get_hidden_fn=None, get_logits_fn=None,
+              importance: float = 1.0):
         """Store an episodic memory with multi-key cloud and consolidation strength.
 
         Args:
@@ -186,6 +187,11 @@ class EpisodicMemory:
         prompt_key = prompt_hidden[0, -1].float().cpu()
         prompt_key = prompt_key / (prompt_key.norm() + 1e-8)
         keys.append((prompt_key, "[PROMPT_END]", -1))
+
+        # Norepinephrine: explicit importance override
+        # importance=1.0 is normal. "YOU NEED TO REMEMBER THIS" = 3.0
+        # Multiplies on top of automatic consolidation strength
+        strength_mod = strength_mod * importance
 
         # Build answer logit biases
         prompt_logits = get_logits_fn(backbone, prompt_input, target_layer, self.device)
